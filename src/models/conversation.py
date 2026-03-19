@@ -1,0 +1,191 @@
+"""Conversation and chat-history models.
+
+These schemas track the multi-turn dialogue between the user
+and the Clarifier Agent, including:
+
+* **ChatMessage** — a single user / assistant / system turn.
+* **ClarificationQuestion** — a structured question the Clarifier
+  needs answered before requirements are complete.
+* **ConversationState** — the full chat session with metadata.
+
+The Clarifier agent loops until ``requirements_complete == True``
+(or ``max_clarification_turns`` is reached), appending messages
+and resolving questions each iteration.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+
+class MessageRole(str, Enum):
+    """Role of the chat message author."""
+
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+
+
+class ClarificationStatus(str, Enum):
+    """Lifecycle of a clarification question."""
+
+    PENDING = "pending"
+    """Question has been posed but not yet answered."""
+
+    ANSWERED = "answered"
+    """User has supplied a satisfactory answer."""
+
+    SKIPPED = "skipped"
+    """User chose to skip; a default will be applied."""
+
+    INFERRED = "inferred"
+    """Agent inferred the answer from prior context."""
+
+
+class ClarificationPriority(str, Enum):
+    """How important is this clarification to decision quality."""
+
+    REQUIRED = "required"
+    """Cannot proceed without this."""
+
+    RECOMMENDED = "recommended"
+    """Improves quality but can be defaulted."""
+
+    OPTIONAL = "optional"
+    """Nice to have; agent can infer a reasonable default."""
+
+
+# ---------------------------------------------------------------------------
+# Core message model
+# ---------------------------------------------------------------------------
+
+
+class ChatMessage(BaseModel):
+    """A single turn in the conversation history.
+
+    Supports both human messages and structured assistant responses.
+    """
+
+    role: MessageRole = Field(description="Who authored this message")
+    content: str = Field(description="Plain-text or Markdown message body")
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="UTC timestamp of this message",
+    )
+
+    # --- Optional structured metadata ---
+    agent_name: str | None = Field(
+        default=None,
+        description="Which agent produced this message (e.g. 'clarifier')",
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Arbitrary key-value metadata attached to the message",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Clarification tracking
+# ---------------------------------------------------------------------------
+
+
+class ClarificationQuestion(BaseModel):
+    """A structured question the Clarifier agent needs answered.
+
+    Each question targets a specific requirement field and carries
+    a default value the agent will use if the user skips.
+    """
+
+    question_id: str = Field(
+        description="Stable identifier (e.g. 'q_budget', 'q_db_engine')",
+    )
+    question_text: str = Field(description="Human-readable question")
+    target_field: str = Field(
+        description="Dot-path of the field this resolves (e.g. 'workloads[0].resources.database_engine')",
+    )
+    priority: ClarificationPriority = Field(default=ClarificationPriority.RECOMMENDED)
+    status: ClarificationStatus = Field(default=ClarificationStatus.PENDING)
+    default_value: str | None = Field(
+        default=None,
+        description="Value the agent will apply if skipped / unanswered",
+    )
+    user_answer: str | None = Field(
+        default=None,
+        description="Raw answer text from the user (populated on resolution)",
+    )
+    resolved_value: Any = Field(
+        default=None,
+        description="Parsed / normalised value extracted from the answer",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Conversation state
+# ---------------------------------------------------------------------------
+
+
+class ConversationState(BaseModel):
+    """Full state of the multi-turn clarification dialogue.
+
+    The Clarifier agent manages this object across turns.
+    ``requirements_complete`` gates whether the orchestrator
+    proceeds to the Profiler or loops back to the Clarifier.
+    """
+
+    conversation_id: str = Field(
+        default="",
+        description="Unique ID for this conversation session",
+    )
+    messages: list[ChatMessage] = Field(
+        default_factory=list,
+        description="Ordered list of all chat messages",
+    )
+    clarification_questions: list[ClarificationQuestion] = Field(
+        default_factory=list,
+        description="Questions generated by the Clarifier",
+    )
+    current_turn: int = Field(
+        default=0, ge=0,
+        description="How many Clarifier turns have executed so far",
+    )
+    max_clarification_turns: int = Field(
+        default=5, ge=1,
+        description="Safety limit — after this many turns, proceed with defaults",
+    )
+    requirements_complete: bool = Field(
+        default=False,
+        description="True when the Clarifier decides it has enough info",
+    )
+
+    # --- Derived helpers ---
+    @property
+    def pending_questions(self) -> list[ClarificationQuestion]:
+        """Return questions still awaiting an answer."""
+        return [q for q in self.clarification_questions if q.status == ClarificationStatus.PENDING]
+
+    @property
+    def has_pending_questions(self) -> bool:
+        """True if any clarification questions are still pending."""
+        return len(self.pending_questions) > 0
+
+    @property
+    def should_continue_clarifying(self) -> bool:
+        """True if the Clarifier should loop for another turn.
+
+        Returns ``False`` once requirements are marked complete
+        or the turn limit is reached.
+        """
+        if self.requirements_complete:
+            return False
+        if self.current_turn >= self.max_clarification_turns:
+            return False
+        return True

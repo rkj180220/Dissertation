@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[project]
+name = "cloud-orchestrator-idss"
+version = "0.1.0"
+description = "Agentic AI-Driven Intelligent Decision Support System for Cloud-Agnostic Resource Orchestration"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.13"
+authors = [
+    { name = "Ramkumar J", email = "2024mt03027@wilp.bits-pilani.ac.in" },
+]
+
+dependencies = [
+    # --- Core Framework ---
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "sse-starlette>=2.0.0",  # Server-Sent Events for streaming chat
+
+    # --- Agentic AI / LLM ---
+    "langgraph>=1.0.0",
+    "langchain-aws[anthropic]>=1.3.0",  # AWS Bedrock Claude (primary LLM)
+
+    # --- Cloud Provider SDKs ---
+    "boto3>=1.35.0",                  # AWS
+    "azure-mgmt-compute>=33.0.0",    # Azure
+    "azure-identity>=1.19.0",
+    "google-cloud-billing>=1.15.0",  # GCP
+    "google-cloud-compute>=1.20.0",
+
+    # --- Data & Caching ---
+    "aiosqlite>=0.20.0",
+    "httpx>=0.28.0",
+
+    # --- Optimization ---
+    "numpy>=1.26.0",
+
+    # --- Data Processing ---
+    "pandas>=2.2.0",
+
+    # --- Observability ---
+    "structlog>=25.0.0",
+    "langfuse>=3.14.0",  # LLM tracing (SDK v3)
+
+    # --- Document Generation ---
+    "jinja2>=3.1.0",
+    "python-docx>=1.1.0",
+]
+
+[project.optional-dependencies]
+gemini = [
+    "langchain-google-genai>=4.2.0",  # Backup LLM provider
+]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "pre-commit>=4.0.0",
+]
+
+[project.scripts]
+idss-api = "src.main:run"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_return_any = true
+warn_unused_configs = true

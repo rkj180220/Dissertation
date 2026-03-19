@@ -1,0 +1,1 @@
+# Placeholder — Health/readiness endpoints
