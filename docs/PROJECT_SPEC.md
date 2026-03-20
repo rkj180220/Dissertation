@@ -3,6 +3,7 @@
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
 > **Last Updated**: 19 March 2026
+> **LLM**: Claude Sonnet 4.5 (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`) via AWS Bedrock
 
 ---
 
@@ -110,8 +111,8 @@ Exports all of the above (90+ symbols). Both new models and deprecated legacy mo
 |------|--------|-------------|-------------|
 | `base_provider.py` | ✅ | N/A | Abstract `BaseCloudProvider` with 3 methods: `search_prices()`, `get_sku_prices()`, `list_regions()` |
 | `azure_provider.py` | ✅ | **Yes** | Azure Retail Prices REST API (no auth). OData filter builder, autopagination, `serviceName → ServiceCategory` mapping, `ServiceCategory → serviceNames` reverse map, PricingTier resolution, Spot/LowPriority post-filtering. `@observe()` + structlog. |
-| `aws_provider.py` | ✅ | **No** (creds expired) | AWS Pricing API via boto3. 45 `ServiceCode → ServiceCategory` mappings, 26 `region ↔ location` name mappings, OnDemand + Reserved 1yr/3yr term parsing, stringified JSON PriceList parsing. `asyncio.to_thread()` for all sync boto3 calls. |
-| `gcp_provider.py` | ✅ | **No** (creds missing) | GCP Cloud Billing Catalog via `google-cloud-billing` SDK. 38 `service display name → ServiceCategory` mappings. Two-step discovery (`list_services → list_skus`). `units + nanos/1e9` price conversion. `asyncio.to_thread()` for all gRPC calls. |
+| `aws_provider.py` | ✅ | **Yes (6/6 checks ✅)** | AWS Pricing API via boto3. 45 `ServiceCode → ServiceCategory` mappings, 26 `region ↔ location` name mappings, OnDemand + Reserved 1yr/3yr term parsing, stringified JSON PriceList parsing. `asyncio.to_thread()` for all sync boto3 calls. |
+| `gcp_provider.py` | ✅ | **Yes (6/6 checks ✅)** | GCP Cloud Billing Catalog via `google-cloud-billing` SDK. 38 `service display name → ServiceCategory` mappings. Two-step discovery (`list_services → list_skus`). `units + nanos/1e9` price conversion. `asyncio.to_thread()` for all gRPC calls. |
 | `__init__.py` | ✅ | — | Re-exports all 4. |
 
 ---
@@ -200,10 +201,12 @@ Exports all of the above (90+ symbols). Both new models and deprecated legacy mo
 | `test_state_models.py` | 41 — all imports, enums, models, instantiation, behavior | ✅ Passed |
 | `test_clarifier_agent.py` | 12 — parsing, workload extraction, question generation, state flow | ✅ Passed |
 | `test_azure_adapter.py` | 16 — live Azure API calls + assertions | ✅ Passed |
+| `test_aws_adapter.py` | 6 — EC2 search, m5.xlarge SKU, reserved tiers, RDS, fields, regions | ✅ Passed |
+| `test_gcp_adapter.py` | 6 — Compute Engine search, DATABASE, tiers, monthly estimate, fields, regions | ✅ Passed |
 | `test_all_providers.py` | Structural — adapter imports + hierarchy + mappings | ✅ Passed |
 | `test_monthly_estimate.py` | Monthly cost calculations (on-demand, reserved 1yr/3yr) | ✅ Passed |
-| `explore_aws_pricing.py` | AWS API shapes | ❌ Needs creds |
-| `explore_gcp_pricing.py` | GCP Billing Catalog shapes | ❌ Needs creds |
+| `explore_aws_pricing.py` | AWS API shape exploration | 🔧 Exploratory |
+| `explore_gcp_pricing.py` | GCP Billing Catalog shape exploration | 🔧 Exploratory |
 
 ---
 
@@ -253,8 +256,6 @@ Items in recommended implementation order:
 | 13 | `tests/conftest.py` — shared pytest fixtures |
 | 14 | `tests/unit/` — unit tests for all agents + engines |
 | 15 | `tests/integration/` — end-to-end workflow tests |
-| 16 | Live-test AWS adapter (when creds available) |
-| 17 | Live-test GCP adapter (when creds available) |
 
 ---
 

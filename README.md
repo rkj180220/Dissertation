@@ -207,7 +207,7 @@ continues normally.
 src/
 ├── agents/          # Five autonomous LangGraph agents
 │   ├── clarifier.py     ✅ live
-│   ├── profiler.py      🔧 in progress
+│   ├── profiler.py      ❌ pending
 │   ├── sizer.py         ❌ pending
 │   ├── finops.py        ❌ pending
 │   └── rfp_writer.py    ❌ pending
