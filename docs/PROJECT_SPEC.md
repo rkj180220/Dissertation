@@ -2,8 +2,50 @@
 
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
-> **Last Updated**: 19 March 2026
+> **Additional Examiner**: Santhosh Kirubakaran
+> **Last Updated**: 20 March 2026
 > **LLM**: Claude Sonnet 4.5 (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`) via AWS Bedrock
+
+---
+
+## 0. System Architecture
+
+```
+User (React chat) → FastAPI (SSE) → LangGraph Orchestrator
+                                         │
+                  ┌──────────────────────┤
+                  │    Clarifier Agent    │ ← Multi-turn requirement refinement
+                  │  (conditional loop)   │   Asks follow-up questions until
+                  └──────────┬───────────┘   requirements are unambiguous
+                             │ complete
+                             ▼
+                  ┌──────────────────────┐
+                  │    Profiler Agent     │ ← Analyzes workload → WorkloadProfile
+                  └──────────┬───────────┘
+                             ▼
+                  ┌──────────────────────┐
+                  │     Sizer Agent      │ ← Calls PricingService → scoring → bin-packing
+                  └──────────┬───────────┘
+                             ▼
+                  ┌──────────────────────┐
+                  │    FinOps Agent      │ ← Multi-provider cost comparison
+                  └──────────┬───────────┘
+                             ▼
+                  ┌──────────────────────┐
+                  │   RFP Writer Agent   │ ← Generates procurement document
+                  └──────────────────────┘
+
+  All agents share OrchestratorState (LangGraph TypedDict):
+  ┌─────────────┐    ┌──────────────┐    ┌─────────────────────────┐
+  │ PricingCache│ ←→ │PricingService│ ←  │  Sizer / FinOps agents  │
+  │  (SQLite)   │    │   (facade)   │    │  (never call adapters)  │
+  └─────────────┘    └──────┬───────┘    └─────────────────────────┘
+                            │
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+        AWS Pricing    Azure Retail    GCP Billing
+         (boto3)       Prices API      Catalog API
+```
 
 ---
 
@@ -136,6 +178,19 @@ Exports all of the above (90+ symbols). Both new models and deprecated legacy mo
 | `state.py` | ✅ | `OrchestratorState` TypedDict. Append-only lists via `Annotated[list, operator.add]`: `messages`, `sized_results`, `savings_opportunities`. Last-writer-wins fields: `conversation`, `workload_request`, `workload_profile`, `cost_comparison`, `rfp_document`, `compliance_report`, `kpis`. `AgentStatus` enum, `AgentExecution` model (timing + retry tracking), `SizedWorkloadResult` (fit score, selected SKU + alternatives). `create_initial_state()` factory. |
 | `graph.py` | 🔧 | **Placeholder only** — empty file |
 | `__init__.py` | ✅ | Exports `OrchestratorState`, `create_initial_state`, `AgentStatus`, `AgentExecution`, `SizedWorkloadResult`. |
+
+### State Fields per Agent
+
+| Agent | Reads | Writes |
+|-------|-------|--------|
+| **Clarifier** | `messages`, `conversation` | `messages`, `conversation`, `workload_request` |
+| **Profiler** | `workload_request` | `workload_profile`, `messages` |
+| **Sizer** | `workload_profile` | `sized_results`, `messages` |
+| **FinOps** | `sized_results` | `cost_comparison`, `recommended_provider`, `savings_opportunities`, `messages` |
+| **RFP Writer** | all above | `rfp_document`, `executive_summary`, `compliance_report`, `messages` |
+
+Append-only (reducer): `messages`, `sized_results`, `savings_opportunities`  
+Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_comparison`, `compliance_report`
 
 ---
 

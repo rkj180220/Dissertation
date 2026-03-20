@@ -1,7 +1,7 @@
 # Cloud Orchestrator IDSS — Continuation Prompt
 
 > **Purpose**: Paste this into a NEW Copilot chat window to resume work from exactly where we left off.
-> **Last Updated**: 28 Feb 2026
+> **Last Updated**: 20 March 2026
 
 ---
 
@@ -10,127 +10,134 @@
 ```
 I'm continuing work on my M.Tech dissertation project: "Agentic AI-Driven Intelligent Decision Support System for Cloud-Agnostic Resource Orchestration and Automated Procurement".
 
-## What's Already Built & Verified
+Project path: `/Users/ramkumarjayakumar/Dev/Dissertation/`
+Student: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 
-The project is at `/Users/ramkumarjayakumar/Dev/Dissertation/`.
+Please read `.github/copilot-instructions.md` first (tech stack rules, observability pattern, LLM abstraction rules). Then read `docs/PROJECT_SPEC.md` for complete per-file status, architecture diagram, and build order.
 
-### ✅ COMPLETE — Config Layer
-- `src/config/settings.py` — 6 Pydantic-settings classes. LLMProvider enum. @lru_cache singleton.
-- `src/config/logging_config.py` — configure_observability() wires structlog + LangFuse SDK.
-- `src/config/__init__.py` — Re-exports.
-- `.env.example` — All env var prefixes.
+---
 
-### ✅ COMPLETE — LLM Factory
-- `src/llm/factory.py` — get_llm() → BaseChatModel. Lazy imports per provider.
-- `src/llm/__init__.py` — Re-exports get_llm.
+## What's Fully Built & Live-Tested ✅
 
-### ✅ COMPLETE — Normalized Pricing Models
-- `src/models/cloud_resource.py` — CloudProvider enum (aws/azure/gcp), ServiceCategory enum (14 values: COMPUTE, SERVERLESS_COMPUTE, CONTAINER, SERVERLESS_FUNCTION, DATABASE, STORAGE, NETWORKING, AI_ML, ANALYTICS, MANAGEMENT, SECURITY, INTEGRATION, IOT, OTHER). Legacy ComputeSKU/StorageSKU kept for backward compat with engines/.
-- `src/models/pricing.py` — PricingTier enum (8 values: ON_DEMAND, SPOT, LOW_PRIORITY, RESERVED_1YR, RESERVED_3YR, SAVINGS_PLAN_1YR, SAVINGS_PLAN_3YR, DEV_TEST). NormalizedPriceItem model with monthly_cost_estimate property (handles reservation total-upfront vs hourly correctly). Legacy SKUPricing kept for backward compat.
-- `src/models/__init__.py` — Exports both new and legacy models.
+### Infrastructure
+- Python 3.13.0 · uv · hatchling · `.venv/` with all deps synced
+- `pyproject.toml` · `uv.lock` · `.env.example` · `.gitignore` · git repo initialised
 
-### ✅ COMPLETE — Azure Provider Adapter
-- `src/providers/base_provider.py` — Abstract BaseCloudProvider: search_prices(), get_sku_prices(), list_regions().
-- `src/providers/azure_provider.py` — AzurePricingProvider: calls Azure Retail Prices REST API (public, no auth). Features: OData filter builder, automatic pagination, serviceName→ServiceCategory mapping, ServiceCategory→serviceNames reverse mapping (for category-only searches), PricingTier resolution, client-side post-filtering for Spot/LowPriority, @observe() tracing + structlog.
+### Config Layer (`src/config/`)
+- `settings.py` — 6 Pydantic-settings classes: AppSettings, LLMSettings, AWSSettings, AzureSettings, GCPSettings, LangFuseSettings. `get_settings()` with `@lru_cache`.
+- `logging_config.py` — `configure_observability()` wires structlog JSON + LangFuse SDK v3. Graceful degradation when keys missing.
 
-### ✅ COMPLETE — AWS Provider Adapter
-- `src/providers/aws_provider.py` — AWSPricingProvider: calls AWS Pricing API via boto3. Features: 45 ServiceCode→ServiceCategory mappings, 26 region↔location name mappings, handles OnDemand + Reserved (1yr/3yr) terms, parses stringified JSON PriceList, all boto3 sync calls wrapped in asyncio.to_thread(), @observe() tracing + structlog. NOT live-tested (AWS creds expired).
+### LLM Factory (`src/llm/`)
+- `factory.py` — `get_llm(provider, model, **kwargs) → BaseChatModel`. Lazy imports (bedrock / gemini). Agents NEVER import provider classes directly.
+- **Live-tested**: `us.anthropic.claude-sonnet-4-5-20250929-v1:0` via AWS Bedrock ✅
 
-### ✅ COMPLETE — GCP Provider Adapter
-- `src/providers/gcp_provider.py` — GCPPricingProvider: calls GCP Cloud Billing Catalog via google-cloud-billing SDK. Features: 38 service display name→ServiceCategory mappings, usageType→PricingTier mapping (OnDemand/Preemptible/Commit1Yr/Commit3Yr), units+nanos→float price conversion, two-step discovery (list_services → list_skus), all gRPC sync calls wrapped in asyncio.to_thread(), @observe() tracing + structlog. NOT live-tested (GCP creds not set up).
+### Data Models (`src/models/`)
+- `cloud_resource.py` — `CloudProvider` enum (aws/azure/gcp), `ServiceCategory` enum (14 values). Legacy `ComputeSKU`/`StorageSKU` kept for backward compat with engines only.
+- `pricing.py` — `PricingTier` enum (8 values). `NormalizedPriceItem` with `monthly_cost_estimate` property (handles reservation upfront vs hourly).
+- `workload.py` — `EnvironmentType`, `WorkloadTier`, `ScalingPattern` enums. `ResourceSpec` (all 14 categories), `WorkloadRequirement`, `ComponentProfile`, `WorkloadProfile`, `WorkloadRequest`. Legacy VMWorkload/ContainerWorkload/StorageRequirement kept at bottom.
+- `conversation.py` — `MessageRole`, `ClarificationStatus`, `ClarificationPriority` enums. `ChatMessage`, `ClarificationQuestion`, `ConversationState` (with `should_continue_clarifying` property).
+- `recommendation.py` — `PackedNode`, `BinPackingResult`, `ProviderCostBreakdown`, `CostComparison`, `ComplianceCheckResult`, `ComplianceReport`, `CloudRecommendation`. All use `NormalizedPriceItem`.
+- **Verified**: 41/41 checks passed (all imports, instantiation, behavior)
 
-- `src/providers/__init__.py` — Exports BaseCloudProvider + all 3 adapters.
+### Cloud Provider Adapters (`src/providers/`)
+- `base_provider.py` — Abstract `BaseCloudProvider`: `search_prices()`, `get_sku_prices()`, `list_regions()`
+- `azure_provider.py` — Azure Retail Prices REST API (no auth). **Live-tested ✅**
+- `aws_provider.py` — AWS Pricing API via boto3. 45 ServiceCode→ServiceCategory maps, 26 region↔location maps. **Live-tested 6/6 ✅**
+- `gcp_provider.py` — GCP Cloud Billing Catalog via `google-cloud-billing` SDK. ADC auth (no service account key). **Live-tested 6/6 ✅**
 
-### ✅ COMPLETE — Pricing Cache + Service Layer
-- `src/services/pricing_cache.py` — PricingCache: async SQLite cache (aiosqlite). Schema: `price_items` (UNIQUE on provider+sku_id+region+pricing_tier) + `fetch_log` (TTL tracking per query pattern). WAL mode, deterministic cache keys, upsert/query/evict_stale/stats. @observe() tracing + structlog.
-- `src/services/pricing_service.py` — PricingService: cache-aware facade that agents use instead of calling providers directly. Features: transparent cache-on-write/read-on-hit, per-tier TTL overrides (spot=6h, on-demand=24h, reserved=7d), graceful degradation (stale cache on API failure), `compare_across_providers()` for FinOps agent, force_refresh, evict_stale, cache_stats. @observe() tracing + structlog.
-- `src/services/__init__.py` — Exports PricingCache, PricingService.
+### Pricing Cache & Service (`src/services/`)
+- `pricing_cache.py` — Async SQLite cache (aiosqlite). WAL mode. Upsert/query/evict/stats.
+- `pricing_service.py` — Cache-transparent facade. Per-tier TTLs: spot=6h, on-demand=24h, reserved=7d. `compare_across_providers()` for FinOps agent. Graceful degradation (stale cache on API failure).
+- **Verified**: 25/25 checks passed. ~970× speedup (0.68s live → 0.0007s cached)
 
-### Live-Tested (51 checks passed)
-- All model + provider imports clean
-- NormalizedPriceItem construction + monthly estimates (on-demand, reserved 1yr/3yr, per-request)
-- Azure VM on-demand search (no spot/low-priority leaking)
-- Azure D4s_v5 all tiers (11 rows: on-demand, reserved, spot, dev-test, Linux+Windows)
-- Azure Functions → correctly categorized as SERVERLESS_FUNCTION
-- Azure container category search → fires 3 API calls (AKS + CI + ACA), returns 39 items
-- All 3 adapters subclass BaseCloudProvider correctly
-- CloudProvider enums correct on each adapter
-- All abstract methods present on all 3 adapters
-- GCP tier resolution, price conversion, unit normalisation all verified
-- AWS/GCP service→category mappings and reverse mappings verified
-- **PricingService cache lifecycle**: miss→live→store→hit→stats→evict→clear (25 checks)
-- **Cache speedup**: ~970x (0.68s live → 0.0007s cached)
-- **Cross-provider compare**: Azure returns data, unregistered providers return empty
-- **Graceful degradation**: stale cache fallback on API failure
-- **State schema + models redesign**: 41/41 checks passed (all imports, instantiation, behavior)
+### Orchestrator State (`src/orchestrator/state.py`)
+- `OrchestratorState` TypedDict with `Annotated[list, operator.add]` append-only reducers
+- `AgentStatus` enum, `AgentExecution` model (timing + retry tracking)
+- `SizedWorkloadResult` (fit_score, selected_sku, alternatives, rationale)
+- `create_initial_state()` factory
+- **Verified**: all imports, enum values, TypedDict fields, create_initial_state() ✅
 
-### ✅ COMPLETE — State Schema + Models Redesign
-- `src/models/workload.py` — REDESIGNED: ScalingPattern enum, ResourceSpec (generic compute/storage/db/k8s/serverless fields), WorkloadRequirement (category-agnostic per-component, maps to any of 14 ServiceCategories), ComponentProfile (Profiler output per workload), WorkloadProfile (with components list), WorkloadRequest (uses CloudProvider enum, provider_regions map, raw_user_input). Legacy VMWorkload/ContainerWorkload/StorageRequirement kept at bottom.
-- `src/models/conversation.py` — NEW: MessageRole/ClarificationStatus/ClarificationPriority enums, ChatMessage (role, content, timestamp, agent_name, metadata), ClarificationQuestion (question_id, target_field, priority, status, default_value, resolved_value), ConversationState (messages, questions, current_turn, max_clarification_turns, requirements_complete, should_continue_clarifying property).
-- `src/models/recommendation.py` — REDESIGNED: Uses NormalizedPriceItem instead of ComputeSKU/StorageSKU. ProviderCostBreakdown (6 cost categories: compute/database/storage/k8s/networking/serverless + RI/SP/spot savings). CostComparison (budget tracking + exceeded flag). CloudRecommendation (sku_selections with NormalizedPriceItem, rfp_document inline).
-- `src/orchestrator/state.py` — NEW: OrchestratorState TypedDict with Annotated[list, operator.add] append-only reducers. AgentStatus/AgentExecution (lifecycle + timing tracking). SizedWorkloadResult (fit_score, rationale, selected_sku + alternatives). create_initial_state() factory. Fields for all 5 agents: messages, conversation, workload_request, workload_profile, sized_results, cost_comparison, rfp_document, compliance_report, kpis.
-- `src/orchestrator/__init__.py` — UPDATED: exports OrchestratorState, create_initial_state, AgentStatus, AgentExecution, SizedWorkloadResult.
-- `src/models/__init__.py` — UPDATED: exports all new + legacy models (~30 symbols in __all__).
+### Clarifier Agent (`src/agents/clarifier.py`) — 596 lines
+- Multi-turn requirement refinement loop
+- 4 required + 4 recommended question templates
+- Parsing helpers: `_parse_environment`, `_parse_tier`, `_parse_providers`, `_parse_budget`, `_parse_compliance`
+- `_extract_workloads_from_text()` keyword-based bootstrap
+- `run_clarifier_node(state, llm, pricing_service)` entry point
+- `@observe()` + structlog throughout
+- **Verified**: 12/12 checks passed ✅
 
-### ⚠️ OLD SCAFFOLD — Needs Redesign
-- `src/engines/` — bin_packing.py, scoring.py, waf_compliance.py (use old ComputeSKU)
-- `src/main.py` — FastAPI shell
+---
 
-### 📝 PLACEHOLDERS — Not Yet Implemented
-- `src/agents/` — clarifier.py, profiler.py, sizer.py, finops.py, rfp_writer.py
-- `src/orchestrator/graph.py` — LangGraph workflow (state.py is done)
-- `src/api/` — dependencies.py, routes/health.py, routes/orchestration.py
-- `tests/` — conftest.py, unit/, integration/
-- `dashboard/` — React not scaffolded
+## What Needs to Be Built Next ❌
 
-## Key Decisions Already Made
-1. Python ≥3.13, uv, hatchling build backend
-2. LangGraph (langchain-core ONLY, NOT full langchain)
-3. AWS Bedrock Claude primary, Gemini optional backup
-4. LLM Factory with lazy imports — agents use BaseChatModel only
-5. LangFuse SDK v3 + structlog (@observe() on every agent node, `from langfuse import observe`)
-6. 5 Agents: Clarifier (conditional loop), Profiler, Sizer, FinOps, RFP Writer
-7. React dashboard (Vite + TS + Tailwind + shadcn/ui), chat-first, SSE streaming
-8. Normalize at adapter level — every provider returns NormalizedPriceItem only
-9. SQLite pricing cache via aiosqlite — PricingService facade, agents NEVER call providers directly
-10. TTL-based cache: 24h default, 6h spot/low-priority, 168h reserved/savings-plan
-11. LangGraph TypedDict state with Annotated[list, operator.add] for append-only reducers
-12. Category-agnostic WorkloadRequirement + ResourceSpec (supports all 14 ServiceCategories)
-13. ConversationState with ClarificationQuestion tracking + should_continue_clarifying gate
-14. AgentExecution tracking per agent (status, timing, retry_count) for observability
-15. Recommendation output uses NormalizedPriceItem everywhere (ComputeSKU/StorageSKU deprecated)
+### Next Immediate Task — Profiler Agent (`src/agents/profiler.py`)
+Currently a blank placeholder (3-line comment). Build it:
+- **Input**: `state["workload_request"]` (`WorkloadRequest`)
+- **Output**: writes `WorkloadProfile` (with `list[ComponentProfile]`) to `state["workload_profile"]`
+- For each `WorkloadRequirement`:
+  - Confirm/resolve `suggested_category` → `ComponentProfile.resolved_category`
+  - Estimate compute/storage/IOPS based on `ResourceSpec`
+  - Recommend instance families per cloud provider (via LLM + heuristics)
+  - Flag `requires_gpu`, note HA requirements
+- Entry point: `run_profiler_node(state, llm)` — same pattern as clarifier
+- Must use `@observe()` + structlog + `BaseChatModel` (never import ChatBedrockConverse)
 
-## What to Build Next
+### Then (in order)
+2. **Migrate engines** (`src/engines/bin_packing.py`, `scoring.py`) — replace `ComputeSKU`/`VMWorkload` with `NormalizedPriceItem`/`WorkloadRequirement`
+3. **Sizer agent** (`src/agents/sizer.py`) — `WorkloadProfile` → calls `PricingService.search_prices()` per component → bins K8s workloads → produces `list[SizedWorkloadResult]`
+4. **FinOps agent** (`src/agents/finops.py`) — `list[SizedWorkloadResult]` → `compare_across_providers()` → `CostComparison` with RI/SP/spot savings
+5. **RFP Writer agent** (`src/agents/rfp_writer.py`) — all upstream outputs → Markdown procurement document → `rfp_document` + `executive_summary`
+6. **LangGraph graph** (`src/orchestrator/graph.py`) — StateGraph wiring all 5 agents, conditional edge for Clarifier loop
+7. **API layer** — `dependencies.py`, `routes/health.py`, `routes/orchestration.py` (SSE streaming)
+8. **Fix `src/main.py`** — currently broken (wrong import path for configure_logging, missing router)
+9. **Dashboard** (`dashboard/`) — React + Vite + TypeScript + Tailwind + shadcn/ui, chat-first
 
-The state schema and all data models are now complete. The natural next step is:
-- **Agents** — Build the 5 agents one at a time: Clarifier → Profiler → Sizer → FinOps → RFP Writer
-  - Each agent reads from / writes to OrchestratorState (TypedDict)
-  - Each must use @observe() + structlog + BaseChatModel (from factory)
-  - Clarifier uses ConversationState for multi-turn loop gating
-  - Sizer calls PricingService (never adapters directly) and produces SizedWorkloadResult
-- **Orchestrator graph** — LangGraph StateGraph wiring the 5 agents, conditional edges for Clarifier loop
-- **API routes** — FastAPI SSE endpoint that invokes the orchestrator
-- **Live-test AWS/GCP** — Set up credentials and run live smoke tests
+---
 
-Please read `.github/copilot-instructions.md` and `docs/CURRENT_STATE_REVIEW.md` first, then ask me which direction to take.
+## Key Rules (from `.github/copilot-instructions.md`)
+1. **`@observe()` + structlog on every LangGraph node** — log entry (inputs) + exit (output summary) + errors with `exc_info=True`
+2. **Agents use `BaseChatModel` only** — never import `ChatBedrockConverse` etc. in agent files
+3. **Agents call `PricingService`** — never call adapters directly
+4. **State lists are append-only** — use `Annotated[list, operator.add]` reducers, never replace
+5. **`from langfuse import observe`** — SDK v3 import (NOT `langfuse.decorators`)
+
+---
+
+## Auth / Credentials (already set in `.env`)
+- **AWS**: Temporary STS session credentials (`ASIA` prefix) — expire after ~8h. Refresh from SSO portal if you get `ExpiredTokenException`. Used for both Pricing API AND Bedrock.
+- **GCP**: ADC via `gcloud auth application-default login` → `~/.config/gcloud/application_default_credentials.json`. Project: `dissertation-rj`.
+- **Azure**: No credentials needed (public REST API).
+- **LangFuse**: Keys not yet set — system degrades gracefully (harmless 401 warning in logs).
+
+---
+
+## Dev Commands
+```bash
+# Run any script
+uv run python scripts/test_aws_adapter.py
+
+# Sync deps after pyproject.toml change
+uv sync --all-extras
+
+# Run tests (when they exist)
+uv run pytest
+```
 ```
 
 ---
 
 ## Notes for Future Me
 
-- The `.venv` is already created with Python 3.13.0 and all 148 deps synced
-- Run `uv sync --all-extras` if deps change
-- All ✅ files were verified with `uv run python` — imports and defaults work
+- `.venv/` already created with Python 3.13.0 and all deps synced
 - `get_settings.cache_clear()` resets the singleton in tests
-- LangFuse gracefully degrades when keys are missing (warns, doesn't crash)
-- LangFuse SDK v3 import: `from langfuse import observe` (NOT `langfuse.decorators`)
-- Azure reserved prices: `retailPrice` = total upfront, NOT per-hour (despite `unitOfMeasure='1 Hour'`)
-- `monthly_cost_estimate` checks reservation tier BEFORE hourly to handle this correctly
+- LangFuse gracefully degrades when keys missing (warns, doesn't crash)
+- LangFuse SDK v3: `from langfuse import observe` (NOT `langfuse.decorators`)
+- Azure reserved prices: `retailPrice` = total upfront cost, NOT per-hour (even though `unitOfMeasure='1 Hour'`) — `monthly_cost_estimate` handles this by checking tier first
 - AWS adapter: boto3 sync calls wrapped in `asyncio.to_thread()`, region filtering uses human-readable location names
 - GCP adapter: gRPC sync calls wrapped in `asyncio.to_thread()`, price = `units + nanos/1e9`
-- AWS/GCP adapters NOT live-tested — need to set up credentials to verify against real APIs
+- Bedrock model ID requires `us.` prefix (cross-region inference profile) — bare `anthropic.*` returns `ValidationException`
 - PricingService is the single entry point for agents — never call adapters directly
-- Cache DB at `data/sku_cache.db` (auto-created). Per-tier TTL: spot=6h, on-demand=24h, reserved=7d
-- `compare_across_providers()` is designed for the FinOps agent's cross-provider workflow
-- Graceful degradation: live API failure + stale cache available → serve stale with warning log
+- Cache DB at `data/sku_cache.db` (auto-created)
+- `compare_across_providers()` designed for FinOps agent's cross-provider workflow
+- Engines (`bin_packing.py`, `scoring.py`) use deprecated `ComputeSKU` — needs migration before Sizer agent can call them
+- `src/main.py` is broken (wrong import) — fix after API routes are ready
