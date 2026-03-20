@@ -25,6 +25,7 @@ An Agentic AI-Driven Intelligent Decision Support System for Cloud-Agnostic Reso
 - `src/orchestrator/` — LangGraph workflow graph + shared state schema
 - `src/engines/` — Algorithmic engines: bin-packing, scoring, WAF compliance
 - `src/providers/` — Cloud provider adapters with normalized data output
+- `src/services/` — PricingService (cache-transparent facade) + PricingCache (SQLite via aiosqlite)
 - `src/api/` — FastAPI routes + dependency injection wiring
 - `src/main.py` — App factory + uvicorn entry point
 - `tests/` — Unit and integration tests (pytest)
@@ -73,20 +74,27 @@ Never import a provider-specific class (e.g., `ChatBedrockConverse`, `ChatGoogle
 2. Agent/node code receives the model instance via dependency injection — never constructs it.
 3. **Lazy imports** — provider packages are imported inside the factory branch, so `langchain-google-genai` is not required unless Gemini is selected.
 4. **Switching model = changing config** — zero code changes in agents/nodes.
-5. Gemini is an **optional dependency**: `pip install .[gemini]`.
+5. Gemini is an **optional dependency**: `uv sync --extra gemini`.
 
 ### Factory Pattern
 ```python
 from langchain_core.language_models import BaseChatModel
+from src.config.settings import LLMSettings, AWSSettings
 
-def get_llm(provider: str, model: str, **kwargs) -> BaseChatModel:
+def get_llm(llm_settings: LLMSettings, aws_settings: AWSSettings | None = None) -> BaseChatModel:
+    """Lazy-import factory. Agents receive this via dependency injection."""
+    provider = llm_settings.provider.value
     if provider == "bedrock":
-        from langchain_aws import ChatBedrockConverse
-        return ChatBedrockConverse(model=model, **kwargs)
+        from langchain_aws import ChatBedrockConverse  # lazy import
+        return ChatBedrockConverse(
+            model=llm_settings.model,
+            region_name=aws_settings.resolved_bedrock_region,
+            # credentials passed if explicitly set; otherwise IAM role / SSO
+        )
     elif provider == "gemini":
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(model=model, **kwargs)
-    raise ValueError(f"Unsupported LLM provider: {provider}")
+        from langchain_google_genai import ChatGoogleGenerativeAI  # lazy import
+        return ChatGoogleGenerativeAI(model=llm_settings.model)
+    raise ValueError(f"Unsupported LLM provider: {provider!r}")
 ```
 
 ## Coding Conventions
@@ -105,3 +113,38 @@ def get_llm(provider: str, model: str, **kwargs) -> BaseChatModel:
 - Always verify package `requires_python` on PyPI before adding a new dependency
 - Pin minimum versions to known-good releases; avoid upper-bound pins unless required
 - Run `pip check` after any dependency change to catch conflicts early
+
+## Documentation Maintenance (MANDATORY — Do This After Every Task)
+
+After completing any meaningful task (new file, agent, migration, bug fix), you MUST update:
+
+### 1. `docs/PROJECT_SPEC.md` — Source of Truth
+Update the relevant section(s) to reflect the new state:
+- Change the status symbol for any file you built or modified (❌/🔧 → ✅)
+- Update the "What it does" description if behaviour changed
+- Add new exported symbols to the symbol tables
+- Mark live-test results when scripts are run (e.g. "Yes (6/6 ✅)")
+- Remove completed items from the build order phases; update phase tables
+- Update the `Last Updated` date in the header
+
+### 2. `docs/CONTINUATION_PROMPT.md` — New Chat Starter
+Keep the paste-block accurate so any new Copilot chat can immediately pick up the work:
+- Move newly completed items from "What Needs to Be Built Next" to "What's Fully Built"
+- Update "Next Immediate Task" to the correct next item
+- Add any new gotchas or lessons learned to "Notes for Future Me"
+- Update the `Last Updated` date in the header
+
+### When to Update
+| Event | Update PROJECT_SPEC | Update CONTINUATION_PROMPT |
+|-------|--------------------|-----------------------------|
+| New file fully implemented + verified | ✅ | ✅ |
+| Existing file significantly changed | ✅ | Only if it affects what to build next |
+| Live test run (pass or fail) | ✅ (update test results) | ✅ (if it unblocks next task) |
+| Bug fixed in existing file | ✅ (update status/notes) | Only if it was blocking progress |
+| New decision made (tech, design) | ✅ (add to invariants if needed) | ✅ (add to Key Rules or Notes) |
+
+### Rule
+**Never leave a completed task undocumented.** A new chat agent reading only
+`copilot-instructions.md` + `PROJECT_SPEC.md` + `CONTINUATION_PROMPT.md` must be able
+to understand exactly what is done, what is next, and how to proceed — without asking
+any clarifying questions.
