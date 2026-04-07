@@ -118,7 +118,7 @@ def get_llm(llm_settings: LLMSettings, aws_settings: AWSSettings | None = None) 
 
 After completing any meaningful task (new file, agent, migration, bug fix), you MUST update:
 
-### 1. `docs/PROJECT_SPEC.md` — Source of Truth
+### 1. `.github/PROJECT_SPEC.md` — Source of Truth
 Update the relevant section(s) to reflect the new state:
 - Change the status symbol for any file you built or modified (❌/🔧 → ✅)
 - Update the "What it does" description if behaviour changed
@@ -127,7 +127,7 @@ Update the relevant section(s) to reflect the new state:
 - Remove completed items from the build order phases; update phase tables
 - Update the `Last Updated` date in the header
 
-### 2. `docs/CONTINUATION_PROMPT.md` — New Chat Starter
+### 2. `.github/CONTINUATION_PROMPT.md` — New Chat Starter
 Keep the paste-block accurate so any new Copilot chat can immediately pick up the work:
 - Move newly completed items from "What Needs to Be Built Next" to "What's Fully Built"
 - Update "Next Immediate Task" to the correct next item

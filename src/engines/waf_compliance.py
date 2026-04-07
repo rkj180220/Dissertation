@@ -18,6 +18,7 @@ from src.models.recommendation import (
     ComplianceCheckResult,
     ComplianceReport,
 )
+from src.models.cloud_resource import ServiceCategory
 from src.models.workload import (
     EnvironmentType,
     WorkloadRequest,
@@ -73,16 +74,22 @@ def _check_reliability_replicas(
     """Reliability: Container replica counts."""
     checks: list[ComplianceCheckResult] = []
 
-    for wl in request.container_workloads:
+    container_workloads = [
+        w for w in request.workloads
+        if w.suggested_category == ServiceCategory.CONTAINER
+    ]
+
+    for wl in container_workloads:
+        replicas = wl.resources.replicas
         min_replicas = 2 if request.environment == EnvironmentType.PRODUCTION else 1
-        passed = wl.replicas >= min_replicas
+        passed = replicas >= min_replicas
         checks.append(
             ComplianceCheckResult(
                 pillar="Reliability",
                 check_name=f"Replica Count — {wl.name}",
                 passed=passed,
                 severity="high" if not passed else "low",
-                finding=f"{wl.replicas} replica(s) in {request.environment.value}",
+                finding=f"{replicas} replica(s) in {request.environment.value}",
                 recommendation=(
                     f"Set replicas ≥ {min_replicas} for {request.environment.value}"
                     if not passed
@@ -100,12 +107,17 @@ def _check_security_encryption(
     """Security: Encryption-at-rest for storage."""
     checks: list[ComplianceCheckResult] = []
 
-    for sr in request.storage_requirements:
+    storage_workloads = [
+        w for w in request.workloads
+        if w.suggested_category == ServiceCategory.STORAGE
+    ]
+
+    for sw in storage_workloads:
         # Default assumption: cloud-managed volumes have encryption at rest.
         checks.append(
             ComplianceCheckResult(
                 pillar="Security",
-                check_name=f"Encryption at Rest — {sr.name}",
+                check_name=f"Encryption at Rest — {sw.name}",
                 passed=True,
                 severity="critical",
                 finding="Managed block storage encrypts at rest by default",
@@ -113,7 +125,7 @@ def _check_security_encryption(
             )
         )
 
-    if not request.storage_requirements:
+    if not storage_workloads:
         checks.append(
             ComplianceCheckResult(
                 pillar="Security",
@@ -163,16 +175,23 @@ def _check_performance_efficiency(
     """Performance Efficiency: Over-provisioning detection for VMs."""
     checks: list[ComplianceCheckResult] = []
 
-    for vm in request.vm_workloads:
+    compute_workloads = [
+        w for w in request.workloads
+        if w.suggested_category == ServiceCategory.COMPUTE
+    ]
+
+    for vm in compute_workloads:
+        vcpus = vm.resources.vcpus or 0
+        gpu_required = (vm.resources.gpu_count or 0) > 0
         # Flag potentially over-specified VMs (> 64 vCPUs without GPU)
-        over_provisioned = vm.vcpus > 64 and not vm.gpu_required
+        over_provisioned = vcpus > 64 and not gpu_required
         checks.append(
             ComplianceCheckResult(
                 pillar="Performance Efficiency",
                 check_name=f"Right-sizing Check — {vm.name}",
                 passed=not over_provisioned,
                 severity="medium" if over_provisioned else "low",
-                finding=f"{vm.vcpus} vCPUs requested, GPU={vm.gpu_required}",
+                finding=f"{vcpus} vCPUs requested, GPU={gpu_required}",
                 recommendation=(
                     "Verify that > 64 vCPUs are justified; consider horizontal scaling"
                     if over_provisioned

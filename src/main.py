@@ -6,12 +6,9 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from config.logging_config import configure_logging
-from config.settings import get_settings
+from src.api.dependencies import lifespan
 from src.api.routes import router
-
-settings = get_settings()
-configure_logging(settings.log_level)
+from src.config.settings import get_settings
 
 app = FastAPI(
     title="Cloud Orchestrator IDSS",
@@ -22,6 +19,7 @@ app = FastAPI(
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -35,14 +33,9 @@ app.add_middleware(
 app.include_router(router, prefix="/api/v1")
 
 
-@app.get("/health")
-async def health_check() -> dict[str, str]:
-    """Health check endpoint."""
-    return {"status": "healthy", "service": "cloud-orchestrator-idss"}
-
-
 def run() -> None:
     """Launch the API server."""
+    settings = get_settings()
     uvicorn.run(
         "src.main:app",
         host=settings.host,

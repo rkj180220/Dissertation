@@ -43,3 +43,6 @@ logs/
 .pytest_cache/
 htmlcov/
 .coverage
+
+# Documentation (contains confidential data)
+docs/

@@ -10,8 +10,14 @@ from __future__ import annotations
 import structlog
 from dataclasses import dataclass
 
-from src.models.cloud_resource import ComputeSKU
-from src.models.workload import VMWorkload
+from src.engines import (
+    extract_generation,
+    extract_gpu_count,
+    extract_memory_gb,
+    extract_vcpus,
+)
+from src.models.pricing import NormalizedPriceItem
+from src.models.workload import WorkloadRequirement
 
 logger = structlog.get_logger(__name__)
 
@@ -31,9 +37,9 @@ class ScoringWeights:
 
 @dataclass
 class ScoredSKU:
-    """A compute SKU annotated with its computed score."""
+    """A normalised price item annotated with its computed score."""
 
-    sku: ComputeSKU
+    sku: NormalizedPriceItem
     total_score: float
     cost_score: float
     cpu_fit_score: float
@@ -41,7 +47,7 @@ class ScoredSKU:
     generation_score: float
 
 
-def _cost_score(sku: ComputeSKU, max_price: float) -> float:
+def _cost_score(sku: NormalizedPriceItem, max_price: float) -> float:
     """Score inversely proportional to cost (cheaper = better).
 
     Args:
@@ -53,7 +59,7 @@ def _cost_score(sku: ComputeSKU, max_price: float) -> float:
     """
     if max_price <= 0:
         return 1.0
-    return round(1.0 - (sku.price_per_hour_usd / max_price), 4)
+    return round(1.0 - (sku.unit_price / max_price), 4)
 
 
 def _fit_score(required: float, available: float) -> float:
@@ -76,11 +82,12 @@ def _fit_score(required: float, available: float) -> float:
     return round(ratio, 4)
 
 
-def _generation_score(sku: ComputeSKU) -> float:
+def _generation_score(sku: NormalizedPriceItem) -> float:
     """Prefer newer processor generations.
 
     Simple heuristic: if generation info is available and contains
-    a numeric suffix, higher numbers score better.
+    a numeric suffix, higher numbers score better.  AWS-style
+    ``currentGeneration=Yes`` maps to ``"current"`` and scores 0.8.
 
     Args:
         sku: Candidate SKU.
@@ -88,10 +95,15 @@ def _generation_score(sku: ComputeSKU) -> float:
     Returns:
         Score between 0.0 and 1.0.
     """
-    if not sku.generation:
+    gen = extract_generation(sku)
+    if not gen:
         return 0.5  # Neutral score for unknown generation
+    if gen == "current":
+        return 0.8  # AWS currentGeneration=Yes
+    if gen == "previous":
+        return 0.3  # AWS currentGeneration=No
     # Extract trailing digits
-    digits = "".join(c for c in sku.generation if c.isdigit())
+    digits = "".join(c for c in gen if c.isdigit())
     if not digits:
         return 0.5
     gen_num = int(digits)
@@ -100,15 +112,15 @@ def _generation_score(sku: ComputeSKU) -> float:
 
 
 def score_skus(
-    workload: VMWorkload,
-    candidates: list[ComputeSKU],
+    workload: WorkloadRequirement,
+    candidates: list[NormalizedPriceItem],
     weights: ScoringWeights | None = None,
 ) -> list[ScoredSKU]:
-    """Score and rank candidate SKUs for a VM workload.
+    """Score and rank candidate SKUs for a workload requirement.
 
     Args:
-        workload: The VM workload requirement.
-        candidates: List of compute SKUs to evaluate.
+        workload: The workload requirement to match against.
+        candidates: List of normalised price items to evaluate.
         weights: Optional scoring weights override.
 
     Returns:
@@ -117,30 +129,40 @@ def score_skus(
     if weights is None:
         weights = ScoringWeights()
 
+    # Extract workload resource needs
+    req_vcpus = workload.resources.vcpus or 0
+    req_memory_gb = workload.resources.memory_gb or 0.0
+    req_gpu = workload.resources.gpu_count or 0
+
     # Filter out SKUs that cannot meet minimum requirements
-    eligible = [
-        sku for sku in candidates
-        if sku.vcpus >= workload.vcpus
-        and sku.memory_gb >= workload.memory_gb
-        and (not workload.gpu_required or sku.gpu_count >= workload.gpu_count)
-    ]
+    eligible: list[NormalizedPriceItem] = []
+    for sku in candidates:
+        sku_vcpus = extract_vcpus(sku)
+        sku_memory = extract_memory_gb(sku)
+        sku_gpu = extract_gpu_count(sku)
+        if (
+            sku_vcpus >= req_vcpus
+            and sku_memory >= req_memory_gb
+            and (req_gpu == 0 or sku_gpu >= req_gpu)
+        ):
+            eligible.append(sku)
 
     if not eligible:
         logger.warning(
             "no_eligible_skus",
             workload=workload.name,
-            vcpus=workload.vcpus,
-            memory_gb=workload.memory_gb,
+            vcpus=req_vcpus,
+            memory_gb=req_memory_gb,
         )
         return []
 
-    max_price = max(s.price_per_hour_usd for s in eligible) if eligible else 1.0
+    max_price = max(s.unit_price for s in eligible) if eligible else 1.0
 
     scored: list[ScoredSKU] = []
     for sku in eligible:
         cs = _cost_score(sku, max_price)
-        cpu_fs = _fit_score(workload.vcpus, sku.vcpus)
-        mem_fs = _fit_score(workload.memory_gb, sku.memory_gb)
+        cpu_fs = _fit_score(req_vcpus, extract_vcpus(sku))
+        mem_fs = _fit_score(req_memory_gb, extract_memory_gb(sku))
         gs = _generation_score(sku)
 
         total = round(
@@ -169,7 +191,7 @@ def score_skus(
         workload=workload.name,
         candidates=len(candidates),
         eligible=len(eligible),
-        top_sku=scored[0].sku.display_name if scored else "none",
+        top_sku=scored[0].sku.sku_name if scored else "none",
     )
 
     return scored

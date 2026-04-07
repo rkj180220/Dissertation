@@ -3,7 +3,7 @@
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
 > **Additional Examiner**: Santhosh Kirubakaran
-> **Last Updated**: 20 March 2026
+> **Last Updated**: 7 April 2026
 > **LLM**: Claude Sonnet 4.5 (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`) via AWS Bedrock
 
 ---
@@ -98,8 +98,8 @@ User (React chat) → FastAPI (SSE) → LangGraph Orchestrator
 |--------|------|-------------|
 | `CloudProvider` | Enum | `aws`, `azure`, `gcp` |
 | `ServiceCategory` | Enum | 14 values: `COMPUTE`, `SERVERLESS_COMPUTE`, `CONTAINER`, `SERVERLESS_FUNCTION`, `DATABASE`, `STORAGE`, `NETWORKING`, `AI_ML`, `ANALYTICS`, `MANAGEMENT`, `SECURITY`, `INTEGRATION`, `IOT`, `OTHER` |
-| `ComputeSKU` | Pydantic | **Deprecated** — kept for `engines/` backward compat only |
-| `StorageSKU` | Pydantic | **Deprecated** — kept for `engines/` backward compat only |
+| `ComputeSKU` | Pydantic | **Deprecated** — engines now use `NormalizedPriceItem` with attribute extraction helpers |
+| `StorageSKU` | Pydantic | **Deprecated** — engines now use `NormalizedPriceItem` with attribute extraction helpers |
 
 ### 4b. `pricing.py` ✅
 | Symbol | Kind | Description |
@@ -176,7 +176,7 @@ Exports all of the above (90+ symbols). Both new models and deprecated legacy mo
 | File | Status | What it does |
 |------|--------|-------------|
 | `state.py` | ✅ | `OrchestratorState` TypedDict. Append-only lists via `Annotated[list, operator.add]`: `messages`, `sized_results`, `savings_opportunities`. Last-writer-wins fields: `conversation`, `workload_request`, `workload_profile`, `cost_comparison`, `rfp_document`, `compliance_report`, `kpis`. `AgentStatus` enum, `AgentExecution` model (timing + retry tracking), `SizedWorkloadResult` (fit score, selected SKU + alternatives). `create_initial_state()` factory. |
-| `graph.py` | 🔧 | **Placeholder only** — empty file |
+| `graph.py` | ✅ | **247 lines. Fully implemented.** `StateGraph` with 5 nodes (clarifier, profiler, sizer, finops, rfp_writer). Conditional edge for Clarifier loop via `_should_continue_clarifying()`. Node wrapper factories inject LLM + PricingService via closures. `build_graph(llm, pricing_service)` returns compiled graph. `@observe()` + structlog throughout. |
 | `__init__.py` | ✅ | Exports `OrchestratorState`, `create_initial_state`, `AgentStatus`, `AgentExecution`, `SizedWorkloadResult`. |
 
 ### State Fields per Agent
@@ -199,24 +199,24 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 | File | Status | What it does / will do |
 |------|--------|----------------------|
 | `clarifier.py` | ✅ | **596 lines. Fully implemented.** Multi-turn requirement refinement loop. 4 required + 4 recommended question templates. Parsing utilities: `_parse_environment`, `_parse_tier`, `_parse_providers`, `_parse_budget`, `_parse_compliance`. `_extract_workloads_from_text()` keyword-based bootstrap. `run_clarifier_node(state, llm, pricing_service)` entry point. `@observe()` + structlog throughout. **Validated: 12/12 checks passed.** |
-| `profiler.py` | ❌ | **Not implemented.** Should: take `WorkloadRequest` → produce `WorkloadProfile` with one `ComponentProfile` per workload. Resolve `suggested_category`, estimate compute/storage/IOPS, recommend instance families via LLM + heuristics. |
-| `sizer.py` | ❌ | **Not implemented.** Should: take `WorkloadProfile` → call `PricingService.search_prices()` per component → score candidates → bin-pack K8s workloads → produce `list[SizedWorkloadResult]`. |
-| `finops.py` | ❌ | **Not implemented.** Should: take `list[SizedWorkloadResult]` → call `PricingService.compare_across_providers()` → compute `ProviderCostBreakdown` per provider → identify RI/SP/spot savings → produce `CostComparison`. |
-| `rfp_writer.py` | ❌ | **Not implemented.** Should: take all upstream outputs → generate a Markdown procurement document (executive summary, technical spec, cost tables, WAF compliance, vendor shortlist) → populate `rfp_document` and `executive_summary` in state. |
+| `profiler.py` | ✅ | **~600 lines. Fully implemented.** Takes `WorkloadRequest` → produces `WorkloadProfile` with one `ComponentProfile` per workload. Priority-ordered category resolution (AI_ML > DATABASE > CONTAINER > COMPUTE), tier-based resource multipliers, environment scaling factors, instance-family recommendation per provider, LLM-enriched rationale with heuristic fallback. `run_profiler_node(state, llm)` entry point. `@observe()` + structlog throughout. **Validated: 23/23 checks passed.** |
+| `sizer.py` | ✅ | **920 lines. Fully implemented.** Category-aware SKU selection: scored categories (COMPUTE, AI_ML) use `scoring.score_skus()`, binpacked categories (CONTAINER) use `bin_packing.pack_workloads()` with cost-efficient node selection, all others use cheapest-price selection. `_SERVICE_NAME_MAP` (24 provider×category→service_name), `_get_region_for_provider()`, `_build_workload_requirement_for_component()`, `_select_best_by_price()`, `_size_compute_workload()`, `_size_container_workload()`, `_size_generic_workload()`, `_generate_sizer_summary()` (LLM with heuristic fallback). `run_sizer_node(state, llm, pricing_service)` entry point. `@observe()` + structlog throughout. |
+| `finops.py` | ✅ | **744 lines. Fully implemented.** Groups `SizedWorkloadResult` by provider, queries RI/spot pricing per SKU, builds `ProviderCostBreakdown` per provider, assembles `CostComparison`. `_CATEGORY_TO_COST_FIELD` mapping, `_group_results_by_provider()`, `_build_provider_breakdown()`, `_generate_finops_summary()` (LLM with heuristic fallback). `run_finops_node(state, llm, pricing_service)` entry point. `@observe()` + structlog throughout. |
+| `rfp_writer.py` | ✅ | **653 lines. Fully implemented.** Generates Markdown RFP with 7 sections (header, exec summary, workload summary, SKU selections, cost comparison, compliance, vendor shortlist). Uses `evaluate_compliance()` from `waf_compliance`. `_build_header_section()`, `_build_workload_summary_section()`, `_build_sku_selection_section()`, `_build_cost_comparison_section()`, `_build_compliance_section()`, `_build_vendor_shortlist_section()`, `_generate_executive_summary()` (LLM with heuristic fallback). `run_rfp_writer_node(state, llm)` entry point. `@observe()` + structlog throughout. |
 | `__init__.py` | ✅ | Exists (empty re-export shell). |
 
 ---
 
 ## 9. Algorithmic Engines — `src/engines/`
 
-> ⚠️ All 3 engines are **functional but use deprecated models** (`ComputeSKU`, `VMWorkload`, `ContainerWorkload`). They need updating to use `NormalizedPriceItem` and `WorkloadRequirement` before the Sizer agent can call them.
+> ✅ All 3 engines have been **migrated** from deprecated models (`ComputeSKU`, `VMWorkload`, `ContainerWorkload`) to `NormalizedPriceItem` and `WorkloadRequirement`. Shared attribute extraction helpers in `__init__.py`.
 
 | File | Status | What it does |
 |------|--------|-------------|
-| `bin_packing.py` | ⚠️ | 307 lines. First-Fit Decreasing (FFD) + Best-Fit Decreasing (BFD) algorithms. Packs container workloads onto nodes. Uses `ComputeSKU` → **needs migration to `NormalizedPriceItem`**. |
-| `scoring.py` | ⚠️ | 176 lines. Weighted multi-criteria scorer (cost 40%, CPU fit 25%, memory fit 25%, generation 10%). Uses `ComputeSKU` + `VMWorkload` → **needs migration**. |
-| `waf_compliance.py` | ⚠️ | 291 lines. Rule-based WAF pillar checks (Reliability, Security, Performance, Cost, Ops Excellence, Sustainability). Uses `WorkloadRequest` + `BinPackingResult` — `WorkloadRequest` is already new-model compatible. Mostly OK after `bin_packing.py` migration. |
-| `__init__.py` | ✅ | Exists. |
+| `__init__.py` | ✅ | Shared attribute extraction helpers: `extract_vcpus()`, `extract_memory_gb()`, `extract_gpu_count()`, `extract_generation()`. Handles standardised keys + AWS-style fallbacks. |
+| `bin_packing.py` | ✅ | 307→313 lines. FFD + BFD algorithms. Uses `NormalizedPriceItem` (node SKU) + `WorkloadRequirement` (container workloads, via `resources.cpu_request_millicores`/`memory_request_mb`/`replicas`). Cost via `monthly_cost_estimate`. **Validated: 60/60 checks passed (shared script).** |
+| `scoring.py` | ✅ | 176→182 lines. Weighted multi-criteria scorer (cost 40%, CPU fit 25%, memory fit 25%, generation 10%). Uses `NormalizedPriceItem` + `WorkloadRequirement`. Extracts specs via attribute helpers. AWS `currentGeneration` → "current"/"previous" scoring. **Validated: 60/60 checks passed (shared script).** |
+| `waf_compliance.py` | ✅ | 291→303 lines. Rule-based WAF pillar checks. Now filters `request.workloads` by `ServiceCategory` (CONTAINER/COMPUTE/STORAGE) instead of deprecated `request.container_workloads`/`vm_workloads`/`storage_requirements`. **Validated: 60/60 checks passed (shared script).** |
 
 ---
 
@@ -224,9 +224,9 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 
 | File | Status | What it does / will do |
 |------|--------|----------------------|
-| `dependencies.py` | ❌ | **Placeholder.** Should: FastAPI `Depends()` providers for `get_llm()`, `get_settings()`, `get_pricing_service()`, `get_db()`. |
-| `routes/health.py` | ❌ | **Placeholder.** Should: `GET /health` (liveness) + `GET /ready` (readiness — checks DB + LLM reachability). |
-| `routes/orchestration.py` | ❌ | **Placeholder.** Should: `POST /orchestrate` — accept `WorkloadRequest` JSON, invoke LangGraph workflow, stream agent responses back via SSE (`sse-starlette`). |
+| `dependencies.py` | ✅ | **114 lines. Fully implemented.** ASGI `lifespan()` context manager: loads settings, configures observability, creates LLM, registers AWS/Azure/GCP providers with `PricingService`, initialises cache, compiles LangGraph, stores singletons on `app.state`. Dependency providers: `get_app_settings()`, `get_llm_dep()`, `get_pricing_service()`, `get_compiled_graph()`. |
+| `routes/health.py` | ✅ | **96 lines. Fully implemented.** `GET /health` (liveness — always 200). `GET /ready` (deep readiness — checks pricing service providers, LLM instance, compiled graph). |
+| `routes/orchestration.py` | ✅ | **208 lines. Fully implemented.** `POST /orchestrate` (full pipeline → JSON result). `POST /orchestrate/stream` (SSE streaming via `sse-starlette` — streams agent progress events + final result). Uses `create_initial_state()`, `graph.ainvoke()`. |
 | `routes/__init__.py` | ✅ | Exists. |
 | `__init__.py` | ✅ | Exists. |
 
@@ -236,7 +236,7 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 
 | Status | Notes |
 |--------|-------|
-| ⚠️ | Old scaffold. FastAPI app + CORS + router mount + `/health` stub + `uvicorn.run()` entrypoint exist. **Cannot start** — `src.api.routes.router` not yet implemented, wrong import path for `configure_logging`. Needs rewrite once API routes are ready. |
+| ✅ | **Rewritten.** FastAPI app with `lifespan=lifespan` (from `dependencies.py`), CORS middleware, router mount at `/api/v1`. `run()` launches uvicorn with settings. All imports verified. |
 
 ---
 
@@ -255,6 +255,8 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 | `test_pricing_service.py` | 25 — full cache lifecycle + 970× speedup | ✅ Passed |
 | `test_state_models.py` | 41 — all imports, enums, models, instantiation, behavior | ✅ Passed |
 | `test_clarifier_agent.py` | 12 — parsing, workload extraction, question generation, state flow | ✅ Passed |
+| `test_profiler_agent.py` | 23 — category resolution, resource estimation, instance families, profile assembly, node function, LLM fallback, imports, decorators | ✅ Passed |
+| `test_engines.py` | 60 — attribute extraction (standardised + AWS + MiB + missing), bin-packing (FFD/BFD/empty/incomplete/AWS), scoring (fit/filter/GPU/weights/AWS), WAF compliance (all 6 pillars, category filtering, over-provisioning) | ✅ Passed |
 | `test_azure_adapter.py` | 16 — live Azure API calls + assertions | ✅ Passed |
 | `test_aws_adapter.py` | 6 — EC2 search, m5.xlarge SKU, reserved tiers, RDS, fields, regions | ✅ Passed |
 | `test_gcp_adapter.py` | 6 — Compute Engine search, DATABASE, tiers, monthly estimate, fields, regions | ✅ Passed |
@@ -277,24 +279,24 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 
 Items in recommended implementation order:
 
-### Phase 1 — Complete the Agent Pipeline (highest priority)
+### Phase 1 — Complete the Agent Pipeline ✅ DONE
 
-| # | Task | Depends on | Est. scope |
-|---|------|-----------|------------|
-| 1 | **Profiler agent** (`src/agents/profiler.py`) | `WorkloadRequest`, `WorkloadProfile`, `ComponentProfile` — all ✅ | ~300 lines |
-| 2 | **Migrate engines** (`bin_packing.py`, `scoring.py`) | `NormalizedPriceItem` ✅ | ~80 lines of changes |
-| 3 | **Sizer agent** (`src/agents/sizer.py`) | Profiler ✅, `PricingService` ✅, engines (after migration) | ~400 lines |
-| 4 | **FinOps agent** (`src/agents/finops.py`) | Sizer ✅, `compare_across_providers()` ✅ | ~300 lines |
-| 5 | **RFP Writer agent** (`src/agents/rfp_writer.py`) | All upstream agents ✅, LLM factory ✅ | ~350 lines |
+| # | Task | Status |
+|---|------|--------|
+| ~~1~~ | ~~**Profiler agent**~~ (`src/agents/profiler.py`) | ✅ ~600 lines, 23/23 checks |
+| ~~2~~ | ~~**Migrate engines**~~ (`bin_packing.py`, `scoring.py`, `waf_compliance.py`) | ✅ 60/60 checks |
+| ~~3~~ | ~~**Sizer agent**~~ (`src/agents/sizer.py`) | ✅ 920 lines, imports verified |
+| ~~4~~ | ~~**FinOps agent**~~ (`src/agents/finops.py`) | ✅ 744 lines, imports verified |
+| ~~5~~ | ~~**RFP Writer agent**~~ (`src/agents/rfp_writer.py`) | ✅ 653 lines, imports verified |
 
-### Phase 2 — Wire the Orchestrator
+### Phase 2 — Wire the Orchestrator ✅ DONE
 
-| # | Task | Depends on |
-|---|------|-----------|
-| 6 | **LangGraph graph** (`src/orchestrator/graph.py`) | All 5 agents ✅, `OrchestratorState` ✅ |
-| 7 | **API dependencies** (`src/api/dependencies.py`) | LLM factory ✅, PricingService ✅ |
-| 8 | **API routes** (`src/api/routes/health.py`, `orchestration.py`) | Graph ✅, deps ✅ |
-| 9 | **Fix `src/main.py`** | Routes ✅ |
+| # | Task | Status |
+|---|------|--------|
+| ~~6~~ | ~~**LangGraph graph**~~ (`src/orchestrator/graph.py`) | ✅ 247 lines, imports verified |
+| ~~7~~ | ~~**API dependencies**~~ (`src/api/dependencies.py`) | ✅ 114 lines, imports verified |
+| ~~8~~ | ~~**API routes**~~ (`src/api/routes/health.py`, `orchestration.py`) | ✅ 96 + 208 lines, imports verified |
+| ~~9~~ | ~~**Fix `src/main.py`**~~ | ✅ Rewritten with lifespan |
 
 ### Phase 3 — Frontend
 

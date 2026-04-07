@@ -222,5 +222,5 @@ src/
 dashboard/           # React (Vite + TypeScript + Tailwind + shadcn/ui)
 ```
 
-See [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full per-file
+See [`.github/PROJECT_SPEC.md`](.github/PROJECT_SPEC.md) for the full per-file
 status, exported symbols, and build roadmap.

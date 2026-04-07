@@ -17,9 +17,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from src.models.cloud_resource import CloudProvider, ComputeSKU
+from src.engines import extract_memory_gb, extract_vcpus
+from src.models.pricing import HOURS_PER_MONTH, NormalizedPriceItem
 from src.models.recommendation import BinPackingResult, PackedNode
-from src.models.workload import ContainerWorkload
+from src.models.workload import WorkloadRequirement
 
 logger = structlog.get_logger(__name__)
 
@@ -42,7 +43,7 @@ NODE_MEMORY_OVERHEAD_MB = 512
 class _Bin:
     """Internal mutable representation of a node during packing."""
 
-    sku: ComputeSKU
+    sku: NormalizedPriceItem
     remaining_cpu_mc: int
     remaining_mem_mb: int
     assigned: list[str] = field(default_factory=list)
@@ -50,12 +51,12 @@ class _Bin:
     @property
     def allocatable_cpu_mc(self) -> int:
         """Total allocatable CPU after system overhead."""
-        return (self.sku.vcpus * 1000) - NODE_CPU_OVERHEAD_MILLICORES
+        return (extract_vcpus(self.sku) * 1000) - NODE_CPU_OVERHEAD_MILLICORES
 
     @property
     def allocatable_mem_mb(self) -> int:
         """Total allocatable memory after system overhead."""
-        return int(self.sku.memory_gb * 1024) - NODE_MEMORY_OVERHEAD_MB
+        return int(extract_memory_gb(self.sku) * 1024) - NODE_MEMORY_OVERHEAD_MB
 
     def fits(self, cpu_mc: int, mem_mb: int) -> bool:
         """Check whether a workload fits in the remaining capacity."""
@@ -80,10 +81,12 @@ class _Bin:
         return round(cpu_pct, 2), round(mem_pct, 2)
 
 
-def _new_bin(sku: ComputeSKU) -> _Bin:
-    """Create a fresh bin from a compute SKU."""
-    allocatable_cpu = (sku.vcpus * 1000) - NODE_CPU_OVERHEAD_MILLICORES
-    allocatable_mem = int(sku.memory_gb * 1024) - NODE_MEMORY_OVERHEAD_MB
+def _new_bin(sku: NormalizedPriceItem) -> _Bin:
+    """Create a fresh bin from a normalised price item."""
+    vcpus = extract_vcpus(sku)
+    memory_gb = extract_memory_gb(sku)
+    allocatable_cpu = (vcpus * 1000) - NODE_CPU_OVERHEAD_MILLICORES
+    allocatable_mem = int(memory_gb * 1024) - NODE_MEMORY_OVERHEAD_MB
     return _Bin(
         sku=sku,
         remaining_cpu_mc=max(allocatable_cpu, 0),
@@ -107,16 +110,34 @@ class _Item:
         return self.cpu_mc * 10_000 + self.mem_mb
 
 
-def _expand_workloads(workloads: list[ContainerWorkload]) -> list[_Item]:
-    """Expand workloads × replicas into individual packable items."""
+def _expand_workloads(workloads: list[WorkloadRequirement]) -> list[_Item]:
+    """Expand workloads × replicas into individual packable items.
+
+    Each ``WorkloadRequirement`` must have
+    ``resources.cpu_request_millicores`` and ``resources.memory_request_mb``
+    set.  Workloads missing either field are skipped with a warning.
+    """
     items: list[_Item] = []
     for wl in workloads:
-        for r in range(wl.replicas):
+        cpu_mc = wl.resources.cpu_request_millicores
+        mem_mb = wl.resources.memory_request_mb
+        replicas = wl.resources.replicas
+
+        if cpu_mc is None or mem_mb is None:
+            logger.warning(
+                "container_workload_missing_resource_spec",
+                workload=wl.name,
+                cpu_request_millicores=cpu_mc,
+                memory_request_mb=mem_mb,
+            )
+            continue
+
+        for r in range(replicas):
             items.append(
                 _Item(
                     name=f"{wl.name}-replica-{r}",
-                    cpu_mc=wl.cpu_request_millicores,
-                    mem_mb=wl.memory_request_mb,
+                    cpu_mc=cpu_mc,
+                    mem_mb=mem_mb,
                 )
             )
     # Sort descending by size (decreasing order for FFD/BFD).
@@ -126,7 +147,7 @@ def _expand_workloads(workloads: list[ContainerWorkload]) -> list[_Item]:
 
 # ─── Packing Algorithms ────────────────────────────────────
 
-def _first_fit_decreasing(items: list[_Item], sku: ComputeSKU) -> list[_Bin]:
+def _first_fit_decreasing(items: list[_Item], sku: NormalizedPriceItem) -> list[_Bin]:
     """First-Fit Decreasing bin-packing.
 
     Place each item (sorted largest-first) into the *first* bin
@@ -135,7 +156,7 @@ def _first_fit_decreasing(items: list[_Item], sku: ComputeSKU) -> list[_Bin]:
 
     Args:
         items: Pre-sorted list of workload items (descending).
-        sku: The node SKU template to use for new bins.
+        sku: The normalised price item to use as the node template.
 
     Returns:
         List of bins with workloads assigned.
@@ -165,7 +186,7 @@ def _first_fit_decreasing(items: list[_Item], sku: ComputeSKU) -> list[_Bin]:
     return bins
 
 
-def _best_fit_decreasing(items: list[_Item], sku: ComputeSKU) -> list[_Bin]:
+def _best_fit_decreasing(items: list[_Item], sku: NormalizedPriceItem) -> list[_Bin]:
     """Best-Fit Decreasing bin-packing.
 
     Place each item into the bin where it fits *most tightly*
@@ -173,7 +194,7 @@ def _best_fit_decreasing(items: list[_Item], sku: ComputeSKU) -> list[_Bin]:
 
     Args:
         items: Pre-sorted list of workload items (descending).
-        sku: The node SKU template to use for new bins.
+        sku: The normalised price item to use as the node template.
 
     Returns:
         List of bins with workloads assigned.
@@ -212,8 +233,8 @@ def _best_fit_decreasing(items: list[_Item], sku: ComputeSKU) -> list[_Bin]:
 # ─── Public API ─────────────────────────────────────────────
 
 def pack_workloads(
-    workloads: list[ContainerWorkload],
-    node_sku: ComputeSKU,
+    workloads: list[WorkloadRequirement],
+    node_sku: NormalizedPriceItem,
     algorithm: PackingAlgorithm = PackingAlgorithm.FIRST_FIT_DECREASING,
     pool_name: str = "default-pool",
 ) -> BinPackingResult:
@@ -222,8 +243,12 @@ def pack_workloads(
     This is the primary entry point for the bin-packing engine.
 
     Args:
-        workloads: Container workloads to pack.
-        node_sku: The compute SKU to use as the node template.
+        workloads: Container workloads to pack (must have
+            ``resources.cpu_request_millicores`` and
+            ``resources.memory_request_mb`` set).
+        node_sku: The normalised price item representing the
+            node template (must have ``vcpus`` and ``memory_gb``
+            in its ``attributes`` dict).
         algorithm: Packing strategy (FFD or BFD).
         pool_name: Kubernetes node pool name for the result.
 
@@ -244,7 +269,7 @@ def pack_workloads(
         "bin_packing_start",
         algorithm=algorithm.value,
         total_items=len(items),
-        node_sku=node_sku.display_name,
+        node_sku=node_sku.sku_name,
     )
 
     if algorithm == PackingAlgorithm.FIRST_FIT_DECREASING:
@@ -284,7 +309,10 @@ def pack_workloads(
         mem_eff = (total_alloc_mem - total_wasted_mem) / total_alloc_mem * 100
         packing_efficiency = round((cpu_eff + mem_eff) / 2, 2)
 
-    total_cost = round(len(bins) * node_sku.price_per_hour_usd * 730, 2)
+    monthly = node_sku.monthly_cost_estimate
+    if monthly is None:
+        monthly = node_sku.unit_price * HOURS_PER_MONTH
+    total_cost = round(len(bins) * monthly, 2)
 
     result = BinPackingResult(
         provider=node_sku.provider,
