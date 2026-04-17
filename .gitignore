@@ -46,3 +46,8 @@ htmlcov/
 
 # Documentation (contains confidential data)
 docs/
+
+# Dashboard / Frontend
+dashboard/node_modules/
+dashboard/dist/
+.vite/
