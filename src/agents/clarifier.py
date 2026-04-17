@@ -1,15 +1,13 @@
-"""Clarifier Agent — Multi-turn requirement refinement.
+"""Clarifier Agent — Single-pass intelligent requirement extraction.
 
-The Clarifier is the entry point to the orchestration pipeline. It engages
-the user in a multi-turn dialogue to disambiguate and refine their cloud
-infrastructure requirements until one of:
+The Clarifier is the entry point to the orchestration pipeline. It analyses
+the user's raw input, extracts structured workload requirements using both
+heuristics and the LLM, applies smart defaults for any gaps, and produces
+a refined ``WorkloadRequest`` ready for the Profiler.
 
-1. ``requirements_complete`` is marked True (all critical questions answered)
-2. ``max_clarification_turns`` is reached (fallback to defaults)
-3. All pending questions are resolved or skipped
-
-The agent's output is a refined ``WorkloadRequest`` with structured
-``WorkloadRequirement`` objects ready for the Profiler.
+This is a **single-pass** agent — it does not loop or ask follow-up
+questions. The user's initial input is processed once, and the pipeline
+proceeds immediately to the Profiler.
 
 ### Flow
 
@@ -18,29 +16,15 @@ User's raw input (from chat)
       │
       ▼
 ┌─────────────────────────┐
-│ Parse raw_user_input    │  ← Extract project name, workloads, constraints
-│ Generate questions      │    Build initial WorkloadRequest
+│ Heuristic extraction    │  ← Keywords → WorkloadRequirements
+│ Parse budget/env/tier   │  ← Regex/keyword parsing
+│ LLM enrichment          │  ← Infer missing fields from context
+│ Apply defaults           │  ← Fill remaining gaps
+│ Mark complete            │  ← requirements_complete = True
 └────────┬────────────────┘
          │
          ▼
-    Loop until:
-    - requirements_complete
-    - max_turns reached
-    - pending_questions empty
-         │
-         ├─► Ask pending question
-         │
-         ├─► User answers (append ChatMessage)
-         │
-         ├─► Parse answer → resolve ClarificationQuestion
-         │
-         └─► Check if more questions needed
-         
-         ▼
-┌─────────────────────────┐
-│ Mark complete           │
-│ Pass to Profiler        │
-└─────────────────────────┘
+   Proceed to Profiler
 ```
 
 ### Usage
@@ -56,30 +40,25 @@ state = create_initial_state(
 )
 
 state = await run_clarifier_node(state, llm, pricing_service)
-# state['conversation'].requirements_complete is now True or max_turns reached
+# state['conversation'].requirements_complete is now True
 # state['workload_request'] is populated
-# state['messages'] includes all clarification Q&A
+# state['messages'] has clarifier summary appended
 ```
 """
 
 from __future__ import annotations
 
-import json
-import operator
 import re
 from datetime import datetime, timezone
 from typing import Any
 
 import structlog
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from langfuse import observe
 
 from src.models.cloud_resource import CloudProvider, ServiceCategory
 from src.models.conversation import (
-    ClarificationPriority,
-    ClarificationQuestion,
-    ClarificationStatus,
     ChatMessage,
     MessageRole,
 )
@@ -95,74 +74,6 @@ from src.orchestrator.state import AgentExecution, AgentStatus, OrchestratorStat
 from src.services.pricing_service import PricingService
 
 logger = structlog.get_logger()
-
-
-# ---------------------------------------------------------------------------
-# Clarification question templates
-# ---------------------------------------------------------------------------
-
-
-REQUIRED_QUESTIONS = [
-    {
-        "id": "q_project_name",
-        "text": "What is the project or organization name?",
-        "target_field": "project_name",
-        "priority": ClarificationPriority.REQUIRED,
-        "default": "untitled",
-    },
-    {
-        "id": "q_environment",
-        "text": "What environment is this for? (production/staging/development/disaster_recovery)",
-        "target_field": "environment",
-        "priority": ClarificationPriority.REQUIRED,
-        "default": "production",
-    },
-    {
-        "id": "q_tier",
-        "text": "What is the criticality tier? (mission_critical/business_critical/non_critical)",
-        "target_field": "tier",
-        "priority": ClarificationPriority.REQUIRED,
-        "default": "business_critical",
-    },
-    {
-        "id": "q_workload_count",
-        "text": "How many distinct workload components do you have? (e.g., API backend, database, cache, job processor)",
-        "target_field": "workload_count",
-        "priority": ClarificationPriority.REQUIRED,
-        "default": "1",
-    },
-]
-
-RECOMMENDED_QUESTIONS = [
-    {
-        "id": "q_budget",
-        "text": "Do you have a monthly budget ceiling (USD)? (optional: press enter to skip)",
-        "target_field": "budget_monthly_usd",
-        "priority": ClarificationPriority.RECOMMENDED,
-        "default": None,
-    },
-    {
-        "id": "q_providers",
-        "text": "Which cloud providers would you like us to evaluate? (aws/azure/gcp, comma-separated)",
-        "target_field": "target_providers",
-        "priority": ClarificationPriority.RECOMMENDED,
-        "default": "aws,azure,gcp",
-    },
-    {
-        "id": "q_region",
-        "text": "Do you have a preferred region? (e.g., us-east-1, eastus, us-central1)",
-        "target_field": "preferred_region",
-        "priority": ClarificationPriority.RECOMMENDED,
-        "default": "us-east-1",
-    },
-    {
-        "id": "q_compliance",
-        "text": "Any compliance requirements? (e.g., hipaa,pci-dss,sox,waf; comma-separated or 'none')",
-        "target_field": "compliance_frameworks",
-        "priority": ClarificationPriority.RECOMMENDED,
-        "default": "waf",
-    },
-]
 
 
 # ---------------------------------------------------------------------------
@@ -211,13 +122,27 @@ def _parse_providers(text: str) -> list[CloudProvider]:
 
 
 def _parse_budget(text: str) -> float | None:
-    """Parse budget from user input."""
+    """Parse budget from user input.
+
+    Matches explicit ``$`` amounts (e.g. ``$5000``, ``$5,000/mo``) or
+    standalone numbers when the user answers a direct budget question.
+    Avoids matching incidental numbers like "3 microservices".
+    """
     text = text.strip()
     if not text or text.lower() in ("skip", "none", "no"):
         return None
-    match = re.search(r"(\d+(?:,\d{3})*|\d+(?:\.\d{2})?)", text.replace(",", ""))
+    # Explicit dollar sign: $5000, $5,000.00
+    match = re.search(r"\$\s*(\d+(?:,\d{3})*(?:\.\d{2})?)", text)
     if match:
-        return float(match.group(1))
+        return float(match.group(1).replace(",", ""))
+    # Standalone number (direct answer to "what's your budget?"): "5000"
+    match = re.match(
+        r"^\s*(\d+(?:,\d{3})*(?:\.\d{2})?)\s*(?:/\s*(?:mo|month))?\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return float(match.group(1).replace(",", ""))
     return None
 
 
@@ -325,6 +250,23 @@ def _extract_workloads_from_text(text: str) -> list[WorkloadRequirement]:
             )
         )
 
+    # Object storage workload
+    if (
+        "s3" in text_lower
+        or "object storage" in text_lower
+        or "blob" in text_lower
+        or "bucket" in text_lower
+    ):
+        workloads.append(
+            WorkloadRequirement(
+                name="Object Storage",
+                description="Scalable object/blob storage",
+                suggested_category=ServiceCategory.STORAGE,
+                scaling_pattern=ScalingPattern.GROWING,
+                resources=ResourceSpec(storage_gb=1000, storage_type="object"),
+            )
+        )
+
     # If no workloads detected, create a generic placeholder
     if not workloads:
         workloads.append(
@@ -350,19 +292,21 @@ async def run_clarifier_node(
     llm: BaseChatModel,
     pricing_service: PricingService,
 ) -> OrchestratorState:
-    """Execute one clarification turn, or loop until complete.
+    """Single-pass requirement extraction and enrichment.
 
-    This is a LangGraph node function. It reads from state['messages'] and
-    state['conversation'], appends clarification Q&A, and eventually sets
-    state['conversation'].requirements_complete = True to gate the next agent.
+    Extracts workloads, budget, environment, providers, and constraints
+    from the user's raw input using heuristics, parses explicit values,
+    then uses the LLM to infer anything that's missing. Sets
+    ``requirements_complete = True`` and proceeds.
 
     Args:
         state: Current OrchestratorState (TypedDict)
-        llm: LLM for generating clarifications
+        llm: LLM for enriching the requirement analysis
         pricing_service: For context (e.g., listing available regions)
 
     Returns:
-        Updated OrchestratorState with clarifications appended
+        Updated OrchestratorState with refined workload_request and
+        only NEW messages (for the append-only reducer).
     """
     log = logger.bind(
         agent="clarifier",
@@ -373,144 +317,114 @@ async def run_clarifier_node(
     log.info("clarifier_node_started")
 
     try:
-        # Get/init conversation and workload request
-        conversation = state.get("conversation") or {}
         workload_request = state.get("workload_request") or WorkloadRequest(
             project_name=state.get("project_name", "untitled"),
-            raw_user_input=state.get("messages", [{}])[0].get("content", "")
-            if state.get("messages")
-            else "",
+            raw_user_input=_extract_first_user_content(state.get("messages", [])),
         )
-        messages = state.get("messages", [])
 
-        # Convert ChatMessage list to LangChain messages for LLM
-        lc_messages: list[BaseMessage] = _chat_to_langchain(messages)
+        raw_input = workload_request.raw_user_input or ""
+        log.info("parsing_raw_input", raw_length=len(raw_input))
 
-        # --- First turn: extract initial workloads from raw input ---
-        if conversation.get("current_turn", 0) == 0:
-            log.info("first_turn_initialization")
+        # --- 1. Heuristic extraction of workloads ---
+        workload_request.workloads = _extract_workloads_from_text(raw_input)
+        log.info("workloads_extracted", count=len(workload_request.workloads))
 
-            # Parse raw input
-            raw_input = workload_request.raw_user_input or ""
-            workload_request.project_name = (
-                workload_request.project_name or "untitled"
-            )
-            workload_request.workloads = _extract_workloads_from_text(raw_input)
+        # --- 2. Parse explicit values from raw input ---
+        _parse_explicit_values(workload_request, raw_input)
+        log.info(
+            "explicit_values_parsed",
+            environment=str(workload_request.environment),
+            budget=workload_request.budget_monthly_usd,
+            providers=[str(p) for p in (workload_request.target_providers or [])],
+        )
 
-            # Generate initial clarification questions
-            questions = _generate_clarification_questions(conversation, workload_request)
-            conversation["clarification_questions"] = [q.model_dump() for q in questions]
-            conversation["current_turn"] = 1
+        # --- 3. LLM enrichment — infer missing context ---
+        llm_summary = await _llm_enrich_requirements(
+            llm, raw_input, workload_request, log
+        )
 
-            # Append LLM response with first question
-            if questions:
-                first_q = questions[0]
-                assistant_msg = ChatMessage(
-                    role=MessageRole.ASSISTANT,
-                    content=first_q.get("text", "Tell me more about your requirements."),
-                    agent_name="clarifier",
-                    metadata={"question_id": first_q.get("id")},
-                )
-                messages.append(assistant_msg)
+        # --- 4. Apply smart defaults for anything still missing ---
+        _apply_defaults(workload_request)
 
-            log.info(
-                "first_turn_complete",
-                workload_count=len(workload_request.workloads),
-                pending_questions=len(questions),
-            )
+        # --- 5. Build summary message ---
+        summary_parts = [
+            f"**Clarifier Analysis Complete** — {len(workload_request.workloads)} workload(s) identified:",
+        ]
+        for w in workload_request.workloads:
+            category = w.suggested_category.value if w.suggested_category else "unknown"
+            summary_parts.append(f"  • **{w.name}**: {category} — {w.description}")
 
-        else:
-            # --- Subsequent turns: parse answers, ask next question ---
-            log.info("subsequent_turn", turn=conversation.get("current_turn", 1))
+        summary_parts.append(f"\n**Environment**: {workload_request.environment.value}")
+        summary_parts.append(f"**Tier**: {workload_request.tier.value}")
+        if workload_request.budget_monthly_usd:
+            summary_parts.append(f"**Budget**: ${workload_request.budget_monthly_usd:,.0f}/mo")
+        if workload_request.target_providers:
+            providers_str = ", ".join(p.value for p in workload_request.target_providers)
+            summary_parts.append(f"**Providers**: {providers_str}")
+        if workload_request.preferred_region:
+            summary_parts.append(f"**Region**: {workload_request.preferred_region}")
 
-            # Find the last user message (their answer to previous question)
-            user_answer = None
-            for msg in reversed(messages):
-                if isinstance(msg, ChatMessage) and msg.role == MessageRole.USER:
-                    user_answer = msg.content
-                    break
+        if llm_summary:
+            summary_parts.append(f"\n{llm_summary}")
 
-            if user_answer:
-                questions = [
-                    ClarificationQuestion(**q)
-                    for q in conversation.get("clarification_questions", [])
-                ]
-                pending = [q for q in questions if q.status == ClarificationStatus.PENDING]
+        summary_content = "\n".join(summary_parts)
 
-                if pending:
-                    # Resolve the first pending question with the user's answer
-                    pending[0].user_answer = user_answer
-                    pending[0].status = ClarificationStatus.ANSWERED
-                    pending[0].resolved_value = user_answer
-
-                    # Apply to workload_request
-                    _apply_clarification_to_request(
-                        workload_request, pending[0], user_answer
-                    )
-
-                    # Check if there are more questions
-                    remaining = [q for q in questions if q.status == ClarificationStatus.PENDING]
-
-                    if remaining and conversation.get("current_turn", 0) < conversation.get(
-                        "max_clarification_turns", 5
-                    ):
-                        # Ask next question
-                        next_q = remaining[0]
-                        assistant_msg = ChatMessage(
-                            role=MessageRole.ASSISTANT,
-                            content=next_q.question_text,
-                            agent_name="clarifier",
-                            metadata={"question_id": next_q.question_id},
-                        )
-                        messages.append(assistant_msg)
-                        conversation["current_turn"] = conversation.get("current_turn", 1) + 1
-                        log.info(
-                            "next_question_asked",
-                            question_id=next_q.question_id,
-                            turn=conversation["current_turn"],
-                        )
-                    else:
-                        # All questions done or max turns reached
-                        conversation["requirements_complete"] = True
-                        log.info("clarification_complete", turn=conversation.get("current_turn"))
-
-        # Update state
-        state["messages"] = messages
-        state["conversation"] = conversation
-        state["workload_request"] = workload_request
-
-        # Track execution
-        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-        if "agent_executions" not in state:
-            state["agent_executions"] = {}
-        state["agent_executions"]["clarifier"] = AgentExecution(
+        summary_message = ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=summary_content,
             agent_name="clarifier",
-            status=AgentStatus.COMPLETED,
-            started_at=start_time,
-            completed_at=datetime.now(timezone.utc),
-            duration_ms=elapsed,
+            metadata={"phase": "requirement_extraction"},
         )
+
+        # --- 6. Mark requirements complete ---
+        from src.models.conversation import ConversationState as _CS
+        conversation = _CS(
+            conversation_id=state.get("request_id", ""),
+            current_turn=1,
+            requirements_complete=True,
+        )
+
+        # --- 7. Return ONLY new data (messages uses operator.add reducer) ---
+        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
 
         log.info(
             "clarifier_node_completed",
             elapsed_ms=elapsed,
-            total_messages=len(messages),
-            requirements_complete=conversation.get("requirements_complete", False),
+            workload_count=len(workload_request.workloads),
+            environment=str(workload_request.environment),
         )
 
-        return state
+        return {
+            "messages": [summary_message],  # append-only: only new messages
+            "conversation": conversation,
+            "workload_request": workload_request,
+            "current_agent": "profiler",
+            "agent_executions": {
+                **state.get("agent_executions", {}),
+                "clarifier": AgentExecution(
+                    agent_name="clarifier",
+                    status=AgentStatus.COMPLETED,
+                    started_at=start_time,
+                    completed_at=datetime.now(timezone.utc),
+                    duration_ms=elapsed,
+                ),
+            },
+        }
 
     except Exception as e:
         log.error("clarifier_node_failed", exc_info=True)
-        state["error"] = str(e)
-        if "agent_executions" not in state:
-            state["agent_executions"] = {}
-        state["agent_executions"]["clarifier"] = AgentExecution(
-            agent_name="clarifier",
-            status=AgentStatus.FAILED,
-            error_message=str(e),
-        )
-        raise
+        return {
+            "error": str(e),
+            "current_agent": "clarifier",
+            "agent_executions": {
+                **state.get("agent_executions", {}),
+                "clarifier": AgentExecution(
+                    agent_name="clarifier",
+                    status=AgentStatus.FAILED,
+                    error_message=str(e),
+                ),
+            },
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -518,79 +432,110 @@ async def run_clarifier_node(
 # ---------------------------------------------------------------------------
 
 
-def _chat_to_langchain(messages: list[ChatMessage]) -> list[BaseMessage]:
-    """Convert ChatMessage list to LangChain BaseMessage list."""
-    lc_messages = []
-    for msg in messages:
-        if msg.role == MessageRole.USER:
-            lc_messages.append(HumanMessage(content=msg.content))
-        elif msg.role == MessageRole.ASSISTANT:
-            from langchain_core.messages import AIMessage
-
-            lc_messages.append(AIMessage(content=msg.content))
-        elif msg.role == MessageRole.SYSTEM:
-            lc_messages.append(SystemMessage(content=msg.content))
-    return lc_messages
+def _extract_first_user_content(messages: list) -> str:
+    """Safely extract content from the first message (dict or ChatMessage)."""
+    if not messages:
+        return ""
+    first = messages[0]
+    if hasattr(first, "content"):
+        return first.content
+    if isinstance(first, dict):
+        return first.get("content", "")
+    return ""
 
 
-def _generate_clarification_questions(
-    conversation: dict[str, Any],
-    workload_request: WorkloadRequest,
-) -> list[ClarificationQuestion]:
-    """Generate the next set of clarification questions.
+def _parse_explicit_values(req: WorkloadRequest, raw_input: str) -> None:
+    """Parse explicitly stated values from user's raw input text."""
+    text = raw_input.lower()
 
-    Returns only REQUIRED questions on first pass, then RECOMMENDED.
+    # Environment detection
+    if any(kw in text for kw in ("production", "prod ")):
+        req.environment = EnvironmentType.PRODUCTION
+    elif "staging" in text:
+        req.environment = EnvironmentType.STAGING
+    elif any(kw in text for kw in ("development", "dev ")):
+        req.environment = EnvironmentType.DEVELOPMENT
+
+    # Tier detection
+    if "mission" in text and "critical" in text:
+        req.tier = WorkloadTier.MISSION_CRITICAL
+    elif "non" in text and "critical" in text:
+        req.tier = WorkloadTier.NON_CRITICAL
+
+    # Budget detection
+    budget = _parse_budget(raw_input)
+    if budget is not None:
+        req.budget_monthly_usd = budget
+
+    # Provider detection
+    providers = _parse_providers(raw_input)
+    if providers:
+        req.target_providers = providers
+
+    # Region detection
+    region_patterns = [
+        r"(us-east-\d|us-west-\d|eu-west-\d|eu-central-\d|ap-southeast-\d)",
+        r"(eastus|westus\d?|northeurope|westeurope|centralus)",
+        r"(us-central\d|us-east\d|europe-west\d|asia-east\d)",
+    ]
+    for pattern in region_patterns:
+        match = re.search(pattern, raw_input, re.IGNORECASE)
+        if match:
+            req.preferred_region = match.group(1)
+            break
+
+    # Compliance detection
+    compliance = _parse_compliance(raw_input)
+    if compliance and compliance != ["waf"]:
+        req.compliance_frameworks = compliance
+
+
+async def _llm_enrich_requirements(
+    llm: BaseChatModel,
+    raw_input: str,
+    req: WorkloadRequest,
+    log: Any,
+) -> str:
+    """Use LLM to analyse the user's input and provide contextual enrichment.
+
+    Returns a summary string for the user. Does NOT modify req — we keep
+    heuristic + default values authoritative to avoid hallucination.
     """
-    questions = []
+    prompt = f"""Analyse this cloud infrastructure request and provide a brief technical assessment.
 
-    # Always ask required questions first
-    for template in REQUIRED_QUESTIONS:
-        q = ClarificationQuestion(
-            question_id=template["id"],
-            question_text=template["text"],
-            target_field=template["target_field"],
-            priority=template["priority"],
-            status=ClarificationStatus.PENDING,
-            default_value=template.get("default"),
-        )
-        questions.append(q)
+USER INPUT:
+{raw_input}
 
-    # Then add recommended questions
-    for template in RECOMMENDED_QUESTIONS:
-        q = ClarificationQuestion(
-            question_id=template["id"],
-            question_text=template["text"],
-            target_field=template["target_field"],
-            priority=template["priority"],
-            status=ClarificationStatus.PENDING,
-            default_value=template.get("default"),
-        )
-        questions.append(q)
+EXTRACTED SO FAR:
+- Workloads: {', '.join(w.name for w in req.workloads)}
+- Environment: {req.environment.value if req.environment else 'not specified'}
+- Budget: {'$' + str(req.budget_monthly_usd) + '/mo' if req.budget_monthly_usd else 'not specified'}
+- Providers: {', '.join(p.value for p in req.target_providers) if req.target_providers else 'all'}
 
-    return questions
+Respond in 2-3 sentences. Note any implicit requirements, potential concerns, or assumptions being made. Do NOT ask questions — just analyse."""
+
+    try:
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        summary = response.content if hasattr(response, "content") else str(response)
+        log.info("llm_enrichment_complete", summary_length=len(summary))
+        return summary
+    except Exception:
+        log.warning("llm_enrichment_failed", exc_info=True)
+        return ""
 
 
-def _apply_clarification_to_request(
-    workload_request: WorkloadRequest,
-    question: ClarificationQuestion,
-    answer: str,
-) -> None:
-    """Apply a resolved clarification answer to the WorkloadRequest."""
-    target = question.target_field
-
-    if target == "project_name":
-        workload_request.project_name = answer.strip()
-    elif target == "environment":
-        workload_request.environment = _parse_environment(answer)
-    elif target == "tier":
-        workload_request.tier = _parse_tier(answer)
-    elif target == "budget_monthly_usd":
-        budget = _parse_budget(answer)
-        if budget is not None:
-            workload_request.budget_monthly_usd = budget
-    elif target == "target_providers":
-        workload_request.target_providers = _parse_providers(answer)
-    elif target == "preferred_region":
-        workload_request.preferred_region = answer.strip()
-    elif target == "compliance_frameworks":
-        workload_request.compliance_frameworks = _parse_compliance(answer)
+def _apply_defaults(req: WorkloadRequest) -> None:
+    """Fill in smart defaults for any missing fields."""
+    if not req.environment:
+        req.environment = EnvironmentType.PRODUCTION
+    if not req.tier:
+        req.tier = WorkloadTier.BUSINESS_CRITICAL
+    if not req.target_providers:
+        req.target_providers = [CloudProvider.AWS, CloudProvider.AZURE, CloudProvider.GCP]
+    if not req.preferred_region:
+        req.preferred_region = "us-east-1"
+    if not req.compliance_frameworks:
+        req.compliance_frameworks = ["waf"]
+    if not req.project_name or req.project_name == "untitled":
+        # Try to infer from input
+        req.project_name = req.project_name or "untitled"

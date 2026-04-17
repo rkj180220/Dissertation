@@ -26,6 +26,7 @@ from langfuse import observe
 from src.models.cloud_resource import CloudProvider, ServiceCategory
 from src.models.pricing import NormalizedPriceItem, PricingTier
 from src.providers.base_provider import BaseCloudProvider
+from src.engines.vm_specs import parse_azure_vm_specs
 
 logger = structlog.get_logger()
 
@@ -198,6 +199,8 @@ def _to_normalized(item: dict[str, Any]) -> NormalizedPriceItem:
             "service_family": item.get("serviceFamily", ""),
             "tier_minimum_units": item.get("tierMinimumUnits", 0),
             "azure_type": item.get("type", ""),
+            # Enrich with parsed VM specs (vcpus, memory_gb, generation)
+            **parse_azure_vm_specs(item.get("armSkuName", "")),
         },
     )
 

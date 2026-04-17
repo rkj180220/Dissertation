@@ -223,15 +223,8 @@ def build_graph(
     # START → clarifier
     graph.add_edge(START, "clarifier")
 
-    # Clarifier → conditional: loop or proceed to profiler
-    graph.add_conditional_edges(
-        "clarifier",
-        _should_continue_clarifying,
-        {
-            "clarifier": "clarifier",
-            "profiler": "profiler",
-        },
-    )
+    # Clarifier → profiler (single-pass, no loop)
+    graph.add_edge("clarifier", "profiler")
 
     # Linear pipeline: profiler → sizer → finops → rfp_writer → END
     graph.add_edge("profiler", "sizer")

@@ -359,12 +359,26 @@ class AWSPricingProvider(BaseCloudProvider):
 
     provider = CloudProvider.AWS
 
-    def __init__(self, *, region: str = _PRICING_REGION) -> None:
+    def __init__(
+        self,
+        *,
+        region: str = _PRICING_REGION,
+        access_key_id: str = "",
+        secret_access_key: str = "",
+        session_token: str = "",
+    ) -> None:
         self._region = region
+        self._access_key_id = access_key_id
+        self._secret_access_key = secret_access_key
+        self._session_token = session_token
         self._client = None  # lazy-init
 
     def _get_client(self):
         """Lazily create the boto3 Pricing client.
+
+        If explicit credentials were provided, they are passed to the
+        client.  Otherwise boto3 falls back to its default credential
+        chain (env vars → shared-credentials → instance profile).
 
         Returns:
             A ``boto3.client('pricing')`` instance.
@@ -372,7 +386,13 @@ class AWSPricingProvider(BaseCloudProvider):
         if self._client is None:
             import boto3
 
-            self._client = boto3.client("pricing", region_name=self._region)
+            kwargs: dict[str, str] = {"region_name": self._region}
+            if self._access_key_id and self._secret_access_key:
+                kwargs["aws_access_key_id"] = self._access_key_id
+                kwargs["aws_secret_access_key"] = self._secret_access_key
+                if self._session_token:
+                    kwargs["aws_session_token"] = self._session_token
+            self._client = boto3.client("pricing", **kwargs)
         return self._client
 
     # ------------------------------------------------------------------

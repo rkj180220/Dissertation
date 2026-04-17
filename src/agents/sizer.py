@@ -68,6 +68,7 @@ from langfuse import observe
 from src.engines import extract_memory_gb, extract_vcpus
 from src.engines.bin_packing import PackingAlgorithm, pack_workloads
 from src.engines.scoring import ScoredSKU, score_skus
+from src.engines.vm_specs import compose_gcp_vm_instances
 from src.models.cloud_resource import CloudProvider, ServiceCategory
 from src.models.conversation import ChatMessage, MessageRole
 from src.models.pricing import NormalizedPriceItem, PricingTier
@@ -747,6 +748,31 @@ async def run_sizer_node(
                     count=len(candidates),
                     region=region,
                 )
+
+                # ── Enrich candidates for compute workloads ───
+                if component.resolved_category in _SCORED_CATEGORIES:
+                    # GCP: Compute Engine returns per-component pricing
+                    # (per-vCPU, per-GB-RAM), not per-instance.  Inject
+                    # synthetic VM instances with proper specs for scoring.
+                    if provider == CloudProvider.GCP:
+                        gcp_vms = compose_gcp_vm_instances(region=region or "us-central1")
+                        candidates = gcp_vms
+                        comp_log.info(
+                            "gcp_synthetic_vms_injected",
+                            synthetic_count=len(gcp_vms),
+                        )
+                    else:
+                        # Filter to hourly-billed VM SKUs only (exclude
+                        # storage/network meters that share the service)
+                        candidates = [
+                            c for c in candidates
+                            if c.unit_of_measure in ("1 Hour", "1 hour")
+                            and c.unit_price > 0
+                        ]
+                        comp_log.info(
+                            "candidates_filtered_to_vms",
+                            remaining=len(candidates),
+                        )
 
                 if not candidates:
                     comp_log.warning("no_candidates_found")

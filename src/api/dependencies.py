@@ -64,7 +64,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     # --- Pricing service --------------------------------------------------
     pricing_service = PricingService(settings)
-    pricing_service.register_provider(AWSPricingProvider())
+    pricing_service.register_provider(AWSPricingProvider(
+        access_key_id=settings.aws.access_key_id,
+        secret_access_key=settings.aws.secret_access_key,
+        session_token=settings.aws.session_token,
+    ))
     pricing_service.register_provider(AzurePricingProvider())
     pricing_service.register_provider(GCPPricingProvider())
     await pricing_service.initialize()
