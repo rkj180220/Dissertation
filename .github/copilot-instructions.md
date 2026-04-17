@@ -147,4 +147,4 @@ Keep the paste-block accurate so any new Copilot chat can immediately pick up th
 **Never leave a completed task undocumented.** A new chat agent reading only
 `copilot-instructions.md` + `PROJECT_SPEC.md` + `CONTINUATION_PROMPT.md` must be able
 to understand exactly what is done, what is next, and how to proceed — without asking
-any clarifying questions.
+any clarifying questions
