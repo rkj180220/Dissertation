@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     log.info("settings_loaded", env=settings.env.value)
 
     # --- LLM --------------------------------------------------------------
-    llm = get_llm(settings.llm, settings.aws)
+    llm = get_llm(settings.llm, settings.aws, settings.gcp)
     log.info("llm_created", provider=settings.llm.provider.value)
 
     # --- Pricing service --------------------------------------------------

@@ -40,6 +40,7 @@ class LLMProvider(str, Enum):
 
     BEDROCK = "bedrock"
     GEMINI = "gemini"
+    VERTEXAI = "vertexai"
 
 
 # ---------------------------------------------------------------------------

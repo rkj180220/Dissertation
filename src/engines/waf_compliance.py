@@ -209,21 +209,67 @@ def _check_operational_excellence(
     """Operational Excellence: Multi-provider evaluation."""
     checks: list[ComplianceCheckResult] = []
 
-    multi_provider = len(request.target_providers) >= 2
-    checks.append(
-        ComplianceCheckResult(
-            pillar="Operational Excellence",
-            check_name="Multi-Cloud Evaluation",
-            passed=multi_provider,
-            severity="medium" if not multi_provider else "low",
-            finding=f"Evaluating {len(request.target_providers)} provider(s)",
-            recommendation=(
-                "Evaluate ≥ 2 providers to avoid vendor lock-in"
-                if not multi_provider
-                else "Multi-provider comparison is enabled"
-            ),
+    provider_count = len(request.target_providers)
+    multi_provider = provider_count >= 2
+
+    # Fix 7f — deliberate single-provider choice (e.g. government data-residency
+    # or explicit client requirement) is a valid architectural decision.
+    # Detect this by checking the raw_user_input for "single_" provider strategy
+    # markers emitted by build_enriched_input_from_structured(), or by checking
+    # for explicit provider keywords like "aws only", "azure only".
+    raw = (request.raw_user_input or "").lower()
+    deliberate_single = (
+        provider_count == 1
+        and any(
+            marker in raw
+            for marker in (
+                "provider strategy: single_",
+                "aws only",
+                "azure only",
+                "gcp only",
+                "only aws",
+                "only azure",
+                "only gcp",
+                "single provider",
+                "no comparison",
+            )
         )
     )
+
+    if deliberate_single:
+        # Client has a hard single-provider requirement (data-residency, contract, etc.)
+        # Mark as PASS / NOT_APPLICABLE — not a compliance gap.
+        checks.append(
+            ComplianceCheckResult(
+                pillar="Operational Excellence",
+                check_name="Multi-Cloud Evaluation",
+                passed=True,
+                severity="low",
+                finding=(
+                    f"Single-provider strategy ({request.target_providers[0].value}) "
+                    "per explicit client requirement"
+                ),
+                recommendation=(
+                    "Single-provider architecture is an intentional client choice. "
+                    "Ensure vendor lock-in risks are documented in the RFP assumptions."
+                ),
+            )
+        )
+    else:
+        checks.append(
+            ComplianceCheckResult(
+                pillar="Operational Excellence",
+                check_name="Multi-Cloud Evaluation",
+                passed=multi_provider,
+                severity="medium" if not multi_provider else "low",
+                finding=f"Evaluating {provider_count} provider(s)",
+                recommendation=(
+                    "Evaluate ≥ 2 providers to avoid vendor lock-in"
+                    if not multi_provider
+                    else "Multi-provider comparison is enabled"
+                ),
+            )
+        )
 
     return checks
 

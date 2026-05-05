@@ -49,6 +49,13 @@ class ServiceCategory(str, Enum):
     CONTAINER = "container"
     """AKS, EKS, GKE, Container Instances, Fargate."""
 
+    KUBERNETES = "kubernetes"
+    """Managed Kubernetes control-plane fee (EKS $0.10/hr, AKS free, GKE $0.10/hr).
+
+    Distinct from CONTAINER (which covers node/workload costs).
+    Used exclusively for the per-cluster management fee line item.
+    """
+
     SERVERLESS_FUNCTION = "serverless_function"
     """Azure Functions, AWS Lambda, Cloud Functions."""
 

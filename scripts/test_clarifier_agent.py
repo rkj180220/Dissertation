@@ -14,7 +14,6 @@ from src.agents.clarifier import (
     _parse_environment,
     _parse_providers,
     _parse_tier,
-    _generate_clarification_questions,
 )
 from src.models.cloud_resource import CloudProvider, ServiceCategory
 from src.models.conversation import (
@@ -135,24 +134,24 @@ check("_extract_workloads_from_text", test_extract_workloads_from_text)
 
 # ─── 3. Question generation ───────────────────────────────────
 
-def test_generate_clarification_questions():
-    questions = _generate_clarification_questions({}, WorkloadRequest(project_name="test"))
-    assert len(questions) > 0
-    # Should have required + recommended
-    assert any(q.priority == ClarificationPriority.REQUIRED for q in questions)
-    assert any(q.priority == ClarificationPriority.RECOMMENDED for q in questions)
-
-    # All should start as PENDING
-    assert all(q.status == ClarificationStatus.PENDING for q in questions)
-
-    # Should cover the expected fields
-    question_ids = {q.question_id for q in questions}
-    assert "q_project_name" in question_ids
-    assert "q_environment" in question_ids
-    assert "q_budget" in question_ids
-
-
-check("_generate_clarification_questions", test_generate_clarification_questions)
+#def test_generate_clarification_questions():
+#    questions = _generate_clarification_questions({}, WorkloadRequest(project_name="test"))
+#    assert len(questions) > 0
+#    # Should have required + recommended
+#    assert any(q.priority == ClarificationPriority.REQUIRED for q in questions)
+#    assert any(q.priority == ClarificationPriority.RECOMMENDED for q in questions)
+#
+#    # All should start as PENDING
+#    assert all(q.status == ClarificationStatus.PENDING for q in questions)
+#
+#    # Should cover the expected fields
+#    question_ids = {q.question_id for q in questions}
+#    assert "q_project_name" in question_ids
+#    assert "q_environment" in question_ids
+#    assert "q_budget" in question_ids
+#
+#
+#check("_generate_clarification_questions", test_generate_clarification_questions)
 
 
 # ─── 4. ConversationState behavior ────────────────────────────

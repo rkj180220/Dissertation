@@ -56,9 +56,10 @@ check("llm.__init__ — re-exports get_llm", t_llm_init)
 def t_models_cloud_resource():
     from src.models.cloud_resource import CloudProvider, ServiceCategory, ComputeSKU, StorageSKU
     assert len(CloudProvider) == 3
-    assert len(ServiceCategory) == 14
+    assert len(ServiceCategory) == 15  # added KUBERNETES in P2
     assert CloudProvider.AWS.value == "aws"
     assert ServiceCategory.COMPUTE.value == "compute"
+    assert ServiceCategory.KUBERNETES.value == "kubernetes"  # P2 addition
 
 def t_models_pricing():
     from src.models.pricing import NormalizedPriceItem, PricingTier, SKUPricing
@@ -118,10 +119,24 @@ def t_models_recommendation():
     from src.models.recommendation import (
         CloudRecommendation, CostComparison, ProviderCostBreakdown,
         BinPackingResult, PackedNode, ComplianceReport, ComplianceCheckResult,
+        AncillaryCost,
     )
-    from src.models.cloud_resource import CloudProvider
-    cbd = ProviderCostBreakdown(provider=CloudProvider.AWS, compute_monthly_usd=100.0)
+    from src.models.cloud_resource import CloudProvider, ServiceCategory
+    cbd = ProviderCostBreakdown(
+        provider=CloudProvider.AWS,
+        compute_monthly_usd=100.0,
+        total_monthly_usd=100.0,  # total is explicit, not auto-computed
+    )
     assert cbd.total_monthly_usd == 100.0
+    # P2: verify AncillaryCost and ancillary_costs field
+    ac = AncillaryCost(
+        provider=CloudProvider.AWS,
+        category=ServiceCategory.NETWORKING,
+        item_name="[Infra] NAT Gateway",
+        monthly_cost_usd=32.0,
+    )
+    assert ac.monthly_cost_usd == 32.0
+    assert cbd.ancillary_costs == []
 
 def t_models_init():
     import src.models as m
@@ -130,7 +145,7 @@ def t_models_init():
                 "ChatMessage", "ConversationState", "CloudRecommendation", "CostComparison"]:
         assert hasattr(m, sym), f"Missing export: {sym}"
 
-check("models.cloud_resource — CloudProvider(3) + ServiceCategory(14) + legacy SKUs", t_models_cloud_resource)
+check("models.cloud_resource — CloudProvider(3) + ServiceCategory(15) + legacy SKUs", t_models_cloud_resource)
 check("models.pricing — NormalizedPriceItem + monthly_cost_estimate", t_models_pricing)
 check("models.workload — new models + legacy backward-compat", t_models_workload)
 check("models.conversation — ChatMessage + ConversationState", t_models_conversation)
@@ -275,8 +290,9 @@ def t_clarifier_extract_workloads():
     from src.models.cloud_resource import ServiceCategory
     wls = _extract_workloads_from_text("Need kubernetes cluster and postgres database")
     categories = [w.suggested_category for w in wls]
-    assert ServiceCategory.CONTAINER in categories
-    assert ServiceCategory.DATABASE in categories
+    # K8s cluster management fee now uses KUBERNETES category (P2 change)
+    assert ServiceCategory.KUBERNETES in categories, f"Expected KUBERNETES in {categories}"
+    assert ServiceCategory.DATABASE in categories, f"Expected DATABASE in {categories}"
 
 def t_profiler_placeholder():
     import src.agents.profiler  # noqa — just confirm importable

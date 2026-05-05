@@ -32,7 +32,7 @@ import structlog
 from langchain_core.language_models import BaseChatModel
 
 if TYPE_CHECKING:
-    from src.config.settings import AWSSettings, LLMSettings
+    from src.config.settings import AWSSettings, GCPSettings, LLMSettings
 
 logger = structlog.get_logger()
 
@@ -40,6 +40,7 @@ logger = structlog.get_logger()
 def get_llm(
     llm_settings: LLMSettings,
     aws_settings: AWSSettings | None = None,
+    gcp_settings: GCPSettings | None = None,
 ) -> BaseChatModel:
     """Create a ``BaseChatModel`` for the configured provider.
 
@@ -49,6 +50,7 @@ def get_llm(
     Args:
         llm_settings: LLM configuration (provider, model, temperature, …).
         aws_settings: AWS configuration — required when provider is *bedrock*.
+        gcp_settings: GCP configuration — used for project ID when provider is *vertexai*.
 
     Returns:
         A concrete ``BaseChatModel`` ready for ``.invoke()`` / ``.ainvoke()``.
@@ -73,11 +75,13 @@ def get_llm(
         model = _create_bedrock(llm_settings, aws_settings)
     elif provider == "gemini":
         model = _create_gemini(llm_settings)
+    elif provider == "vertexai":
+        model = _create_vertexai(llm_settings, gcp_settings)
     else:
         log.error("unsupported_llm_provider", provider=provider)
         raise ValueError(
             f"Unsupported LLM provider: {provider!r}. "
-            "Supported: 'bedrock', 'gemini'."
+            "Supported: 'bedrock', 'gemini', 'vertexai'."
         )
 
     log.info("llm_created", model_type=type(model).__name__)
@@ -152,6 +156,61 @@ def _create_gemini(llm_settings: LLMSettings) -> BaseChatModel:
 
     return ChatGoogleGenerativeAI(
         model=llm_settings.model,
+        temperature=llm_settings.temperature,
+        max_output_tokens=llm_settings.max_tokens,
+    )
+
+
+def _create_vertexai(
+    llm_settings: LLMSettings,
+    gcp_settings: GCPSettings | None = None,
+) -> BaseChatModel:
+    """Instantiate a Gemini model via Google Cloud Vertex AI.
+
+    Uses Application Default Credentials (ADC) — no API key required.
+    The GCP project is sourced from ``gcp_settings.project_id`` (preferred)
+    or the ``VERTEXAI_PROJECT`` env var as fallback.
+
+    Uses ``ChatGoogleGenerativeAI`` from ``langchain-google-genai`` with ADC
+    credentials (recommended over the deprecated ``ChatVertexAI``).
+
+    Args:
+        llm_settings: LLM configuration.
+        gcp_settings: GCP configuration — used for project ID validation.
+
+    Returns:
+        ``ChatGoogleGenerativeAI`` instance backed by Vertex AI ADC.
+    """
+    import os
+
+    # Prefer settings object; fall back to raw env var
+    project = (
+        (gcp_settings.project_id if gcp_settings else None)
+        or os.environ.get("VERTEXAI_PROJECT", "")
+    )
+
+    if not project:
+        raise ValueError(
+            "GCP project ID must be set (GCP_PROJECT_ID in .env or VERTEXAI_PROJECT) "
+            "when using the 'vertexai' LLM provider."
+        )
+
+    try:
+        import google.auth
+        from langchain_google_genai import ChatGoogleGenerativeAI  # lazy import
+    except ImportError as exc:
+        raise ImportError(
+            "The 'vertexai' LLM provider requires the langchain-google-genai and "
+            "google-auth packages.  Install with:  uv sync --extra gemini"
+        ) from exc
+
+    creds, _ = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+
+    return ChatGoogleGenerativeAI(
+        model=llm_settings.model,
+        credentials=creds,
         temperature=llm_settings.temperature,
         max_output_tokens=llm_settings.max_tokens,
     )

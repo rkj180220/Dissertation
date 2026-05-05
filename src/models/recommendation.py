@@ -16,9 +16,48 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from src.models.cloud_resource import CloudProvider
+from src.models.cloud_resource import CloudProvider, ServiceCategory
 from src.models.pricing import NormalizedPriceItem
 from src.models.workload import WorkloadProfile
+
+
+# ─── Ancillary Costs ────────────────────────────────────────
+
+
+class AncillaryCost(BaseModel):
+    """A typed record for ancillary infrastructure cost items.
+
+    Used to represent fixed or usage-based costs that sit outside the main
+    SKU catalog — e.g. NAT gateways, load balancers, data transfer, and
+    the K8s managed control-plane fee.  The Sizer generates these as part
+    of ``_build_ancillary_results()`` and they are surfaced in the
+    ``ProviderCostBreakdown`` for downstream agents and the RFP Writer.
+    """
+
+    provider: CloudProvider
+    category: ServiceCategory = Field(
+        description="Service category this cost falls under (NETWORKING, KUBERNETES, …)",
+    )
+    item_name: str = Field(
+        description="Human-readable label (e.g. '[Infra] NAT Gateway', 'K8s Cluster Management')",
+    )
+    monthly_cost_usd: float = Field(
+        ge=0,
+        description="Estimated monthly cost in USD",
+    )
+    unit: str = Field(
+        default="fixed",
+        description="Pricing unit: 'fixed' | 'per_gb' | 'per_request' | …",
+    )
+    quantity: float = Field(
+        default=1.0,
+        ge=0,
+        description="Quantity of units (e.g. 1 NAT GW, 500 GB data transfer)",
+    )
+    notes: str = Field(
+        default="",
+        description="Optional pricing rationale or source reference",
+    )
 
 
 # ─── Bin-Packing ────────────────────────────────────────────
@@ -83,6 +122,13 @@ class ProviderCostBreakdown(BaseModel):
     selected_skus: list[NormalizedPriceItem] = Field(
         default_factory=list,
         description="SKUs chosen by the Sizer for this provider",
+    )
+    ancillary_costs: list[AncillaryCost] = Field(
+        default_factory=list,
+        description=(
+            "Typed breakdown of ancillary costs: NAT gateways, load balancers, "
+            "data transfer, K8s cluster management fees, etc."
+        ),
     )
 
 

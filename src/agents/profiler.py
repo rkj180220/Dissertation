@@ -154,6 +154,11 @@ _INSTANCE_FAMILY_MAP: dict[ServiceCategory, dict[str, list[str]]] = {
         "azure": ["Standard_D", "Standard_E", "Standard_F"],
         "gcp": ["n2-standard", "n2-highmem", "c2-standard"],
     },
+    ServiceCategory.KUBERNETES: {
+        "aws": ["EKS"],
+        "azure": ["AKS"],
+        "gcp": ["GKE"],
+    },
     ServiceCategory.CONTAINER: {
         "aws": ["m5", "m6i", "c5"],
         "azure": ["Standard_D", "Standard_DS"],
@@ -205,6 +210,9 @@ _INSTANCE_FAMILY_MAP: dict[ServiceCategory, dict[str, list[str]]] = {
 _RESOURCE_DEFAULTS: dict[ServiceCategory, dict[str, Any]] = {
     ServiceCategory.COMPUTE: {
         "vcpus": 2, "memory_gb": 4.0, "storage_gb": 50.0,
+    },
+    ServiceCategory.KUBERNETES: {
+        "vcpus": 0, "memory_gb": 0.0, "storage_gb": 0.0,  # fixed-fee — no compute
     },
     ServiceCategory.CONTAINER: {
         "vcpus": 2, "memory_gb": 4.0, "storage_gb": 20.0,
@@ -284,6 +292,13 @@ def _resolve_category(
     """
     log = logger.bind(step="resolve_category", workload=workload.name)
 
+    # Early-return: cluster management fee is always KUBERNETES category.
+    # The notes field is the authoritative signal — bypasses all keyword/resource
+    # checks to prevent CONTAINER keywords from overriding the explicit category.
+    if "cluster_management_fee" in (workload.notes or ""):
+        log.debug("category_forced_kubernetes_cluster_mgmt", workload=workload.name)
+        return ServiceCategory.KUBERNETES
+
     # Priority order: most specific categories first, generic COMPUTE last.
     # This prevents vcpus (common across many categories) from shadowing
     # more specific signals like database_engine or gpu_count.
@@ -337,6 +352,71 @@ def _resolve_category(
     return workload.suggested_category
 
 
+def _guard_ai_ml(
+    category: ServiceCategory,
+    workload: WorkloadRequirement,
+) -> ServiceCategory:
+    """Prevent AI_ML assignment when the workload has no GPU or AI/ML intent.
+
+    This guard catches two edge cases:
+
+    1. Keyword overlap — e.g. "training" in a non-ML context might resolve
+       to AI_ML via the keyword signals in ``_CATEGORY_SIGNALS``.
+    2. Hallucinated GPU — the Clarifier's LLM enrichment (``RESOURCE_ADJUSTMENTS``)
+       may set ``gpu_count > 0`` on a non-GPU workload. Because
+       ``_CATEGORY_SIGNALS[AI_ML]["resource_check"]`` checks ``gpu_count > 0``,
+       this would then override the category.  The guard strips the fabricated
+       GPU count and reverts to the ``suggested_category``.
+
+    Args:
+        category: The initially resolved category.
+        workload: The workload requirement (mutated if GPU is stripped).
+
+    Returns:
+        The guarded category — either ``AI_ML`` (confirmed) or the
+        ``suggested_category`` fallback.
+    """
+    if category != ServiceCategory.AI_ML:
+        return category
+
+    # Check for explicit AI/ML keywords in name + description
+    text = f"{workload.name} {workload.description}".lower()
+    ai_ml_keywords = {
+        "machine learning", "ml ", "deep learning", "neural",
+        "training model", "inference", "sagemaker", "vertex ai",
+        "gpu", "cuda", "tensor",
+    }
+    has_ai_ml_intent = any(kw in text for kw in ai_ml_keywords)
+
+    # GPU set AND AI/ML keywords confirm intent → AI_ML is correct
+    if workload.resources.gpu_count > 0 and has_ai_ml_intent:
+        return ServiceCategory.AI_ML
+
+    # GPU set but NO AI/ML keywords → GPU was hallucinated by LLM enrichment.
+    # Strip it and revert to the suggested_category so the correct SKU is chosen.
+    if workload.resources.gpu_count > 0 and not has_ai_ml_intent:
+        logger.debug(
+            "ai_ml_guard_stripped_hallucinated_gpu",
+            workload=workload.name,
+            gpu_count_before=workload.resources.gpu_count,
+            fallback=workload.suggested_category.value,
+        )
+        workload.resources.gpu_count = 0
+        return workload.suggested_category
+
+    # No GPU — check keywords alone
+    if has_ai_ml_intent:
+        return ServiceCategory.AI_ML
+
+    # No GPU, no AI/ML keywords → revert to suggested_category
+    logger.debug(
+        "ai_ml_guard_triggered",
+        workload=workload.name,
+        fallback=workload.suggested_category.value,
+    )
+    return workload.suggested_category
+
+
 def _estimate_resources(
     workload: WorkloadRequirement,
     resolved_category: ServiceCategory,
@@ -347,6 +427,13 @@ def _estimate_resources(
 
     Fills in missing values from ``_RESOURCE_DEFAULTS``, then applies
     tier-based multipliers and environment scaling factors.
+
+    For **container** workloads that already have ``cpu_request_millicores``
+    and ``memory_request_mb`` (set by the Clarifier), derives vCPUs and
+    memory from the container specs × replicas instead of using defaults.
+
+    For workloads marked with ``notes="cluster_management_fee"``, returns
+    minimal resources (the cost is a fixed platform fee, not compute).
 
     Args:
         workload: The source workload requirement.
@@ -363,7 +450,75 @@ def _estimate_resources(
     tier_mult = _TIER_MULTIPLIERS.get(tier, _TIER_MULTIPLIERS[WorkloadTier.BUSINESS_CRITICAL])
     env_factor = _ENVIRONMENT_FACTORS.get(environment, 1.0)
 
-    # Base values: user-specified or defaults
+    # --- Cluster management fee: fixed cost, no compute ---
+    if "cluster_management_fee" in (workload.notes or ""):
+        return {
+            "vcpus": 0,
+            "memory_gb": 0.0,
+            "storage_gb": 0.0,
+            "iops": None,
+            "requires_gpu": False,
+        }
+
+    # --- Managed services (NETWORKING, STORAGE): no vCPU/memory allocation ---
+    # These are billed per-request, per-GB, or per-LCU — not per-vCPU.
+    # Assigning vCPU defaults would cause bin-packing to treat managed
+    # services as VMs, inflating the total resource footprint.
+    if resolved_category == ServiceCategory.NETWORKING:
+        return {
+            "vcpus": 0,
+            "memory_gb": 0.0,
+            "storage_gb": 0.0,
+            "iops": None,
+            "requires_gpu": False,
+        }
+
+    if resolved_category == ServiceCategory.STORAGE:
+        storage_gb = resources.storage_gb or defaults.get("storage_gb", 100.0)
+        storage_gb = round(storage_gb * tier_mult.get("storage", 1.0), 1)
+        return {
+            "vcpus": 0,
+            "memory_gb": 0.0,
+            "storage_gb": storage_gb,
+            "iops": None,
+            "requires_gpu": False,
+        }
+
+    # --- Container workloads: derive from millicore/MB specs ---
+    if (
+        resolved_category == ServiceCategory.CONTAINER
+        and resources.cpu_request_millicores is not None
+        and resources.memory_request_mb is not None
+    ):
+        replicas = max(resources.replicas, 1)
+        # Convert millicores → vCPU, MB → GB, then × replicas
+        vcpus_per_pod = resources.cpu_request_millicores / 1000.0
+        mem_per_pod_gb = resources.memory_request_mb / 1024.0
+        vcpus = max(1, round(vcpus_per_pod * replicas))
+        memory_gb = round(mem_per_pod_gb * replicas, 1)
+        storage_gb = resources.storage_gb or defaults.get("storage_gb", 20.0)
+        iops = resources.iops or defaults.get("iops")
+
+        # Apply tier multiplier
+        vcpus = max(1, int(vcpus * tier_mult.get("compute", 1.0)))
+        memory_gb = round(memory_gb * tier_mult.get("compute", 1.0), 1)
+        storage_gb = round(storage_gb * tier_mult.get("storage", 1.0), 1)
+
+        # Apply environment scaling
+        if environment != EnvironmentType.PRODUCTION:
+            vcpus = max(1, int(vcpus * env_factor))
+            memory_gb = max(0.5, round(memory_gb * env_factor, 1))
+            storage_gb = max(10.0, round(storage_gb * max(env_factor, 0.5), 1))
+
+        return {
+            "vcpus": vcpus,
+            "memory_gb": memory_gb,
+            "storage_gb": storage_gb,
+            "iops": iops,
+            "requires_gpu": False,
+        }
+
+    # --- Standard path: use user-specified or defaults ---
     vcpus = resources.vcpus or defaults.get("vcpus", 2)
     memory_gb = resources.memory_gb or defaults.get("memory_gb", 4.0)
     storage_gb = resources.storage_gb or defaults.get("storage_gb", 50.0)
@@ -383,8 +538,8 @@ def _estimate_resources(
         # Storage doesn't scale down as aggressively in dev
         storage_gb = max(10.0, round(storage_gb * max(env_factor, 0.5), 1))
 
-    # GPU detection
-    requires_gpu = resources.gpu_count > 0 or resolved_category == ServiceCategory.AI_ML
+    # GPU detection — only when explicitly requested
+    requires_gpu = resources.gpu_count > 0
 
     return {
         "vcpus": vcpus,
@@ -667,7 +822,6 @@ async def _generate_profiler_notes(
 # ---------------------------------------------------------------------------
 
 
-@observe()
 async def run_profiler_node(
     state: OrchestratorState,
     llm: BaseChatModel,
@@ -739,6 +893,7 @@ async def run_profiler_node(
 
             # 1. Resolve category
             resolved_category = _resolve_category(workload)
+            resolved_category = _guard_ai_ml(resolved_category, workload)
             wl_log.info(
                 "category_resolved",
                 suggested=workload.suggested_category.value,

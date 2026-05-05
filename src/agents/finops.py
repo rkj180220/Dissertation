@@ -86,6 +86,7 @@ _CATEGORY_TO_COST_FIELD: dict[ServiceCategory, str] = {
     ServiceCategory.AI_ML: "compute_monthly_usd",
     ServiceCategory.SERVERLESS_COMPUTE: "serverless_monthly_usd",
     ServiceCategory.SERVERLESS_FUNCTION: "serverless_monthly_usd",
+    ServiceCategory.KUBERNETES: "kubernetes_monthly_usd",
     ServiceCategory.CONTAINER: "kubernetes_monthly_usd",
     ServiceCategory.DATABASE: "database_monthly_usd",
     ServiceCategory.STORAGE: "storage_monthly_usd",
@@ -97,6 +98,68 @@ _CATEGORY_TO_COST_FIELD: dict[ServiceCategory, str] = {
     ServiceCategory.IOT: "other_monthly_usd",
     ServiceCategory.OTHER: "other_monthly_usd",
 }
+
+
+# ---------------------------------------------------------------------------
+# Known discount rates (used as fallback when live RI/spot data is absent)
+# ---------------------------------------------------------------------------
+
+#: Provider → (ri_1yr_pct, ri_3yr_pct).  Industry-standard discounts.
+_RI_DISCOUNT_RATES: dict[str, tuple[float, float]] = {
+    "aws": (30.0, 45.0),    # AWS Reserved Instances
+    "azure": (35.0, 50.0),  # Azure Reserved VM Instances
+    "gcp": (25.0, 40.0),    # GCP Committed Use Discounts
+}
+
+#: Provider → spot savings percentage (typical, not guaranteed).
+_SPOT_DISCOUNT_RATES: dict[str, float] = {
+    "aws": 70.0,
+    "azure": 80.0,
+    "gcp": 60.0,
+}
+
+#: Categories NOT eligible for spot/preemptible pricing (stateful).
+_SPOT_INELIGIBLE: set[ServiceCategory] = {
+    ServiceCategory.DATABASE,
+    ServiceCategory.STORAGE,
+    ServiceCategory.NETWORKING,
+    ServiceCategory.MANAGEMENT,
+    ServiceCategory.SECURITY,
+    ServiceCategory.KUBERNETES,   # managed control-plane fee — always fixed cost
+}
+
+#: Names that indicate fixed-cost line items (no discounting).
+_FIXED_COST_PREFIXES = ("[Infra]", "K8s Cluster", "Load Balancer")
+
+
+# ---------------------------------------------------------------------------
+# TCO projection helper
+# ---------------------------------------------------------------------------
+
+
+def _compute_tco(
+    monthly_usd: float,
+    years: int,
+    annual_growth_pct: float = 0.0,
+) -> float:
+    """Compute total cost of ownership over N years with compound growth.
+
+    Args:
+        monthly_usd: Current monthly cost (USD).
+        years: Number of years to project.
+        annual_growth_pct: Annual cost growth rate (0-100).
+
+    Returns:
+        Total USD over the projection period.
+    """
+    if annual_growth_pct == 0.0:
+        return round(monthly_usd * 12 * years, 2)
+
+    g = 1 + annual_growth_pct / 100.0
+    total = 0.0
+    for yr in range(years):
+        total += monthly_usd * 12 * (g ** yr)
+    return round(total, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +191,8 @@ def _resolve_category_for_result(
     """Determine the service category for a sized result.
 
     Uses the profiler's resolved category if available.
+    ``[Infra]`` prefixed workloads (NAT Gateway, Data Transfer, etc.)
+    added by the Sizer are always bucketed as NETWORKING.
 
     Args:
         result: A single sizing result.
@@ -136,6 +201,10 @@ def _resolve_category_for_result(
     Returns:
         The ServiceCategory for this result.
     """
+    # Ancillary infrastructure line items injected by the Sizer
+    if result.workload_name.startswith("[Infra]"):
+        return ServiceCategory.NETWORKING
+
     return workload_components.get(
         result.workload_name, ServiceCategory.COMPUTE
     )
@@ -152,7 +221,9 @@ async def _build_provider_breakdown(
     """Build a cost breakdown for a single provider.
 
     Aggregates costs by category, queries RI/spot pricing for
-    savings estimates.
+    savings estimates.  When live RI/spot prices are unavailable,
+    applies industry-standard discount rate fallbacks so the savings
+    table is always populated.
 
     Args:
         provider: The cloud provider.
@@ -194,170 +265,243 @@ async def _build_provider_breakdown(
 
     total_on_demand = sum(cost_buckets.values())
 
-    # ── Query RI / spot savings ───────────────────────────────
+    # ── RI / spot savings analysis ────────────────────────────
     savings: list[dict[str, Any]] = []
-    reserved_1yr_total = 0.0
-    reserved_3yr_total = 0.0
-    spot_total = 0.0
-    ri_1yr_queries = 0
-    ri_3yr_queries = 0
-    spot_queries = 0
 
+    # Compute what portion of total cost is discount-eligible
+    # Fixed-cost line items (K8s fee, LB, NAT, data transfer) cannot be discounted
+    discountable_cost = sum(
+        r.monthly_cost_usd
+        for r in results
+        if not any(r.workload_name.startswith(pfx) for pfx in _FIXED_COST_PREFIXES)
+        and r.selected_sku is not None  # has an actual SKU to commit to
+    )
+    spot_eligible_cost = sum(
+        r.monthly_cost_usd
+        for r in results
+        if not any(r.workload_name.startswith(pfx) for pfx in _FIXED_COST_PREFIXES)
+        and _resolve_category_for_result(r, workload_components)
+           not in _SPOT_INELIGIBLE
+        and r.selected_sku is not None
+    )
+    non_discountable_cost = total_on_demand - discountable_cost
+
+    ri_1yr_rate, ri_3yr_rate = _RI_DISCOUNT_RATES.get(
+        provider.value, (25.0, 40.0),
+    )
+    spot_rate = _SPOT_DISCOUNT_RATES.get(provider.value, 60.0)
+
+    # Attempt live RI pricing per SKU; fall back to rate when unavailable
     region = workload_request.provider_regions.get(
         provider.value,
         workload_request.preferred_region,
     )
 
+    live_ri_1yr_total: float = 0.0
+    live_ri_3yr_total: float = 0.0
+    live_spot_total: float = 0.0
+    live_1yr_found = False
+    live_3yr_found = False
+    live_spot_found = False
+
     for r in results:
         if r.selected_sku is None:
+            continue
+        if any(r.workload_name.startswith(pfx) for pfx in _FIXED_COST_PREFIXES):
+            # Fixed costs go through unchanged for all tiers
+            live_ri_1yr_total += r.monthly_cost_usd
+            live_ri_3yr_total += r.monthly_cost_usd
+            live_spot_total += r.monthly_cost_usd
             continue
 
         sku_name = r.selected_sku.sku_name
         on_demand_cost = r.monthly_cost_usd
+        category = _resolve_category_for_result(r, workload_components)
 
-        # Attempt reserved 1yr pricing
+        # -- RI 1yr --
         try:
             ri_1yr_items = await pricing_service.search_prices(
                 provider,
-                sku_name=sku_name,
+                service_name=r.selected_sku.service_name,
+                service_category=r.selected_sku.service_category,
                 region=region,
                 pricing_tier=PricingTier.RESERVED_1YR,
-                max_results=5,
+                max_results=10,
             )
-            ri_1yr_queries += 1
-
             if ri_1yr_items:
+                # Find closest match by vCPU/memory attributes
                 best_ri = min(
                     ri_1yr_items,
                     key=lambda x: x.monthly_cost_estimate or float("inf"),
                 )
                 ri_monthly = best_ri.monthly_cost_estimate
-                if ri_monthly is not None and ri_monthly > 0:
-                    reserved_1yr_total += ri_monthly
-                    if on_demand_cost > 0 and ri_monthly < on_demand_cost:
-                        pct = round(
-                            (1 - ri_monthly / on_demand_cost) * 100, 1,
-                        )
-                        savings.append({
-                            "type": "reserved_1yr",
-                            "provider": provider.value,
-                            "workload": r.workload_name,
-                            "sku": sku_name,
-                            "on_demand_monthly": round(on_demand_cost, 2),
-                            "reserved_monthly": round(ri_monthly, 2),
-                            "savings_pct": pct,
-                        })
-                else:
-                    reserved_1yr_total += on_demand_cost
-            else:
-                reserved_1yr_total += on_demand_cost
+                if ri_monthly is not None and 0 < ri_monthly < on_demand_cost:
+                    live_ri_1yr_total += ri_monthly
+                    live_1yr_found = True
+                    pct = round((1 - ri_monthly / on_demand_cost) * 100, 1)
+                    savings.append({
+                        "type": "reserved_1yr",
+                        "provider": provider.value,
+                        "workload": r.workload_name,
+                        "sku": sku_name,
+                        "on_demand_monthly": round(on_demand_cost, 2),
+                        "reserved_monthly": round(ri_monthly, 2),
+                        "savings_pct": pct,
+                        "source": "live",
+                    })
+                    continue
+            # No live data → fall through to rate-based estimate
+            live_ri_1yr_total += round(on_demand_cost * (1 - ri_1yr_rate / 100.0), 2)
         except Exception:
             log.debug("ri_1yr_query_failed", sku=sku_name, exc_info=True)
-            reserved_1yr_total += on_demand_cost
+            live_ri_1yr_total += round(on_demand_cost * (1 - ri_1yr_rate / 100.0), 2)
 
-        # Attempt reserved 3yr pricing
+        # -- RI 3yr --
         try:
             ri_3yr_items = await pricing_service.search_prices(
                 provider,
-                sku_name=sku_name,
+                service_name=r.selected_sku.service_name,
+                service_category=r.selected_sku.service_category,
                 region=region,
                 pricing_tier=PricingTier.RESERVED_3YR,
-                max_results=5,
+                max_results=10,
             )
-            ri_3yr_queries += 1
-
             if ri_3yr_items:
                 best_ri3 = min(
                     ri_3yr_items,
                     key=lambda x: x.monthly_cost_estimate or float("inf"),
                 )
                 ri3_monthly = best_ri3.monthly_cost_estimate
-                if ri3_monthly is not None and ri3_monthly > 0:
-                    reserved_3yr_total += ri3_monthly
-                    if on_demand_cost > 0 and ri3_monthly < on_demand_cost:
-                        pct = round(
-                            (1 - ri3_monthly / on_demand_cost) * 100, 1,
-                        )
-                        savings.append({
-                            "type": "reserved_3yr",
-                            "provider": provider.value,
-                            "workload": r.workload_name,
-                            "sku": sku_name,
-                            "on_demand_monthly": round(on_demand_cost, 2),
-                            "reserved_monthly": round(ri3_monthly, 2),
-                            "savings_pct": pct,
-                        })
-                else:
-                    reserved_3yr_total += on_demand_cost
-            else:
-                reserved_3yr_total += on_demand_cost
+                if ri3_monthly is not None and 0 < ri3_monthly < on_demand_cost:
+                    live_ri_3yr_total += ri3_monthly
+                    live_3yr_found = True
+                    pct = round((1 - ri3_monthly / on_demand_cost) * 100, 1)
+                    savings.append({
+                        "type": "reserved_3yr",
+                        "provider": provider.value,
+                        "workload": r.workload_name,
+                        "sku": sku_name,
+                        "on_demand_monthly": round(on_demand_cost, 2),
+                        "reserved_monthly": round(ri3_monthly, 2),
+                        "savings_pct": pct,
+                        "source": "live",
+                    })
+                    continue
+            live_ri_3yr_total += round(on_demand_cost * (1 - ri_3yr_rate / 100.0), 2)
         except Exception:
             log.debug("ri_3yr_query_failed", sku=sku_name, exc_info=True)
-            reserved_3yr_total += on_demand_cost
+            live_ri_3yr_total += round(on_demand_cost * (1 - ri_3yr_rate / 100.0), 2)
 
-        # Attempt spot pricing
+        # -- Spot (only eligible categories) --
+        if category in _SPOT_INELIGIBLE:
+            live_spot_total += on_demand_cost  # no discount for stateful
+            continue
+
         try:
             spot_items = await pricing_service.search_prices(
                 provider,
-                sku_name=sku_name,
+                service_name=r.selected_sku.service_name,
+                service_category=r.selected_sku.service_category,
                 region=region,
                 pricing_tier=PricingTier.SPOT,
-                max_results=5,
+                max_results=10,
             )
-            spot_queries += 1
-
             if spot_items:
                 best_spot = min(
                     spot_items,
                     key=lambda x: x.monthly_cost_estimate or float("inf"),
                 )
                 spot_monthly = best_spot.monthly_cost_estimate
-                if spot_monthly is not None and spot_monthly > 0:
-                    spot_total += spot_monthly
-                    if on_demand_cost > 0 and spot_monthly < on_demand_cost:
-                        pct = round(
-                            (1 - spot_monthly / on_demand_cost) * 100, 1,
-                        )
-                        savings.append({
-                            "type": "spot",
-                            "provider": provider.value,
-                            "workload": r.workload_name,
-                            "sku": sku_name,
-                            "on_demand_monthly": round(on_demand_cost, 2),
-                            "spot_monthly": round(spot_monthly, 2),
-                            "savings_pct": pct,
-                        })
-                else:
-                    spot_total += on_demand_cost
-            else:
-                spot_total += on_demand_cost
+                if spot_monthly is not None and 0 < spot_monthly < on_demand_cost:
+                    live_spot_total += spot_monthly
+                    live_spot_found = True
+                    pct = round((1 - spot_monthly / on_demand_cost) * 100, 1)
+                    savings.append({
+                        "type": "spot",
+                        "provider": provider.value,
+                        "workload": r.workload_name,
+                        "sku": sku_name,
+                        "on_demand_monthly": round(on_demand_cost, 2),
+                        "spot_monthly": round(spot_monthly, 2),
+                        "savings_pct": pct,
+                        "source": "live",
+                    })
+                    continue
+            live_spot_total += round(on_demand_cost * (1 - spot_rate / 100.0), 2)
         except Exception:
             log.debug("spot_query_failed", sku=sku_name, exc_info=True)
-            spot_total += on_demand_cost
+            live_spot_total += round(on_demand_cost * (1 - spot_rate / 100.0), 2)
 
-    # Compute savings percentages
-    ri_1yr_savings_pct = None
-    ri_1yr_monthly = None
-    if total_on_demand > 0 and reserved_1yr_total < total_on_demand:
-        ri_1yr_monthly = round(reserved_1yr_total, 2)
+    # Add bucket-level savings entries (rate-based) when no live data found
+    if not live_1yr_found and discountable_cost > 0:
+        ri_1yr_discounted = round(discountable_cost * (1 - ri_1yr_rate / 100.0), 2)
+        savings.append({
+            "type": "reserved_1yr",
+            "provider": provider.value,
+            "workload": "(all discountable workloads)",
+            "sku": "portfolio",
+            "on_demand_monthly": round(discountable_cost, 2),
+            "reserved_monthly": ri_1yr_discounted,
+            "savings_pct": ri_1yr_rate,
+            "source": "estimate",
+        })
+
+    if not live_3yr_found and discountable_cost > 0:
+        ri_3yr_discounted = round(discountable_cost * (1 - ri_3yr_rate / 100.0), 2)
+        savings.append({
+            "type": "reserved_3yr",
+            "provider": provider.value,
+            "workload": "(all discountable workloads)",
+            "sku": "portfolio",
+            "on_demand_monthly": round(discountable_cost, 2),
+            "reserved_monthly": ri_3yr_discounted,
+            "savings_pct": ri_3yr_rate,
+            "source": "estimate",
+        })
+
+    if not live_spot_found and spot_eligible_cost > 0:
+        spot_discounted = round(spot_eligible_cost * (1 - spot_rate / 100.0), 2)
+        savings.append({
+            "type": "spot",
+            "provider": provider.value,
+            "workload": "(eligible stateless workloads only)",
+            "sku": "portfolio",
+            "on_demand_monthly": round(spot_eligible_cost, 2),
+            "spot_monthly": spot_discounted,
+            "savings_pct": spot_rate,
+            "source": "estimate",
+            "warning": "Spot instances are interruptible — suitable only for fault-tolerant workloads",
+        })
+
+    # Compute aggregate savings percentages
+    ri_1yr_monthly: float | None = None
+    ri_1yr_savings_pct: float | None = None
+    if total_on_demand > 0 and live_ri_1yr_total < total_on_demand:
+        ri_1yr_monthly = round(live_ri_1yr_total + non_discountable_cost, 2)
+        effective_ri1 = non_discountable_cost + live_ri_1yr_total
         ri_1yr_savings_pct = round(
-            (1 - reserved_1yr_total / total_on_demand) * 100, 1,
-        )
+            (1 - effective_ri1 / total_on_demand) * 100, 1,
+        ) if total_on_demand > 0 else None
 
-    ri_3yr_savings_pct = None
-    ri_3yr_monthly = None
-    if total_on_demand > 0 and reserved_3yr_total < total_on_demand:
-        ri_3yr_monthly = round(reserved_3yr_total, 2)
+    ri_3yr_monthly: float | None = None
+    ri_3yr_savings_pct: float | None = None
+    if total_on_demand > 0 and live_ri_3yr_total < total_on_demand:
+        ri_3yr_monthly = round(live_ri_3yr_total + non_discountable_cost, 2)
+        effective_ri3 = non_discountable_cost + live_ri_3yr_total
         ri_3yr_savings_pct = round(
-            (1 - reserved_3yr_total / total_on_demand) * 100, 1,
-        )
+            (1 - effective_ri3 / total_on_demand) * 100, 1,
+        ) if total_on_demand > 0 else None
 
-    spot_savings_pct = None
-    spot_monthly_out = None
-    if total_on_demand > 0 and spot_total < total_on_demand:
-        spot_monthly_out = round(spot_total, 2)
+    spot_monthly_out: float | None = None
+    spot_savings_pct: float | None = None
+    if total_on_demand > 0 and spot_eligible_cost > 0:
+        effective_spot = (
+            total_on_demand - spot_eligible_cost
+            + round(spot_eligible_cost * (1 - spot_rate / 100.0), 2)
+        )
+        spot_monthly_out = round(effective_spot, 2)
         spot_savings_pct = round(
-            (1 - spot_total / total_on_demand) * 100, 1,
+            (1 - effective_spot / total_on_demand) * 100, 1,
         )
 
     breakdown = ProviderCostBreakdown(
@@ -383,11 +527,11 @@ async def _build_provider_breakdown(
     log.info(
         "breakdown_completed",
         total_monthly=round(total_on_demand, 2),
+        discountable_cost=round(discountable_cost, 2),
         ri_1yr_savings_pct=ri_1yr_savings_pct,
         ri_3yr_savings_pct=ri_3yr_savings_pct,
         spot_savings_pct=spot_savings_pct,
-        ri_queries=ri_1yr_queries + ri_3yr_queries,
-        spot_queries=spot_queries,
+        savings_entries=len(savings),
     )
 
     return breakdown, savings
@@ -399,14 +543,19 @@ async def _build_provider_breakdown(
 
 _FINOPS_SYSTEM_PROMPT = """\
 You are a FinOps (Cloud Financial Operations) expert. Given a multi-provider \
-cost comparison, provide a concise analysis that:
+cost comparison with TCO projections, provide a concise analysis that:
 
-1. Recommends the best provider with clear justification
-2. Highlights the largest cost drivers
-3. Identifies the most impactful savings opportunities (RI, spot)
-4. Notes any budget concerns
+1. Recommends the best provider with clear justification (on-demand monthly cost)
+2. Highlights the largest cost drivers (compute, database, networking, kubernetes)
+3. Identifies the most impactful savings opportunities:
+   - Reserved instance / committed use discounts (1yr and 3yr)
+   - Spot/preemptible pricing for stateless workloads
+4. Summarises 3-year and 5-year Total Cost of Ownership (TCO) for the cheapest provider
+5. Notes any budget concerns or whether reserved instances resolve the budget gap
 
-Respond in 4-6 sentences. Be specific about dollar amounts and percentages.
+Respond in 5-7 sentences. Be specific about dollar amounts and percentages. \
+Use "estimate" or "~" when data is based on industry-standard rates rather than \
+live pricing.
 """
 
 
@@ -415,22 +564,27 @@ async def _generate_finops_summary(
     llm: BaseChatModel,
     comparison: CostComparison,
     savings: list[dict[str, Any]],
+    growth_pct: float = 15.0,
 ) -> str:
-    """Use the LLM to generate a FinOps analysis summary.
+    """Use the LLM to generate a FinOps analysis summary with TCO projections.
 
     Args:
         llm: The LLM model (BaseChatModel interface).
         comparison: The cost comparison result.
         savings: All identified savings opportunities.
+        growth_pct: Annual cost growth rate assumption (default 15%).
 
     Returns:
         LLM-generated analysis string.
     """
     log = logger.bind(agent="finops", step="generate_summary")
-    log.debug("summary_generation_started")
+    log.debug("summary_generation_started", growth_pct=growth_pct)
 
     provider_summaries = []
     for pb in comparison.providers:
+        tco_1yr = _compute_tco(pb.total_monthly_usd, 1)
+        tco_3yr = _compute_tco(pb.total_monthly_usd, 3, growth_pct)
+        tco_5yr = _compute_tco(pb.total_monthly_usd, 5, growth_pct)
         provider_summaries.append({
             "provider": pb.provider.value,
             "total_monthly": pb.total_monthly_usd,
@@ -438,9 +592,13 @@ async def _generate_finops_summary(
             "database": pb.database_monthly_usd,
             "storage": pb.storage_monthly_usd,
             "kubernetes": pb.kubernetes_monthly_usd,
+            "networking": pb.networking_monthly_usd,
             "ri_1yr_savings_pct": pb.reserved_1yr_savings_pct,
             "ri_3yr_savings_pct": pb.reserved_3yr_savings_pct,
             "spot_savings_pct": pb.spot_savings_pct,
+            "tco_1yr_usd": tco_1yr,
+            "tco_3yr_usd_with_growth": tco_3yr,
+            "tco_5yr_usd_with_growth": tco_5yr,
         })
 
     user_content = json.dumps({
@@ -451,6 +609,7 @@ async def _generate_finops_summary(
         "savings_vs_most_expensive_pct": comparison.savings_vs_most_expensive_pct,
         "budget_monthly_usd": comparison.budget_monthly_usd,
         "budget_exceeded": comparison.budget_exceeded,
+        "growth_assumption_pct_per_year": growth_pct,
         "providers": provider_summaries,
         "top_savings": savings[:10],
     }, indent=2)
@@ -464,7 +623,7 @@ async def _generate_finops_summary(
         response = await llm.ainvoke(messages)
         content = response.content if hasattr(response, "content") else str(response)
         log.debug("summary_generation_completed", length=len(content))
-        return content[:1000]
+        return content[:1500]
     except Exception:
         log.warning("summary_generation_failed", exc_info=True)
         # Heuristic fallback
@@ -476,9 +635,13 @@ async def _generate_finops_summary(
                 None,
             )
             if cheapest_bd:
+                tco_3yr = _compute_tco(cheapest_bd.total_monthly_usd, 3, growth_pct)
+                tco_5yr = _compute_tco(cheapest_bd.total_monthly_usd, 5, growth_pct)
                 parts.append(
                     f"{comparison.cheapest_provider.value.upper()} is the "
-                    f"cheapest at ${cheapest_bd.total_monthly_usd:.2f}/mo."
+                    f"cheapest at ${cheapest_bd.total_monthly_usd:.2f}/mo "
+                    f"(TCO: ${tco_3yr:,.0f} over 3yr, ${tco_5yr:,.0f} over 5yr "
+                    f"at {growth_pct:.0f}%/yr growth)."
                 )
         if comparison.savings_vs_most_expensive_pct > 0:
             parts.append(
@@ -487,12 +650,17 @@ async def _generate_finops_summary(
             )
         if comparison.budget_exceeded:
             parts.append("WARNING: All providers exceed the stated budget.")
-        if savings:
-            best_saving = max(savings, key=lambda s: s.get("savings_pct", 0))
+        ri_savings = [s for s in savings if s.get("type") == "reserved_1yr"]
+        if ri_savings:
+            avg_ri = sum(s.get("savings_pct", 0) for s in ri_savings) / len(ri_savings)
             parts.append(
-                f"Best savings opportunity: {best_saving['type']} on "
-                f"{best_saving.get('sku', 'N/A')} "
-                f"({best_saving.get('savings_pct', 0):.1f}% savings)."
+                f"Reserved instance savings: ~{avg_ri:.0f}% with 1-year commitment."
+            )
+        spot_savings = [s for s in savings if s.get("type") == "spot"]
+        if spot_savings:
+            avg_spot = sum(s.get("savings_pct", 0) for s in spot_savings) / len(spot_savings)
+            parts.append(
+                f"Spot/preemptible savings: ~{avg_spot:.0f}% for fault-tolerant workloads."
             )
         return " ".join(parts) if parts else "Cost analysis completed."
 
@@ -502,7 +670,6 @@ async def _generate_finops_summary(
 # ---------------------------------------------------------------------------
 
 
-@observe()
 async def run_finops_node(
     state: OrchestratorState,
     llm: BaseChatModel,
@@ -627,11 +794,51 @@ async def run_finops_node(
         )
 
         # ── Generate LLM summary ─────────────────────────────
+        # Use growth_rate from workload request if provided, else 15% default
+        growth_pct = getattr(workload_request, "growth_rate_pct", None) or 15.0
         finops_summary = await _generate_finops_summary(
-            llm, comparison, all_savings,
+            llm, comparison, all_savings, growth_pct=growth_pct,
         )
 
+        # ── Build TCO projections for KPI tracking ────────────
+        tco_projections: dict[str, Any] = {}
+        if cheapest:
+            tco_projections = {
+                "growth_pct_per_year": growth_pct,
+                "cheapest_provider": cheapest.provider.value,
+                "tco_1yr_usd": _compute_tco(cheapest.total_monthly_usd, 1),
+                "tco_3yr_usd": _compute_tco(
+                    cheapest.total_monthly_usd, 3, growth_pct,
+                ),
+                "tco_5yr_usd": _compute_tco(
+                    cheapest.total_monthly_usd, 5, growth_pct,
+                ),
+                "ri_3yr_tco_usd": _compute_tco(
+                    cheapest.reserved_3yr_monthly_usd
+                    if cheapest.reserved_3yr_monthly_usd
+                    else cheapest.total_monthly_usd,
+                    3,
+                    growth_pct,
+                ),
+            }
+            log.info(
+                "tco_computed",
+                tco_1yr=tco_projections["tco_1yr_usd"],
+                tco_3yr=tco_projections["tco_3yr_usd"],
+                tco_5yr=tco_projections["tco_5yr_usd"],
+                ri_3yr_tco=tco_projections["ri_3yr_tco_usd"],
+                growth_pct=growth_pct,
+            )
+
         # ── Build summary message ─────────────────────────────
+        tco_line = ""
+        if tco_projections:
+            tco_line = (
+                f"\n**TCO ({growth_pct:.0f}%/yr growth)**: "
+                f"3yr=${tco_projections['tco_3yr_usd']:,.0f} | "
+                f"5yr=${tco_projections['tco_5yr_usd']:,.0f} | "
+                f"RI-3yr-3yr=${tco_projections['ri_3yr_tco_usd']:,.0f}"
+            )
         provider_lines = "\n".join(
             f"  • **{pb.provider.value.upper()}**: "
             f"${pb.total_monthly_usd:.2f}/mo "
@@ -655,7 +862,7 @@ async def run_finops_node(
         summary_content = (
             f"**FinOps Analysis Complete** — "
             f"{len(provider_breakdowns)} provider(s) analyzed:\n"
-            f"{provider_lines}{budget_line}\n\n"
+            f"{provider_lines}{budget_line}{tco_line}\n\n"
             f"**Recommended**: "
             f"{cheapest.provider.value.upper() if cheapest else 'N/A'}"
             f" (saves {savings_vs_expensive:.1f}% vs. most expensive)\n\n"
@@ -673,6 +880,7 @@ async def run_finops_node(
                 "savings_vs_expensive_pct": savings_vs_expensive,
                 "budget_exceeded": budget_exceeded,
                 "provider_count": len(provider_breakdowns),
+                "tco_projections": tco_projections,
             },
         )
 
@@ -695,6 +903,7 @@ async def run_finops_node(
         )
 
         # ── Return state update ───────────────────────────────
+        existing_kpis = state.get("kpis", {}) or {}
         return {
             "cost_comparison": comparison.model_dump(),
             "recommended_provider": (
@@ -703,6 +912,7 @@ async def run_finops_node(
             "savings_opportunities": all_savings,
             "messages": [summary_message],
             "current_agent": "finops",
+            "kpis": {**existing_kpis, "tco_projections": tco_projections},
             "agent_executions": {
                 **state.get("agent_executions", {}),
                 "finops": execution,

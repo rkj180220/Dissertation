@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import structlog
+from langfuse import Langfuse, observe
 
 
 def _json_default(obj: Any) -> Any:
@@ -30,17 +31,41 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from src.agents.clarifier import (
-    _extract_workloads_from_text,
-    _parse_budget,
-    _parse_compliance,
-    _parse_environment,
-    _parse_providers,
+    build_enriched_input_from_structured,
+    llm_clarify_turn,
 )
 from src.orchestrator.state import OrchestratorState, create_initial_state
 
 logger = structlog.get_logger()
 
 router = APIRouter(tags=["orchestration"])
+
+
+# ---------------------------------------------------------------------------
+# LangFuse flush helper
+# ---------------------------------------------------------------------------
+
+
+def _flush_langfuse() -> None:
+    """Flush any buffered LangFuse traces so they are not lost."""
+    try:
+        Langfuse().flush()
+    except Exception:
+        logger.warning("langfuse_flush_failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline execution helpers (parent trace context)
+# ---------------------------------------------------------------------------
+
+
+@observe(name="orchestrate_pipeline")
+async def _execute_pipeline(
+    graph: Any,
+    initial_state: OrchestratorState,
+) -> OrchestratorState:
+    """Run the full graph with a parent LangFuse trace."""
+    return await graph.ainvoke(initial_state)
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +131,7 @@ async def orchestrate(body: OrchestrationRequest, request: Request) -> Orchestra
     )
 
     try:
-        result: OrchestratorState = await graph.ainvoke(initial_state)
+        result: OrchestratorState = await _execute_pipeline(graph, initial_state)
         elapsed = (datetime.now(timezone.utc) - start_ts).total_seconds() * 1000
 
         log.info(
@@ -134,6 +159,8 @@ async def orchestrate(body: OrchestrationRequest, request: Request) -> Orchestra
             error=str(exc),
             duration_ms=elapsed,
         )
+    finally:
+        _flush_langfuse()
 
 
 # ---------------------------------------------------------------------------
@@ -235,15 +262,23 @@ async def orchestrate_stream(
                     "duration_ms": elapsed,
                 }),
             }
+        finally:
+            _flush_langfuse()
 
     return EventSourceResponse(_event_generator())
 
 
 # ---------------------------------------------------------------------------
-# POST /orchestrate/clarify — multi-turn requirement clarification
+# POST /orchestrate/clarify — LLM-powered multi-turn requirement clarification
 # ---------------------------------------------------------------------------
 
-# In-memory session store (demo-grade; use Redis/DB for production)
+# In-memory session store (demo-grade; swap for Redis in production)
+# Session structure:
+#   {
+#     "project_name": str,
+#     "raw_input": str,         ← the user's very first message
+#     "history": [(role, content), ...]  ← full conversation log
+#   }
 _clarify_sessions: dict[str, dict[str, Any]] = {}
 
 
@@ -274,228 +309,95 @@ class ClarifyResponse(BaseModel):
     enriched_input: str | None = None  # Only populated when status="ready"
 
 
-_QUESTION_TEXT: dict[str, str] = {
-    "environment": (
-        "What **environment** is this deployment for?\n"
-        "(production / staging / development / disaster_recovery)"
-    ),
-    "providers": (
-        "Which **cloud providers** should I compare?\n"
-        "(AWS, Azure, GCP — or any combination)"
-    ),
-    "budget": (
-        "Do you have a **monthly budget** target?\n"
-        "(e.g. `$5000` — or type `skip` to proceed without a budget constraint)"
-    ),
-    "compliance": (
-        "Any **compliance requirements**?\n"
-        "(e.g. hipaa, pci-dss, sox — or `none` for standard WAF checks only)"
-    ),
-}
-
-
 @router.post("/orchestrate/clarify", response_model=ClarifyResponse)
 async def clarify_requirements(
     body: ClarifyRequest,
     request: Request,
 ) -> ClarifyResponse:
-    """Multi-turn clarification endpoint.
+    """LLM-powered multi-turn requirement clarification.
 
-    * **First call** — parse the user's initial input, acknowledge what was
-      understood, and ask about the first missing field.
-    * **Subsequent calls** — process the user's answer, then ask the next
-      question or return ``status="ready"`` with an ``enriched_input``
-      string that can be passed directly to ``/orchestrate/stream``.
+    Each call passes the user's message to the LLM along with the full
+    conversation history.  The LLM decides:
+
+    * What was understood from the message.
+    * What critical information is still missing.
+    * What 1-2 questions to ask next (adaptive — not a fixed sequence).
+
+    When the LLM determines it has enough context, it switches to
+    ``status="ready"`` and the response includes an ``enriched_input``
+    string ready to post to ``/orchestrate`` or ``/orchestrate/stream``.
     """
     request_id = body.request_id or str(uuid.uuid4())
     log = logger.bind(component="clarify", request_id=request_id)
+    llm = request.app.state.llm
 
-    if request_id not in _clarify_sessions:
-        # ── First turn: parse initial input ──────────────────────
+    is_new_session = request_id not in _clarify_sessions
+
+    if is_new_session:
         log.info("clarify_new_session", input_len=len(body.user_input))
-
-        raw = body.user_input
-        text_lower = raw.lower()
-        workloads = _extract_workloads_from_text(raw)
-
-        extracted: dict[str, Any] = {
-            "workloads": workloads,
-            "environment": None,
-            "budget": None,
-            "providers": [],
-            "compliance": None,
-        }
-
-        # Try heuristic extraction from the raw input
-        if any(kw in text_lower for kw in (
-            "production", "prod ", "staging", "development", "dev ",
-        )):
-            extracted["environment"] = _parse_environment(raw)
-
-        budget = _parse_budget(raw)
-        if budget is not None:
-            extracted["budget"] = budget
-
-        # _parse_providers defaults to ALL if none detected; only store
-        # if the user explicitly named at least one provider.
-        if any(kw in text_lower for kw in ("aws", "azure", "gcp")):
-            extracted["providers"] = _parse_providers(raw)
-
-        if any(kw in text_lower for kw in ("hipaa", "pci", "sox")):
-            extracted["compliance"] = _parse_compliance(raw)
-
-        # Determine which fields still need clarification
-        pending: list[str] = []
-        if not extracted["environment"]:
-            pending.append("environment")
-        if not extracted["providers"]:
-            pending.append("providers")
-        if extracted["budget"] is None:
-            pending.append("budget")
-        if not extracted["compliance"]:
-            pending.append("compliance")
-
-        session: dict[str, Any] = {
+        _clarify_sessions[request_id] = {
             "project_name": body.project_name,
-            "raw_input": raw,
-            "extracted": extracted,
-            "pending": pending,
-            "current_field": None,
+            "raw_input": body.user_input,
+            "history": [],
         }
-        _clarify_sessions[request_id] = session
 
-        # Build acknowledgment
-        wk_names = [w.name for w in workloads]
-        ack_parts = [
-            f"I've identified **{len(wk_names)} workload(s)** from your request:",
-        ]
-        for w in workloads:
-            ack_parts.append(f"  - **{w.name}**: {w.description}")
+    session = _clarify_sessions[request_id]
+    history: list[tuple[str, str]] = session["history"]
 
-        if extracted["providers"]:
-            prov_str = ", ".join(p.value.upper() for p in extracted["providers"])
-            ack_parts.append(f"\nProviders: **{prov_str}**")
-        if extracted["environment"]:
-            ack_parts.append(
-                f"Environment: **{extracted['environment'].value}**"
-            )
-        if extracted["budget"] is not None:
-            ack_parts.append(f"Budget: **${extracted['budget']:,.0f}/mo**")
+    log.info(
+        "clarify_turn",
+        turn=len(history) + 1,
+        is_new_session=is_new_session,
+        input_len=len(body.user_input),
+    )
 
-        acknowledgment = "\n".join(ack_parts)
-
-        # Ask first pending question (or mark ready if nothing to ask)
-        question = _pop_next_question(session)
-        if question:
-            log.info("clarify_asking", field=session["current_field"])
-            return ClarifyResponse(
-                request_id=request_id,
-                status="clarifying",
-                message=f"{acknowledgment}\n\n{question}",
-            )
-        else:
-            enriched = _build_enriched_input(session)
-            log.info("clarify_ready_immediately")
-            return ClarifyResponse(
-                request_id=request_id,
-                status="ready",
-                message=(
-                    f"{acknowledgment}\n\n"
-                    "All requirements captured. Starting analysis..."
-                ),
-                enriched_input=enriched,
-            )
-
-    else:
-        # ── Subsequent turn: process the user's answer ───────────
-        session = _clarify_sessions[request_id]
-        field = session["current_field"]
-        answer = body.user_input.strip()
-        log.info("clarify_answer", field=field, answer_len=len(answer))
-
-        # Apply the answer to the session
-        if field == "environment":
-            session["extracted"]["environment"] = _parse_environment(answer)
-        elif field == "providers":
-            session["extracted"]["providers"] = _parse_providers(answer)
-        elif field == "budget":
-            session["extracted"]["budget"] = _parse_budget(answer)
-        elif field == "compliance":
-            session["extracted"]["compliance"] = _parse_compliance(answer)
-
-        # Ask next pending question
-        question = _pop_next_question(session)
-        if question:
-            ack = _format_answer_ack(field, session["extracted"])
-            log.info("clarify_asking", field=session["current_field"])
-            return ClarifyResponse(
-                request_id=request_id,
-                status="clarifying",
-                message=f"{ack} {question}",
-            )
-        else:
-            enriched = _build_enriched_input(session)
-            # Clean up session
-            del _clarify_sessions[request_id]
-            log.info("clarify_ready")
-            return ClarifyResponse(
-                request_id=request_id,
-                status="ready",
-                message=(
-                    "All requirements captured. "
-                    "Starting the analysis pipeline..."
-                ),
-                enriched_input=enriched,
-            )
-
-
-# ---------------------------------------------------------------------------
-# Clarification helpers
-# ---------------------------------------------------------------------------
-
-
-def _pop_next_question(session: dict[str, Any]) -> str | None:
-    """Pop and return the next pending question, or *None* if done."""
-    pending: list[str] = session["pending"]
-    if not pending:
-        session["current_field"] = None
-        return None
-    field = pending.pop(0)
-    session["current_field"] = field
-    return _QUESTION_TEXT.get(field, f"What is the {field}?")
-
-
-def _format_answer_ack(field: str | None, extracted: dict[str, Any]) -> str:
-    """Short acknowledgment of the user's answer."""
-    if field == "environment" and extracted.get("environment"):
-        return f"Got it — **{extracted['environment'].value}** environment."
-    if field == "providers" and extracted.get("providers"):
-        prov = ", ".join(p.value.upper() for p in extracted["providers"])
-        return f"Comparing **{prov}**."
-    if field == "budget":
-        if extracted.get("budget") is not None:
-            return f"Budget set to **${extracted['budget']:,.0f}/mo**."
-        return "No budget constraint — understood."
-    if field == "compliance" and extracted.get("compliance"):
-        return f"Compliance: **{', '.join(extracted['compliance'])}**."
-    return "Noted."
-
-
-def _build_enriched_input(session: dict[str, Any]) -> str:
-    """Combine original input + extracted fields into a single text
-    that the pipeline's clarifier node can parse heuristically."""
-    parts = [session["raw_input"]]
-    e = session["extracted"]
-
-    if e.get("environment"):
-        parts.append(f"Environment: {e['environment'].value}")
-    if e.get("budget") is not None:
-        parts.append(f"Budget: ${e['budget']}/month")
-    if e.get("providers"):
-        parts.append(
-            f"Providers: {', '.join(p.value for p in e['providers'])}"
+    try:
+        result = await llm_clarify_turn(
+            llm=llm,
+            history=history,
+            user_input=body.user_input,
+            log=log,
         )
-    if e.get("compliance"):
-        parts.append(f"Compliance: {', '.join(e['compliance'])}")
+    except Exception:
+        log.error("clarify_llm_call_failed", exc_info=True)
+        return ClarifyResponse(
+            request_id=request_id,
+            status="clarifying",
+            message=(
+                "I'm having trouble processing your request right now. "
+                "Could you tell me: what are you building and roughly how many users will it serve?"
+            ),
+        )
+    finally:
+        _flush_langfuse()
 
-    return "\n".join(parts)
+    # Update history — append user turn + architect response
+    history.append(("user", body.user_input))
+    history.append(("architect", result["response"]))
+
+    if result["status"] == "ready":
+        structured = result.get("structured", {})
+        enriched = build_enriched_input_from_structured(
+            raw_input=session["raw_input"],
+            structured=structured,
+        )
+        # Clean up session memory
+        del _clarify_sessions[request_id]
+        log.info(
+            "clarify_ready",
+            turns=len(history) // 2,
+            enriched_len=len(enriched),
+        )
+        return ClarifyResponse(
+            request_id=request_id,
+            status="ready",
+            message=result["response"],
+            enriched_input=enriched,
+        )
+
+    log.info("clarify_still_clarifying", turn=len(history) // 2)
+    return ClarifyResponse(
+        request_id=request_id,
+        status="clarifying",
+        message=result["response"],
+    )

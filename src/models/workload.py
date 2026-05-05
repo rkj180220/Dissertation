@@ -225,6 +225,51 @@ class WorkloadRequirement(BaseModel):
         description="Free-text notes from the user or Clarifier agent",
     )
 
+    # --- SLA & Performance ---
+    latency_p99_ms: int | None = Field(
+        default=None,
+        ge=0,
+        description="P99 latency target in milliseconds",
+    )
+    throughput_rps: int | None = Field(
+        default=None,
+        ge=0,
+        description="Required peak throughput in requests per second",
+    )
+    concurrent_users: int | None = Field(
+        default=None,
+        ge=0,
+        description="Expected peak concurrent users",
+    )
+    uptime_sla: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description="Required availability SLA as a percentage (e.g. 99.9)",
+    )
+    rpo_minutes: int | None = Field(
+        default=None,
+        ge=0,
+        description="Recovery Point Objective in minutes (0 = zero RPO)",
+    )
+    rto_minutes: int | None = Field(
+        default=None,
+        ge=0,
+        description="Recovery Time Objective in minutes",
+    )
+    data_growth_rate_pct: float | None = Field(
+        default=None,
+        ge=0,
+        description="Annual data/traffic growth rate as a percentage (used for TCO projection)",
+    )
+    spot_eligible: bool = Field(
+        default=True,
+        description=(
+            "Whether this workload can tolerate spot/preemptible interruptions. "
+            "Set to False to force on-demand pricing regardless of category."
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Top-level request

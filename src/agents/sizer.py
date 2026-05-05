@@ -102,6 +102,7 @@ _SERVICE_NAME_MAP: dict[tuple[str, ServiceCategory], str] = {
     ("aws", ServiceCategory.COMPUTE): "AmazonEC2",
     ("aws", ServiceCategory.DATABASE): "AmazonRDS",
     ("aws", ServiceCategory.STORAGE): "AmazonS3",
+    ("aws", ServiceCategory.KUBERNETES): "AmazonEKS",
     ("aws", ServiceCategory.CONTAINER): "AmazonEKS",
     ("aws", ServiceCategory.AI_ML): "AmazonSageMaker",
     ("aws", ServiceCategory.SERVERLESS_FUNCTION): "AWSLambda",
@@ -111,6 +112,7 @@ _SERVICE_NAME_MAP: dict[tuple[str, ServiceCategory], str] = {
     ("azure", ServiceCategory.COMPUTE): "Virtual Machines",
     ("azure", ServiceCategory.DATABASE): "SQL Database",
     ("azure", ServiceCategory.STORAGE): "Storage",
+    ("azure", ServiceCategory.KUBERNETES): "Azure Kubernetes Service",
     ("azure", ServiceCategory.CONTAINER): "Azure Kubernetes Service",
     ("azure", ServiceCategory.AI_ML): "Azure Machine Learning",
     ("azure", ServiceCategory.SERVERLESS_FUNCTION): "Functions",
@@ -120,6 +122,7 @@ _SERVICE_NAME_MAP: dict[tuple[str, ServiceCategory], str] = {
     ("gcp", ServiceCategory.COMPUTE): "Compute Engine",
     ("gcp", ServiceCategory.DATABASE): "Cloud SQL",
     ("gcp", ServiceCategory.STORAGE): "Cloud Storage",
+    ("gcp", ServiceCategory.KUBERNETES): "Kubernetes Engine",
     ("gcp", ServiceCategory.CONTAINER): "Kubernetes Engine",
     ("gcp", ServiceCategory.AI_ML): "Vertex AI",
     ("gcp", ServiceCategory.SERVERLESS_FUNCTION): "Cloud Functions",
@@ -140,6 +143,102 @@ _BINPACKED_CATEGORIES: set[ServiceCategory] = {
 
 #: Max alternative SKUs to keep per workload
 _MAX_ALTERNATIVES = 3
+
+
+# ---------------------------------------------------------------------------
+# Container / Database / Ancillary cost constants
+# ---------------------------------------------------------------------------
+
+#: Maps provider to the VM service used for K8s node pool sizing.
+#: Container workloads need VM candidates, not K8s control-plane prices.
+_NODE_POOL_VM_SERVICE: dict[str, str] = {
+    "aws": "AmazonEC2",
+    "azure": "Virtual Machines",
+    "gcp": "Compute Engine",
+}
+
+#: Known K8s cluster management fees (monthly USD, per cluster).
+_K8S_CLUSTER_FEE_MONTHLY: dict[str, float] = {
+    "aws": 73.00,   # EKS: $0.10/hr
+    "azure": 0.00,  # AKS free tier (basic)
+    "gcp": 73.00,   # GKE standard: $0.10/hr
+}
+
+#: Database engine → provider-specific service + optional SKU name filter.
+#: Values are ``(service_name_override, sku_name_filter | None)``.
+_DATABASE_ENGINE_MAP: dict[tuple[str, str], tuple[str, str | None]] = {
+    # AWS
+    ("aws", "postgresql"): ("AmazonRDS", "PostgreSQL"),
+    ("aws", "postgres"): ("AmazonRDS", "PostgreSQL"),
+    ("aws", "mysql"): ("AmazonRDS", "MySQL"),
+    ("aws", "mariadb"): ("AmazonRDS", "MariaDB"),
+    ("aws", "aurora-postgresql"): ("AmazonRDS", "Aurora PostgreSQL"),
+    ("aws", "aurora-mysql"): ("AmazonRDS", "Aurora MySQL"),
+    ("aws", "sqlserver"): ("AmazonRDS", "SQL Server"),
+    # Azure
+    ("azure", "postgresql"): ("Azure Database for PostgreSQL", None),
+    ("azure", "postgres"): ("Azure Database for PostgreSQL", None),
+    ("azure", "mysql"): ("Azure Database for MySQL", None),
+    ("azure", "sqlserver"): ("SQL Database", None),
+    # GCP
+    ("gcp", "postgresql"): ("Cloud SQL", "PostgreSQL"),
+    ("gcp", "postgres"): ("Cloud SQL", "PostgreSQL"),
+    ("gcp", "mysql"): ("Cloud SQL", "MySQL"),
+    ("gcp", "sqlserver"): ("Cloud SQL", "SQL Server"),
+    # AWS ElastiCache (Redis / Memcached) — separate service from RDS
+    ("aws", "redis"): ("AmazonElastiCache", "cache.r6g"),
+    ("aws", "elasticache"): ("AmazonElastiCache", "cache.r6g"),
+    ("aws", "memcached"): ("AmazonElastiCache", "cache.m6g"),
+    # Azure Cache for Redis
+    ("azure", "redis"): ("Azure Cache for Redis", None),
+    ("azure", "memcached"): ("Azure Cache for Redis", None),
+    # GCP Memorystore
+    ("gcp", "redis"): ("Cloud Memorystore", None),
+    ("gcp", "memcached"): ("Cloud Memorystore", None),
+}
+
+#: Known load balancer base costs (monthly USD).
+_LOAD_BALANCER_FEE_MONTHLY: dict[str, float] = {
+    "aws": 22.27,   # ALB: ~$0.0225/hr + LCU
+    "azure": 18.25, # Standard LB: ~$0.025/hr
+    "gcp": 18.26,   # Cloud LB: ~$0.025/hr
+}
+
+#: Estimated ancillary infrastructure costs (monthly USD).
+#: These cover baseline items NOT modeled as explicit workloads.
+_ANCILLARY_COSTS: dict[str, list[tuple[str, float]]] = {
+    "aws": [
+        ("NAT Gateway", 32.40),
+        ("Data Transfer (est. 100 GB egress)", 9.00),
+    ],
+    "azure": [
+        ("NAT Gateway", 32.85),
+        ("Data Transfer (est. 100 GB egress)", 8.70),
+    ],
+    "gcp": [
+        ("Cloud NAT", 32.40),
+        ("Data Transfer (est. 100 GB egress)", 12.00),
+    ],
+}
+
+#: Estimated monthly CDN / edge delivery costs (fixed estimate, ~500 GB transfer).
+_CDN_COST_MONTHLY: dict[str, float] = {
+    "aws": 85.00,    # CloudFront: ~500 GB transfer + 10M requests
+    "azure": 70.00,  # Azure CDN: ~500 GB transfer
+    "gcp": 60.00,    # Cloud CDN: ~500 GB transfer
+}
+
+#: Preferred general-purpose instance families for container node pools.
+#: Sorting viable nodes by these families prevents selecting oversized
+#: memory-optimized (x, u, hpc) or specialized instance types.
+_PREFERRED_CONTAINER_FAMILIES: dict[str, tuple[str, ...]] = {
+    "aws": (
+        "m5.", "m6i.", "m6a.", "m7i.", "m7g.",
+        "c5.", "c6i.", "c6a.", "c7i.", "c7g.",
+        "t3.", "t3a.",
+    ),
+    "azure": ("Standard_D", "Standard_B", "Standard_F"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +337,218 @@ def _select_best_by_price(
     best = sorted_items[0]
     alternatives = sorted_items[1: 1 + _MAX_ALTERNATIVES]
     return (best, alternatives)
+
+
+def _is_fixed_cost_workload(workload: WorkloadRequirement) -> str | None:
+    """Check if a workload has a known fixed cost instead of needing SKU lookup.
+
+    Returns:
+        A cost-type identifier (``"cluster_management_fee"`` or
+        ``"load_balancer"``) or ``None`` if normal pricing applies.
+    """
+    notes = (workload.notes or "").lower()
+    if "cluster_management_fee" in notes:
+        return "cluster_management_fee"
+
+    name_lower = workload.name.lower()
+    if "load balancer" in name_lower:
+        return "load_balancer"
+
+    return None
+
+
+def _infer_engine_from_name(workload_name: str) -> str:
+    """Infer a database engine key from the workload name when the engine field is unset.
+
+    This is a fallback for workloads where the Clarifier did not explicitly
+    populate ``resources.database_engine`` (e.g. "Postgresql Database",
+    "Cache Layer").
+
+    Args:
+        workload_name: Human-readable workload name.
+
+    Returns:
+        Lowercase engine key (e.g. ``"postgresql"``, ``"redis"``) or empty string.
+    """
+    name = workload_name.lower()
+    if any(k in name for k in ("postgres", "postgresql")):
+        return "postgresql"
+    if any(k in name for k in ("mysql",)):
+        return "mysql"
+    if any(k in name for k in ("mariadb",)):
+        return "mariadb"
+    if any(k in name for k in ("sqlserver", "mssql", "sql server")):
+        return "sqlserver"
+    if any(k in name for k in ("redis", "cache", "elasticache", "memcache")):
+        return "redis"
+    if "memcached" in name:
+        return "memcached"
+    if any(k in name for k in ("aurora",)) and "mysql" in name:
+        return "aurora-mysql"
+    if any(k in name for k in ("aurora",)):
+        return "aurora-postgresql"
+    return ""
+
+
+def _get_db_search_params(
+    provider: CloudProvider,
+    workload: WorkloadRequirement,
+) -> tuple[str | None, str | None]:
+    """Resolve database-engine-specific service name and SKU filter.
+
+    Resolves in priority order:
+    1. ``workload.resources.database_engine`` (explicit, set by Clarifier)
+    2. Name-based inference via :func:`_infer_engine_from_name` (fallback)
+
+    Args:
+        provider: Target cloud provider.
+        workload: Workload with optional ``resources.database_engine``.
+
+    Returns:
+        Tuple of ``(service_name_override, sku_name_filter)``.
+        Both may be ``None`` if no engine is specified.
+    """
+    engine = (workload.resources.database_engine or "").lower().strip()
+    if not engine:
+        engine = _infer_engine_from_name(workload.name)
+    if not engine:
+        return (None, None)
+
+    key = (provider.value, engine)
+    if key in _DATABASE_ENGINE_MAP:
+        return _DATABASE_ENGINE_MAP[key]
+
+    # Partial match: try matching engine as a substring
+    for (prov, eng), val in _DATABASE_ENGINE_MAP.items():
+        if prov == provider.value and eng in engine:
+            return val
+
+    return (None, None)
+
+
+def _build_ancillary_results(
+    target_providers: list[CloudProvider],
+    has_containers: bool,
+) -> list[SizedWorkloadResult]:
+    """Generate ancillary infrastructure cost estimates.
+
+    Adds baseline costs for networking items that are not modeled
+    as explicit workloads (NAT gateway, data transfer).
+
+    Args:
+        target_providers: Providers to generate estimates for.
+        has_containers: Whether the workload includes container components.
+
+    Returns:
+        List of ``SizedWorkloadResult`` with estimated ancillary costs.
+    """
+    results: list[SizedWorkloadResult] = []
+    for provider in target_providers:
+        costs = _ANCILLARY_COSTS.get(provider.value, [])
+        for cost_name, monthly in costs:
+            # NAT only relevant when containers / VPCs are involved
+            is_nat = "nat" in cost_name.lower()
+            if is_nat and not has_containers:
+                continue
+
+            results.append(
+                SizedWorkloadResult(
+                    workload_name=f"[Infra] {cost_name}",
+                    provider=provider,
+                    selected_sku=None,
+                    alternative_skus=[],
+                    monthly_cost_usd=monthly,
+                    fit_score=1.0,
+                    rationale=(
+                        f"Estimated baseline cost for {cost_name}: "
+                        f"${monthly:.2f}/mo on {provider.value}."
+                    ),
+                )
+            )
+    return results
+
+
+def _is_cdn_workload(workload: WorkloadRequirement) -> bool:
+    """Detect CDN / edge delivery workloads by notes or name.
+
+    CDN workloads have no vCPU-based pricing (billed per-GB transferred
+    and per-request). We use a fixed-cost estimate instead of a SKU lookup.
+
+    Args:
+        workload: The workload requirement to check.
+
+    Returns:
+        True when the workload represents a CDN / edge delivery layer.
+    """
+    notes = (workload.notes or "").lower()
+    name_lower = workload.name.lower()
+    return (
+        notes == "cdn"
+        or "cdn" in name_lower
+        or "edge delivery" in name_lower
+        or "cloudfront" in name_lower
+        or "cloud cdn" in name_lower
+    )
+
+
+def _filter_storage_candidates(
+    candidates: list[NormalizedPriceItem],
+    provider: CloudProvider,
+) -> list[NormalizedPriceItem]:
+    """Filter storage SKU candidates to exclude archival and penalty rows.
+
+    Cloud storage APIs return many row types: standard tier, nearline,
+    archive, early-delete penalties, retrieval fees, etc. We want standard
+    hot-tier storage for a realistic baseline cost estimate.
+
+    Args:
+        candidates: Raw candidates from PricingService.
+        provider: Target cloud provider (used for provider-specific logic).
+
+    Returns:
+        Filtered list with archival / penalty rows removed.
+    """
+    _EXCLUDE_PATTERNS = (
+        "earlydelete", "earlydeletion", "glacier", "deeparchive",
+        "retrievalfee", "retrieval", "coldline", "nearline",
+        "archive", "infrequent",
+        # Intelligent-Tiering archive sub-tiers: Archive Instant Access (AIA),
+        # Archive Access (AA), and Deep Archive Access (DA) have the same
+        # per-GB rate as Standard but should not be selected as a baseline.
+        "int-aia", "int-aa", "int-da", "int-fa",
+        "-aia-", "-aa-",
+    )
+    filtered = [
+        c for c in candidates
+        if not any(pat in c.sku_name.lower() for pat in _EXCLUDE_PATTERNS)
+        and c.monthly_cost_estimate is not None
+        and c.monthly_cost_estimate > 0
+    ]
+    if not filtered:
+        return candidates  # fall back if over-filtered
+
+    # Prefer standard / hot tier rows per provider
+    if provider == CloudProvider.AWS:
+        standard = [
+            c for c in filtered
+            if "standardstorage" in c.sku_name.lower()
+            or "standard" in c.sku_name.lower()
+        ]
+        if standard:
+            return standard
+    elif provider == CloudProvider.AZURE:
+        hot = [
+            c for c in filtered
+            if "hot" in c.sku_name.lower() or "lrs" in c.sku_name.lower()
+        ]
+        if hot:
+            return hot
+    elif provider == CloudProvider.GCP:
+        standard = [c for c in filtered if "standard" in c.sku_name.lower()]
+        if standard:
+            return standard
+
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -360,11 +671,28 @@ async def _size_container_workload(
         container_workload_count=len(container_workloads),
     )
 
-    # Select node SKU: pick a reasonably-sized node
-    # Filter to nodes with at least 2 vCPUs and 4 GB memory
+    # Compute total vCPU demand across all container workloads.
+    # This caps node size to prevent selecting massively oversized hosts
+    # (e.g. x8i.48xlarge at 192 vCPU for a 3-vCPU workload set).
+    total_needed_vcpus = 0.0
+    for _wl in container_workloads:
+        if _wl.resources.cpu_request_millicores:
+            total_needed_vcpus += (
+                (_wl.resources.cpu_request_millicores / 1000.0)
+                * max(_wl.resources.replicas, 1)
+            )
+        elif _wl.resources.vcpus:
+            total_needed_vcpus += float(_wl.resources.vcpus)
+        else:
+            total_needed_vcpus += 2.0
+    total_needed_vcpus = max(2.0, total_needed_vcpus)
+    # Reject any node with >4× the total workload vCPU demand
+    max_node_vcpus = max(8, int(total_needed_vcpus * 4))
+
+    # Select node SKU: pick a right-sized general-purpose node
     viable_nodes = [
         c for c in candidates
-        if extract_vcpus(c) >= 2
+        if 2 <= extract_vcpus(c) <= max_node_vcpus
         and extract_memory_gb(c) >= 4.0
         and c.monthly_cost_estimate is not None
         and c.monthly_cost_estimate > 0
@@ -386,14 +714,23 @@ async def _size_container_workload(
             None,
         )
 
-    # Sort by cost-efficiency: monthly_cost / (vcpus * memory_gb)
+    # Sort: general-purpose families first, then by cost-efficiency.
+    # Preferred families (m5/m6i/c5 etc.) are right-sized for microservices.
     def cost_efficiency(sku: NormalizedPriceItem) -> float:
         vcpus = max(extract_vcpus(sku), 1)
         mem = max(extract_memory_gb(sku), 1.0)
         cost = sku.monthly_cost_estimate or float("inf")
         return cost / (vcpus * mem)
 
-    viable_nodes.sort(key=cost_efficiency)
+    def _sort_key(sku: NormalizedPriceItem) -> tuple:
+        preferred = _PREFERRED_CONTAINER_FAMILIES.get(provider.value, ())
+        is_not_preferred = 0 if any(
+            sku.sku_name.startswith(p) or p in sku.sku_name
+            for p in preferred
+        ) else 1
+        return (is_not_preferred, cost_efficiency(sku))
+
+    viable_nodes.sort(key=_sort_key)
     best_node = viable_nodes[0]
     alt_nodes = viable_nodes[1: 1 + _MAX_ALTERNATIVES]
 
@@ -590,7 +927,6 @@ async def _generate_sizer_summary(
 # ---------------------------------------------------------------------------
 
 
-@observe()
 async def run_sizer_node(
     state: OrchestratorState,
     llm: BaseChatModel,
@@ -708,6 +1044,69 @@ async def run_sizer_node(
                 )
                 comp_log.info("sizing_component_started")
 
+                # ── Fixed-cost workloads (no SKU lookup needed) ──
+                fixed_type = _is_fixed_cost_workload(original_wl)
+                if fixed_type == "cluster_management_fee":
+                    fee = _K8S_CLUSTER_FEE_MONTHLY.get(provider.value, 73.0)
+                    all_results.append(
+                        SizedWorkloadResult(
+                            workload_name=component.workload_name,
+                            provider=provider,
+                            selected_sku=None,
+                            alternative_skus=[],
+                            monthly_cost_usd=fee,
+                            fit_score=1.0,
+                            rationale=(
+                                f"K8s cluster management fee: "
+                                f"${fee:.2f}/mo on {provider.value}."
+                            ),
+                        )
+                    )
+                    comp_log.info("management_fee_added", fee=fee)
+                    continue
+
+                if fixed_type == "load_balancer":
+                    fee = _LOAD_BALANCER_FEE_MONTHLY.get(provider.value, 20.0)
+                    all_results.append(
+                        SizedWorkloadResult(
+                            workload_name=component.workload_name,
+                            provider=provider,
+                            selected_sku=None,
+                            alternative_skus=[],
+                            monthly_cost_usd=fee,
+                            fit_score=1.0,
+                            rationale=(
+                                f"Application load balancer base cost: "
+                                f"${fee:.2f}/mo on {provider.value}."
+                            ),
+                        )
+                    )
+                    comp_log.info("load_balancer_fee_added", fee=fee)
+                    continue
+
+                # ── CDN workloads: fixed-cost estimate ────────
+                # CloudFront / Azure CDN / Cloud CDN are usage-based (per-GB,
+                # per-request) — no flat instance SKU to query.
+                if _is_cdn_workload(original_wl):
+                    fee = _CDN_COST_MONTHLY.get(provider.value, 80.0)
+                    all_results.append(
+                        SizedWorkloadResult(
+                            workload_name=component.workload_name,
+                            provider=provider,
+                            selected_sku=None,
+                            alternative_skus=[],
+                            monthly_cost_usd=fee,
+                            fit_score=1.0,
+                            rationale=(
+                                f"CDN/Edge Delivery estimated cost: "
+                                f"${fee:.2f}/mo on {provider.value} "
+                                f"(~500 GB/mo transfer estimate)."
+                            ),
+                        )
+                    )
+                    comp_log.info("cdn_fixed_cost_added", fee=fee)
+                    continue
+
                 # ── Fetch candidate SKUs ──────────────────────
                 region = _get_region_for_provider(
                     provider, workload_request, original_wl,
@@ -715,14 +1114,46 @@ async def run_sizer_node(
                 service_name = _SERVICE_NAME_MAP.get(
                     (provider.value, component.resolved_category),
                 )
+                sku_name_filter: str | None = None
+
+                # Database engine propagation
+                if component.resolved_category == ServiceCategory.DATABASE:
+                    svc_override, sku_override = _get_db_search_params(
+                        provider, original_wl,
+                    )
+                    if svc_override:
+                        service_name = svc_override
+                        comp_log.debug(
+                            "db_service_override",
+                            service_name=svc_override,
+                        )
+                    if sku_override:
+                        sku_name_filter = sku_override
+                        comp_log.debug(
+                            "db_sku_filter",
+                            sku_name=sku_override,
+                        )
+
+                # Container workloads → query VM SKUs for node pools
+                search_category = component.resolved_category
+                if component.resolved_category in _BINPACKED_CATEGORIES:
+                    service_name = _NODE_POOL_VM_SERVICE.get(
+                        provider.value, service_name,
+                    )
+                    search_category = ServiceCategory.COMPUTE
+                    comp_log.debug(
+                        "container_vm_service_override",
+                        service_name=service_name,
+                    )
 
                 try:
                     candidates = await pricing_service.search_prices(
                         provider,
                         service_name=service_name,
-                        service_category=component.resolved_category,
+                        service_category=search_category,
                         region=region,
                         pricing_tier=PricingTier.ON_DEMAND,
+                        sku_name=sku_name_filter,
                         max_results=100,
                     )
                 except Exception:
@@ -749,12 +1180,15 @@ async def run_sizer_node(
                     region=region,
                 )
 
-                # ── Enrich candidates for compute workloads ───
-                if component.resolved_category in _SCORED_CATEGORIES:
-                    # GCP: Compute Engine returns per-component pricing
-                    # (per-vCPU, per-GB-RAM), not per-instance.  Inject
-                    # synthetic VM instances with proper specs for scoring.
+                # ── Enrich candidates for VM-based workloads ──
+                # Both scored (COMPUTE/AI_ML) and binpacked (CONTAINER)
+                # categories need real VM SKUs.
+                _vm_categories = _SCORED_CATEGORIES | _BINPACKED_CATEGORIES
+                if component.resolved_category in _vm_categories:
                     if provider == CloudProvider.GCP:
+                        # GCP returns per-component pricing (per-vCPU,
+                        # per-GB-RAM), not per-instance.  Inject synthetic
+                        # VM instances with calculated hourly prices.
                         gcp_vms = compose_gcp_vm_instances(region=region or "us-central1")
                         candidates = gcp_vms
                         comp_log.info(
@@ -769,10 +1203,57 @@ async def run_sizer_node(
                             if c.unit_of_measure in ("1 Hour", "1 hour")
                             and c.unit_price > 0
                         ]
+                        # AWS: further exclude non-standard OS/license meters.
+                        # EC2 pricing includes rows for SQL Server Enterprise,
+                        # Windows, RHEL, and "Unused Reservation" placeholders
+                        # that have inflated prices (e.g. $1.70/hr for m7i.xlarge
+                        # vs $0.19/hr for the Linux on-demand rate).
+                        if provider == CloudProvider.AWS:
+                            linux_only = [
+                                c for c in candidates
+                                if (
+                                    c.attributes.get("operatingSystem", "Linux").lower()
+                                    == "linux"
+                                    and "unusedbox" not in c.attributes.get(
+                                        "usagetype", ""
+                                    ).lower()
+                                    and "unusedded" not in c.attributes.get(
+                                        "usagetype", ""
+                                    ).lower()
+                                )
+                            ]
+                            if linux_only:
+                                candidates = linux_only
                         comp_log.info(
                             "candidates_filtered_to_vms",
                             remaining=len(candidates),
                         )
+
+                # ── Filter DATABASE to instance-hour rows only ─
+                # RDS / ElastiCache pricing includes storage, IOPS, and backup
+                # meters alongside instance-hour rows.  We need instance rows.
+                if component.resolved_category == ServiceCategory.DATABASE:
+                    hourly = [
+                        c for c in candidates
+                        if c.unit_of_measure in ("1 Hour", "1 hour")
+                        and c.unit_price > 0
+                    ]
+                    if hourly:
+                        candidates = hourly
+                        comp_log.info(
+                            "database_candidates_filtered_to_hourly",
+                            remaining=len(hourly),
+                        )
+
+                # ── Filter STORAGE to standard-tier rows only ──
+                # S3 / Blob / GCS return archival, Glacier early-delete,
+                # and retrieval-fee rows that have misleadingly low prices.
+                if component.resolved_category == ServiceCategory.STORAGE:
+                    candidates = _filter_storage_candidates(candidates, provider)
+                    comp_log.info(
+                        "storage_candidates_filtered",
+                        remaining=len(candidates),
+                    )
 
                 if not candidates:
                     comp_log.warning("no_candidates_found")
@@ -826,6 +1307,34 @@ async def run_sizer_node(
                     result = await _size_generic_workload(
                         component, candidates, provider,
                     )
+                    # ── STORAGE: multiply per-GB price by storage_gb ──
+                    # The generic sizer returns ``unit_price × 1`` for
+                    # GB-month priced items.  We need to scale by the
+                    # actual storage volume from the workload requirement.
+                    if (
+                        component.resolved_category == ServiceCategory.STORAGE
+                        and result.selected_sku is not None
+                        and result.selected_sku.is_monthly
+                        and result.selected_sku.unit_price > 0
+                    ):
+                        storage_gb = original_wl.resources.storage_gb or 100.0
+                        per_gb = result.selected_sku.unit_price
+                        monthly = round(per_gb * storage_gb, 2)
+                        result = result.model_copy(update={
+                            "monthly_cost_usd": monthly,
+                            "rationale": (
+                                f"Selected {result.selected_sku.sku_name} at "
+                                f"${per_gb:.4f}/GB-Month. "
+                                f"Est. ${monthly:.2f}/mo for "
+                                f"{storage_gb:.0f} GB storage."
+                            ),
+                        })
+                        comp_log.info(
+                            "storage_cost_scaled",
+                            storage_gb=storage_gb,
+                            per_gb=per_gb,
+                            monthly_cost=monthly,
+                        )
                     all_results.append(result)
 
                 comp_log.info(
@@ -837,6 +1346,20 @@ async def run_sizer_node(
                     fit_score=result.fit_score,
                     monthly_cost=result.monthly_cost_usd,
                 )
+
+        # ── Add ancillary infrastructure cost estimates ─────────
+        has_containers = any(
+            c.resolved_category in _BINPACKED_CATEGORIES
+            for c in workload_profile.components
+        )
+        ancillary = _build_ancillary_results(target_providers, has_containers)
+        all_results.extend(ancillary)
+        if ancillary:
+            log.info(
+                "ancillary_costs_added",
+                count=len(ancillary),
+                total=round(sum(a.monthly_cost_usd for a in ancillary), 2),
+            )
 
         # ── Generate LLM summary ─────────────────────────────
         sizer_summary = await _generate_sizer_summary(

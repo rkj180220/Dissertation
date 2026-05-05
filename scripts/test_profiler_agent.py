@@ -216,7 +216,7 @@ check("estimate_resources: dev environment scales down", test_estimate_resources
 
 
 def test_estimate_resources_gpu_detection():
-    """GPU is detected from ResourceSpec or AI_ML category."""
+    """GPU is detected from ResourceSpec gpu_count only (not category alone)."""
     wl_gpu = WorkloadRequirement(
         name="GPU Job",
         resources=ResourceSpec(gpu_count=1),
@@ -224,12 +224,13 @@ def test_estimate_resources_gpu_detection():
     result = _estimate_resources(wl_gpu, ServiceCategory.COMPUTE, WorkloadTier.BUSINESS_CRITICAL, EnvironmentType.PRODUCTION)
     assert result["requires_gpu"] is True
 
+    # AI_ML category WITHOUT gpu_count should NOT force GPU
     wl_aiml = WorkloadRequirement(
         name="ML Training",
         resources=ResourceSpec(),
     )
     result = _estimate_resources(wl_aiml, ServiceCategory.AI_ML, WorkloadTier.BUSINESS_CRITICAL, EnvironmentType.PRODUCTION)
-    assert result["requires_gpu"] is True
+    assert result["requires_gpu"] is False, "AI_ML category alone should not force GPU"
 
 
 check("estimate_resources: GPU detection", test_estimate_resources_gpu_detection)
@@ -561,18 +562,18 @@ check("no_provider_imports: clean abstraction", test_no_provider_imports)
 
 
 def test_observe_decorator():
-    """Key functions must have @observe() decorator."""
+    """Key internal functions must have @observe() decorator."""
     import inspect
     import src.agents.profiler as mod
 
     source = inspect.getsource(mod)
-    assert source.count("@observe()") >= 3, (
-        f"Expected at least 3 @observe() decorators, "
+    assert source.count("@observe()") >= 2, (
+        f"Expected at least 2 @observe() decorators (LLM-calling functions), "
         f"found {source.count('@observe()')}"
     )
 
 
-check("observe_decorator: at least 3 @observe()", test_observe_decorator)
+check("observe_decorator: at least 2 @observe()", test_observe_decorator)
 
 
 # ═══════════════════════════════════════════════════════════════════

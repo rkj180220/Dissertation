@@ -34,6 +34,7 @@ from src.models.pricing import (
     SKUPricing,
 )
 from src.models.recommendation import (
+    AncillaryCost,
     BinPackingResult,
     CloudRecommendation,
     ComplianceCheckResult,
@@ -80,6 +81,7 @@ __all__ = [
     "ClarificationQuestion",
     "ConversationState",
     # --- Recommendations ---
+    "AncillaryCost",
     "PackedNode",
     "BinPackingResult",
     "ProviderCostBreakdown",
