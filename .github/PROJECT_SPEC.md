@@ -3,7 +3,7 @@
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
 > **Additional Examiner**: Santhosh Kirubakaran
-> **Last Updated**: 4 May 2026 (Priority 11 — Second live Cal Fire run completed (4 May 2026). 5 bugs confirmed from second run; root causes diagnosed. Fixes in progress: 11a DATABASE $0 pricing, 11b EC2 wrong meter row, 11c Storage $0 quantity, 11d §11 section numbering collision, 11e Cache Layer → wrong managed service in RFP table. 142/142 tests pass.)
+> **Last Updated**: 5 May 2026 (Priority 12 fixes applied + fourth run attempted. Bugs 12a/12b/12c fixed in `sizer.py`; Bug 12d confirmed NOT a bug — budget `266,666.0` propagates correctly to NFR-05 in RFP. Fourth live run (request_id `4d134426`) shows fixes are in code but pricing data is zero because AWS STS credentials expired between run #3 and run #4. Need fresh AWS credentials to complete final live verification. 142/142 tests pass.)
 > **LLM**: Gemini 2.5 Pro (`gemini-2.5-pro`) via Google Cloud Vertex AI (`dissertation-rj`, `us-central1`) using ADC
 
 ---
@@ -87,7 +87,7 @@ User (React chat) → FastAPI (SSE) → LangGraph Orchestrator
 
 | File | Status | What it does |
 |------|--------|-------------|
-| `factory.py` | ✅ | `get_llm(provider, model, **kwargs) → BaseChatModel`. Lazy imports: `bedrock` → `ChatBedrockConverse`, `gemini` → `ChatGoogleGenerativeAI`, **`vertexai` → `ChatGoogleGenerativeAI` with `google.auth.default()` ADC** (deprecation warning fixed — `ChatVertexAI` removed). `_create_vertexai()` requires `gcp_settings.project_id` for validation; uses ADC — no API key needed. Never imported directly in agent code. Live-tested: `gemini-2.5-pro` ✅ |
+| `factory.py` | ✅ | `get_llm(provider, model, **kwargs) → BaseChatModel`. Lazy imports: `bedrock` → `ChatBedrockConverse`, `gemini` → `ChatGoogleGenerativeAI`, **`vertexai` → `ChatGoogleGenerativeAI` with `google.auth.default()` ADC** (deprecation warning fixed — `ChatVertexAI` removed). `_create_vertexai()` passes `vertexai=True`, `project=project`, `location=location` to `ChatGoogleGenerativeAI` (required for Vertex AI routing); reads `VERTEXAI_PROJECT` env var with `GCP_PROJECT_ID` as fallback; reads `VERTEXAI_LOCATION` with `us-central1` default. Never imported directly in agent code. Live-tested: `gemini-2.5-pro` ✅. **Note**: `gemini-3.1-pro-preview` requires Model Garden enablement per GCP project before use. |
 | `__init__.py` | ✅ | Re-exports `get_llm`. |
 
 ---
@@ -647,3 +647,68 @@ Comparison source: `docs/Presidio_Response_Cal Fire_Draft 10.7.25 (2) (1).html`.
 | **11e** ✅ | RFP Managed Services table | Cache Layer → "Amazon RDS Multi-AZ" (wrong) | `_build_managed_services_section()` used `category.value.upper()` ("DATABASE") for all DB-category workloads — no distinction between relational DB and cache. | Added name-based override in the component loop: if `resolved_category == DATABASE` and name contains "cache"/"redis"/"elasticache", use "CACHE" key instead → "Amazon ElastiCache for Redis". | `rfp_writer.py` |
 
 **Post-fix test result**: 142/142 tests pass ✅. All fix logic verified via unit tests and quick Python validation.
+
+---
+
+## 18. Third Cal Fire Live Run — Results & Bugs (5 May 2026)
+
+**Run summary**: Third full Cal Fire pipeline run (request_id `9498902b`), Vertex AI `gemini-2.5-pro`. Clarifier: 4 turns → ready. 9 workloads identified. Profiler: 9 components profiled. Sizer: 11 combinations sized. RFP: 41,169 chars, 19 sections, 100% WAF score. Runtime: 244.3s.
+
+**Improvements vs run #2**: Section count same (19), char count similar (41,169 vs 41,718). P11d ✅ (§11 collision resolved). P11e ✅ (Cache Layer → ElastiCache). P11b **partially** working (m7i.xlarge SQL Ent meter gone), but new SQL Std meter now selected.
+
+### 18a. Sizer Output Trace
+
+| Component | SKU | Monthly Cost | Fit | Status |
+|-----------|-----|-------------|-----|--------|
+| Containerised Application (aws) | i3.4xlarge | $2,312.64 | 0.20 | ❌ SQL Std meter, storage-optimized family |
+| Kubernetes Cluster (aws) | Fixed cost | $73.00 | 1.00 | ✅ |
+| API Server (aws) | i3.4xlarge | $2,312.64 | 0.50 | ❌ Same SQL Std / i3 issue |
+| Postgresql Database (aws) | N/A | $0.00 | 0.00 | ❌ No candidates (stale cache) |
+| Cache Layer (aws) | N/A | $0.00 | 0.00 | ❌ No candidates (stale cache) |
+| Object Storage (aws) | USW2-TimedStorage-GIR-ByteHrs | $4.00 | 0.70 | ❌ GIR = Glacier Instant Retrieval |
+| Load Balancer (aws) | N/A | $22.27 | 1.00 | ✅ |
+| CDN / Edge Delivery (aws) | N/A | $85.00 | 1.00 | ✅ |
+| Geospatial / Tile Storage (aws) | USW2-TimedStorage-GIR-ByteHrs | $20.00 | 0.70 | ❌ GIR tier again |
+| [Infra] NAT Gateway (aws) | N/A | $32.40 | 1.00 | ✅ |
+| [Infra] Data Transfer (aws) | N/A | $9.00 | 1.00 | ✅ |
+| **TOTAL** | | **$4,870.95** | | ❌ Understated (DB/Cache missing) |
+
+**Expected total**: ~$15,000–$60,000/mo when DB/Cache/EC2 are correctly priced.
+
+### 18b. Priority 12 Bugs (Identified 5 May 2026 — All Fixed)
+
+| ID | Component | Symptom | Root Cause | Fix Applied | File |
+|----|-----------|---------|-----------|-------------|------|
+| **12a** ✅ | Containerised Application, API Server | `i3.4xlarge` at $2,312.64/mo (SQL Std meter) — fit 0.20 | P11b added `operatingSystem == "Linux"` filter but SQL Standard rows also report `operatingSystem=Linux` — only distinguishable by `meter_name` description. | Added `_SQL_LICENSE_TOKENS` tuple (`"sql std"`, `"sql ent"`, `"sql web"`, `"with sql"`, `"sqlserver"`, `"windows"`, `"rhel"`, `"suse"`); filter checks `(c.meter_name or "").lower()` before adding to `linux_only` candidates. | `sizer.py` ~line 1221 |
+| **12b** ✅ | Object Storage, Geospatial Storage | `USW2-TimedStorage-GIR-ByteHrs` (S3 Glacier Instant Retrieval) selected | `GIR` not in `_EXCLUDE_PATTERNS`; P11c added Intel-Tiering sub-tiers but missed GIR's distinct SKU code prefix. | Added `"-gir-"` and `"gir-bytehrs"` to `_EXCLUDE_PATTERNS` in `_filter_storage_candidates()`. | `sizer.py` ~line 523 |
+| **12c** ✅ | Postgresql Database, Cache Layer | $0.00, fit 0.00 (N/A) | Stale SQLite cache had wrong/missing RDS and ElastiCache rows from before P11a fix. | Deleted `data/sku_cache.db` to force fresh fetch on next pipeline run. | `data/sku_cache.db` |
+| **12d** ✅ | RFP Requirements Traceability | Initially suspected: NFR-05 "Budget ceiling: Not specified" | Investigation and run #4 confirmed this is NOT a bug — `_parse_budget("Budget: $266,666/month")` correctly returns `266666.0`; NFR-05 in run #4 RFP shows `Budget ceiling: $266,666/mo`. | No code change needed. | `clarifier.py` / `rfp_writer.py` |
+
+### 18d. Fourth Live Cal Fire Run (5 May 2026, request_id `4d134426`)
+
+**Status**: Partially verified — code fixes confirmed but pricing data empty due to expired AWS STS credentials.
+
+| Component | Selected SKU | Monthly Cost | Fit Score | Status |
+|-----------|-------------|-------------|-----------|--------|
+| All compute/container/database | N/A | $0.00 | 0.00 | ❌ AWS `ExpiredToken` error during pricing fetch |
+| Kubernetes Cluster | Fixed cost | $73.00 | 1.00 | ✅ |
+| Load Balancer | Fixed cost | $22.27 | 1.00 | ✅ |
+| NAT Gateway | Fixed cost | $32.40 | 1.00 | ✅ |
+| Data Transfer | Fixed cost | $9.00 | 1.00 | ✅ |
+
+**Budget propagation (Bug 12d confirmed fixed)**: `budget_monthly_usd = 266666.0` in `CostComparison`; RFP §17 NFR-05 shows `Budget ceiling: $266,666/mo` ✅
+
+**Blocker for final verification**: AWS STS session token (`ASIA` prefix) expired. Refresh `.env` with new credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) and re-run to populate the pricing cache with correct m-family EC2, RDS, and ElastiCache data.
+
+**All 142 tests pass** with P12 fixes in place.
+
+
+### 18c. LLM Factory Fix Applied This Session
+
+| Change | File | Detail |
+|--------|------|--------|
+| `_create_vertexai()` passes `vertexai=True` | `src/llm/factory.py` | `ChatGoogleGenerativeAI` requires this flag to route to Vertex AI endpoint (not Google AI Studio) |
+| `project=project` passed explicitly | `src/llm/factory.py` | ADC project resolves to `None` in some dev environments — explicit parameter prevents crash |
+| `location=location` passed explicitly | `src/llm/factory.py` | Defaults to wrong endpoint without this; now reads `VERTEXAI_LOCATION` env var (default `us-central1`) |
+| `GCP_PROJECT_ID` fallback added | `src/llm/factory.py` | Falls back to `GCP_PROJECT_ID` env var if `VERTEXAI_PROJECT` is not set |
+| Gemini 3.1 Pro Preview status | `.env` (reverted) | `gemini-3.1-pro-preview` is a restricted preview — requires Model Garden enablement per GCP project. Not currently accessible in `dissertation-rj`. Use `gemini-2.5-pro` until enabled. |

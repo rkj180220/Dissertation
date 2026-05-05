@@ -169,24 +169,25 @@ def _create_vertexai(
 
     Uses Application Default Credentials (ADC) — no API key required.
     The GCP project is sourced from ``gcp_settings.project_id`` (preferred)
-    or the ``VERTEXAI_PROJECT`` env var as fallback.
+    or the ``VERTEXAI_PROJECT`` / ``GCP_PROJECT_ID`` env vars as fallback.
+    Location defaults to ``VERTEXAI_LOCATION`` env var or ``us-central1``.
 
-    Uses ``ChatGoogleGenerativeAI`` from ``langchain-google-genai`` with ADC
-    credentials (recommended over the deprecated ``ChatVertexAI``).
+    Uses ``ChatGoogleGenerativeAI`` from ``langchain-google-genai`` with
+    ``vertexai=True`` — the recommended approach for Vertex AI Gemini models.
 
     Args:
         llm_settings: LLM configuration.
-        gcp_settings: GCP configuration — used for project ID validation.
+        gcp_settings: GCP configuration — used for project ID.
 
     Returns:
         ``ChatGoogleGenerativeAI`` instance backed by Vertex AI ADC.
     """
     import os
 
-    # Prefer settings object; fall back to raw env var
     project = (
         (gcp_settings.project_id if gcp_settings else None)
         or os.environ.get("VERTEXAI_PROJECT", "")
+        or os.environ.get("GCP_PROJECT_ID", "")
     )
 
     if not project:
@@ -194,6 +195,8 @@ def _create_vertexai(
             "GCP project ID must be set (GCP_PROJECT_ID in .env or VERTEXAI_PROJECT) "
             "when using the 'vertexai' LLM provider."
         )
+
+    location = os.environ.get("VERTEXAI_LOCATION", "us-central1")
 
     try:
         import google.auth
@@ -211,6 +214,9 @@ def _create_vertexai(
     return ChatGoogleGenerativeAI(
         model=llm_settings.model,
         credentials=creds,
+        vertexai=True,
+        project=project,
+        location=location,
         temperature=llm_settings.temperature,
         max_output_tokens=llm_settings.max_tokens,
     )

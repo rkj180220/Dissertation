@@ -517,6 +517,10 @@ def _filter_storage_candidates(
         # per-GB rate as Standard but should not be selected as a baseline.
         "int-aia", "int-aa", "int-da", "int-fa",
         "-aia-", "-aa-",
+        # S3 Glacier Instant Retrieval has its own SKU code prefix (GIR) that
+        # does not include the word "glacier" in the meter name.
+        # e.g. "USW2-TimedStorage-GIR-ByteHrs"
+        "-gir-", "gir-bytehrs",
     )
     filtered = [
         c for c in candidates
@@ -1205,10 +1209,20 @@ async def run_sizer_node(
                         ]
                         # AWS: further exclude non-standard OS/license meters.
                         # EC2 pricing includes rows for SQL Server Enterprise,
-                        # Windows, RHEL, and "Unused Reservation" placeholders
-                        # that have inflated prices (e.g. $1.70/hr for m7i.xlarge
-                        # vs $0.19/hr for the Linux on-demand rate).
+                        # SQL Server Standard, Windows, RHEL, and "Unused
+                        # Reservation" placeholders that have inflated prices.
+                        # Bug 11b: `operatingSystem=Linux` filter removed SQL
+                        # Enterprise (Windows/RHEL rows), but SQL Standard rows
+                        # *also* report operatingSystem=Linux — they are only
+                        # distinguishable by the meter_name/description field.
+                        # Bug 12a fix: additionally filter on meter_name to
+                        # exclude any row that bundles an OS/DB license.
                         if provider == CloudProvider.AWS:
+                            _SQL_LICENSE_TOKENS = (
+                                "sql std", "sql ent", "sql web",
+                                "with sql", "sqlserver",
+                                "windows", "rhel", "suse",
+                            )
                             linux_only = [
                                 c for c in candidates
                                 if (
@@ -1220,6 +1234,10 @@ async def run_sizer_node(
                                     and "unusedded" not in c.attributes.get(
                                         "usagetype", ""
                                     ).lower()
+                                    and not any(
+                                        tok in (c.meter_name or "").lower()
+                                        for tok in _SQL_LICENSE_TOKENS
+                                    )
                                 )
                             ]
                             if linux_only:
