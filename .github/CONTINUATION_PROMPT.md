@@ -1,6 +1,6 @@
 # Cloud Orchestrator IDSS — Continuation Prompt
 
-> **Last Updated**: 5 May 2026 (Priority 12 fixes applied — all 4 bugs addressed. Bugs 12a/12b fixed in `sizer.py`. Bug 12c: stale cache cleared. Bug 12d: confirmed NOT a bug (budget `266,666.0` propagates correctly; NFR-05 shows `Budget ceiling: $266,666/mo`). Fourth live run (request_id `4d134426`) blocked by expired AWS STS credentials — pricing data empty. Code fixes verified correct: 142/142 tests pass. **Next: refresh AWS credentials and do final live verification run.**)
+> **Last Updated**: 5 May 2026 (P13 fixes applied — AWS pricing cache poisoning root cause discovered and fixed. Per-service API filters added to `aws_provider.py` (EC2/RDS/ElastiCache/S3). `linux_only` fallback safety net, GPU exclusion, and ZIA pattern added to `sizer.py`. 8 RFP section numbers fixed in `rfp_writer.py`. Stale cache deleted. **Run #5 completed successfully** (254s, 44,057-char RFP, 100% WAF). 142/142 tests pass. **Next: refresh AWS credentials and run #6 to verify correct SKU selection.**)
 
 ---
 
@@ -80,19 +80,22 @@ Please read `.github/copilot-instructions.md` first (tech stack rules, observabi
 - `@observe()` + structlog throughout
 - **Verified**: 23/23 checks passed, 142/142 tests pass ✅
 
-- **Sizer Agent** (`src/agents/sizer.py`) — ~1300 lines ✅ P12 fixes applied
+- **Sizer Agent** (`src/agents/sizer.py`) — ~1470 lines ✅ P13 fixes applied
 - Category-aware SKU selection: scored (COMPUTE, AI_ML), binpacked (CONTAINER with VM node SKUs), cheapest-price (all others)
 - **Container node pool fix**: queries EC2/VMs/Compute Engine for node pools (not EKS/AKS/GKE service pricing)
 - **Database engine propagation**: `_DATABASE_ENGINE_MAP` routes PostgreSQL/MySQL/etc. + **redis/elasticache → AmazonElastiCache** (Bug 9c fix)
 - **Engine inference fallback** (Bug 11a fix): `_infer_engine_from_name()` parses engine from workload name when `resources.database_engine` is None
 - **EC2 Linux OS filter** (Bug 11b fix): AWS candidates filtered to `operatingSystem=Linux` and `usagetype` not containing "UnusedBox"/"UnusedDed"
-- **SQL license token filter** (Bug 12a fix ✅): `_SQL_LICENSE_TOKENS` checks `meter_name` to exclude SQL Standard/Enterprise/Web rows — they also show `operatingSystem=Linux` but description reveals the license
+- **SQL license token filter** (Bug 12a fix ✅): `_SQL_LICENSE_TOKENS` checks `meter_name` to exclude SQL Standard/Enterprise/Web rows
+- **linux_only silent fallback safety** (Bug 13b fix ✅): when `linux_only` filter produces empty list, `candidates` is set to `[]` — never silently reverts to garbage rows
+- **GPU exclusion for non-GPU workloads** (Bug 13c fix ✅): `_GPU_PREFIXES` block (`g3–g7`, `p2–p5`, `trn`, `dl1`) excludes GPU instances when `not component.requires_gpu`
 - **Storage quantity scaling** (Bug 11c fix): post-processing for STORAGE: `monthly = unit_price × storage_gb`
-- **GIR exclusion** (Bug 12b fix ✅): `"-gir-"` and `"gir-bytehrs"` added to `_EXCLUDE_PATTERNS` — S3 Glacier Instant Retrieval SKU code `GIR` not containing the word "glacier"
+- **GIR exclusion** (Bug 12b fix ✅): `"-gir-"` and `"gir-bytehrs"` added to `_EXCLUDE_PATTERNS`
+- **ZIA exclusion** (Bug 13d fix ✅): `"-zia-"` and `"zia-bytehrs"` added to `_EXCLUDE_PATTERNS` — S3 One Zone-Infrequent Access SKU uses acronym "ZIA"
 - **Fixed-cost workloads**: K8s cluster management fee ($73/mo), load balancer ($18-22/mo), **CDN ($60-85/mo fixed estimate)**
 - **Container vCPU ratio guard** (Bug 9a fix): `max_node_vcpus = max(8, total_needed_vcpus × 4)`; preferred families (m5/m6i/c5/c6i) sorted first
 - **DATABASE hourly filter** (Bug 9b fix): RDS/ElastiCache candidates filtered to `unit_of_measure in ("1 Hour", "1 hour")`
-- **STORAGE standard-tier filter** (Bug 9d fix): `_filter_storage_candidates()` excludes EarlyDelete/Glacier/GIR/Nearline/INT-AIA rows
+- **STORAGE standard-tier filter** (Bug 9d fix): `_filter_storage_candidates()` excludes EarlyDelete/Glacier/GIR/Nearline/INT-AIA/ZIA rows
 - **CDN detection** (Bug 9e fix): `_is_cdn_workload()` routes `notes="cdn"` or "cdn" in name to fixed-cost CDN path
 - Ancillary costs: NAT gateway + data transfer estimates per provider
 - **Verified**: 142/142 tests pass ✅
@@ -467,26 +470,29 @@ Full Cal Fire pipeline completed end-to-end with gemini-2.5-pro via Vertex AI.
 
 ## What Needs to Be Fixed/Built Next ❌
 
-> **All Priority 12 code fixes are done.** Final live run verification is blocked by expired AWS STS credentials.
+> **All Priority 13 code fixes are done.** Live run #6 is the next step — needs fresh AWS credentials.
 
-### Priority 12 — COMPLETE (code fixes done, live run pending)
+### Priority 13 — COMPLETE (code fixes done, live run pending)
 
-| Bug | Status | Fix |
+| Bug | Status | Fix location |
 |-----|--------|-----|
-| 12a — SQL Standard meter (`i3.4xlarge`) | ✅ Fixed | `_SQL_LICENSE_TOKENS` filter on `meter_name` in `sizer.py` ~line 1221 |
-| 12b — GIR storage tier not excluded | ✅ Fixed | `"-gir-"` + `"gir-bytehrs"` added to `_EXCLUDE_PATTERNS` in `sizer.py` ~line 523 |
-| 12c — DB/Cache still $0 (stale cache) | ✅ Fixed | Deleted `data/sku_cache.db`; auto-recreates on next run |
-| 12d — NFR-05 budget not propagated | ✅ Not a bug | Verified: budget `266666.0` propagates correctly; run #4 NFR-05 = `Budget ceiling: $266,666/mo` |
+| 13a — RDS/ElastiCache $0 (`instanceType` filter mismatch) | ✅ Fixed | `aws_provider.py` `search_prices()` — RDS uses `databaseEngine` filter; ElastiCache uses `cacheEngine=Redis` filter |
+| 13b — EC2 `linux_only` silent fallback to garbage rows | ✅ Fixed | `sizer.py` ~line 1256 — `else: candidates = []` when `linux_only` empty |
+| 13c — GPU instance (g5.4xlarge) selected for non-GPU VM | ✅ Fixed | `sizer.py` `_GPU_PREFIXES` block excludes `g3–g7`, `p2–p5`, `trn`, `dl1` for `not requires_gpu` |
+| 13d — S3 ZIA tier not excluded | ✅ Fixed | `sizer.py` `_EXCLUDE_PATTERNS`: `"-zia-"`, `"zia-bytehrs"` added; `aws_provider.py` `storageClass=General Purpose` API filter |
+| 13e — S3 API filter missing (cache poisoned with archival tiers) | ✅ Fixed | `aws_provider.py`: EC2 gets `operatingSystem=Linux` + `tenancy=Shared` + `preInstalledSw=NA` filters; S3 gets `storageClass=General Purpose` |
+| 13f — RFP 8 duplicate/wrong section numbers | ✅ Fixed | `rfp_writer.py` lines 164, 201, 271, 317, 1135, 1219, 1600, 1844 |
 
 ### Next Immediate Task
 
-**Refresh AWS credentials and run the fifth live Cal Fire run:**
+**Refresh AWS credentials and run the sixth live Cal Fire run:**
 1. Update `.env` with fresh `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` (run `aws sso login` or re-issue from AWS console)
-2. Restart API server: `uv run uvicorn src.main:app --port 8001`
-3. Run 4-turn Cal Fire clarify session → `/orchestrate` pipeline
-4. Verify sizer output: m5/m6i family (NOT i3), DB/Cache > $0, S3 Standard (NOT GIR), total ~$15K–60K/mo
-5. Save RFP to `docs/test-rfp-document-5.md`
-6. Commit: `git add src/agents/sizer.py src/llm/factory.py .github/ docs/ && git commit -m "Fix P12: SQL Standard filter, GIR exclusion, stale cache cleared (142/142 tests)"`
+2. Delete `data/sku_cache.db` if it somehow got recreated with old data
+3. Restart API server: `uv run uvicorn src.main:app --port 8001`
+4. Run 2-turn Cal Fire clarify session → `/orchestrate` pipeline
+5. Verify sizer output: Container=m5/m6i family (~$70–150/mo), DB=RDS `db.m5.large` (~$120–200/mo), Cache=ElastiCache `cache.r6g.large` (~$100–150/mo), VMs=m5/m6i (~$280–350/mo), Storage=S3 Standard (NOT ZIA/GIR)
+6. Total should be ~$15,000–50,000/mo (not $3,220)
+7. Save RFP to `docs/test-rfp-document-6.md`
 
 
 ## Auth / Credentials (already set in `.env`)
@@ -526,6 +532,9 @@ cd dashboard && npm run build
 
 ## Notes for Future Me
 
+- **P13 AWS pricing cache poisoning root cause (5 May 2026)**: AWS `GetProducts` for `AmazonEC2` WITHOUT `operatingSystem`/`tenancy`/`preInstalledSw` filters returns billing artifacts in alphabetical `usagetype` order. The first 100 items in `us-west-2` are ALL non-standard: `USW2-UnusedBox:m7i.xlarge` (unused RI placeholder, `operatingSystem=Linux`, $1.70/hr — PASSES linux_only filter because it IS Linux), DedicatedHost rows ($0 — filtered by `unit_price > 0`), SQL-licensed rows, etc. **The fix**: add `operatingSystem=Linux`, `tenancy=Shared`, `preInstalledSw=NA` as API-level filters in `search_prices()` BEFORE hitting the pricing endpoint. For RDS: never use engine name (e.g. "PostgreSQL") as `instanceType` filter — use `databaseEngine` field instead. For ElastiCache: use `cacheEngine=Redis`. For S3: use `storageClass=General Purpose` to get only Standard tier. **Key lesson**: always add service-specific attribute filters to AWS `GetProducts` — the API intentionally returns ALL product variants without them.
+- **P13 linux_only silent fallback (5 May 2026)**: `if linux_only: candidates = linux_only` evaluates to `False` when `linux_only` is empty (all remaining rows were non-Linux after filter). The old code silently reverted to the pre-filter set (garbage rows including UnusedBox). Fix: `else: candidates = []` + log warning. This was the root cause of m7i.xlarge (UnusedBox RI placeholder at $1.70/hr) being selected for the Container workload across multiple runs.
+- **P13 RFP section numbers (5 May 2026)**: When `_build_managed_services_section()` was added as §5, 8 downstream section headers were never renumbered. The ToC was already correct (1–17) but body section headers had `## 5.`, `## 6.` etc. in the wrong places. Fixed lines: 164 (§5→§6 SKU), 201 (§6→§7 Cost), 271 (§15→§16 WAF), 317 (§13→§14 Vendor), 1135 (§8→§9 SLA), 1219 (§9→§10 Security), 1600 (§7→§8 TCO), 1844 (§14→§15 Assumptions). Rule: after adding/reordering sections, grep for all `## \d+\.` and verify each matches the ToC.
 - **P10 RFP Writer content gaps (4 May 2026)**: 6 gaps closed vs Presidio reference. Key lessons: (1) `ComponentProfile` has `recommended_instance_families: list[str]`, NOT `recommended_family` — always check model fields before using attribute access; (2) government/greenfield detection uses keyword sets on `raw_user_input` — keep `_GOVERNMENT_KEYWORDS` and `_MIGRATION_KEYWORDS` up to date as new scenarios arise; (3) WCAG + StateRAMP sections must be conditional on `compliance_frameworks` — don't add them for every run; (4) the `_MANAGED_SERVICES` dict is the key lookup for 10e — expand it when new service categories are added to `ServiceCategory` enum.
 - **P10 live pipeline crash fix**: `comp.recommended_family` → `comp.recommended_instance_families[0] if comp.recommended_instance_families else comp.resolved_category.value` — always check model field names against `model_fields.keys()` before referencing.
 - **LLM factory fix (5 May 2026)**: `_create_vertexai()` in `factory.py` now passes `vertexai=True` (routes to Vertex AI, not Google AI Studio), `project=project` (explicit — ADC project can be `None` in dev), and `location=location` (prevents wrong endpoint). Also added `GCP_PROJECT_ID` fallback for `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` env var (default `us-central1`).

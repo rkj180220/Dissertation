@@ -3,7 +3,7 @@
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
 > **Additional Examiner**: Santhosh Kirubakaran
-> **Last Updated**: 5 May 2026 (Priority 12 fixes applied + fourth run attempted. Bugs 12a/12b/12c fixed in `sizer.py`; Bug 12d confirmed NOT a bug — budget `266,666.0` propagates correctly to NFR-05 in RFP. Fourth live run (request_id `4d134426`) shows fixes are in code but pricing data is zero because AWS STS credentials expired between run #3 and run #4. Need fresh AWS credentials to complete final live verification. 142/142 tests pass.)
+> **Last Updated**: 5 May 2026 (P13 fixes applied — EC2/RDS/ElastiCache/S3 API filters, linux_only fallback safety, GPU exclusion, ZIA exclusion, RFP section numbers. Run #5 root cause discovered: AWS pricing cache was poisoned with billing artifacts. All 142 tests pass. Cache deleted. Ready for run #6.)
 > **LLM**: Gemini 2.5 Pro (`gemini-2.5-pro`) via Google Cloud Vertex AI (`dissertation-rj`, `us-central1`) using ADC
 
 ---
@@ -712,3 +712,59 @@ Comparison source: `docs/Presidio_Response_Cal Fire_Draft 10.7.25 (2) (1).html`.
 | `location=location` passed explicitly | `src/llm/factory.py` | Defaults to wrong endpoint without this; now reads `VERTEXAI_LOCATION` env var (default `us-central1`) |
 | `GCP_PROJECT_ID` fallback added | `src/llm/factory.py` | Falls back to `GCP_PROJECT_ID` env var if `VERTEXAI_PROJECT` is not set |
 | Gemini 3.1 Pro Preview status | `.env` (reverted) | `gemini-3.1-pro-preview` is a restricted preview — requires Model Garden enablement per GCP project. Not currently accessible in `dissertation-rj`. Use `gemini-2.5-pro` until enabled. |
+
+---
+
+## 19. Fifth + Sixth Cal Fire Runs — P13 Bug Discovery & Fixes (5 May 2026)
+
+### 19a. Fifth Live Cal Fire Run (request_id `049a1b82-d5eb-430d-b907-469675de9be6`)
+
+**Run summary**: Run #5 with fresh AWS STS credentials. Clarifier: 2 turns → ready. 10 workloads identified. Profiler: 10 components. Sizer: 12 combinations. RFP: 44,057 chars, 19 sections, 100% WAF (6/6). Runtime: **254,361ms (~4.25 min)**.
+
+| Component | SKU | Monthly Cost | Fit | Status |
+|-----------|-----|-------------|-----|--------|
+| Containerised Application (aws) | m7i.xlarge | $1,242.17 | 0.25 | ❌ UnusedBox RI artifact selected |
+| Kubernetes Cluster (aws) | Fixed cost | $73.00 | 1.00 | ✅ |
+| API Server (aws) | m5d.xlarge | $266.45 | 0.76 | ❌ NVMe-storage instance for generic API |
+| Postgresql Database (aws) | N/A | $0.00 | 0.00 | ❌ Zero candidates (wrong API filter) |
+| Cache Layer (aws) | N/A | $0.00 | 0.00 | ❌ Zero candidates (wrong API filter) |
+| Virtual Machines (aws) | g5.4xlarge | $1,430.22 | 0.66 | ❌ GPU instance for general-purpose VM |
+| Object Storage (aws) | USW2-TimedStorage-ZIA-ByteHrs | $10.00 | 0.70 | ❌ ZIA = One Zone-IA tier |
+| Load Balancer (aws) | Fixed cost | $22.27 | 1.00 | ✅ |
+| CDN / Edge Delivery (aws) | Fixed cost | $85.00 | 1.00 | ✅ |
+| Geospatial / Tile Storage (aws) | USW2-TimedStorage-ZIA-ByteHrs | $50.00 | 0.70 | ❌ ZIA tier again |
+| [Infra] NAT Gateway | Fixed cost | $32.40 | 1.00 | ✅ |
+| [Infra] Data Transfer | Fixed cost | $9.00 | 1.00 | ✅ |
+| **TOTAL** | | **$3,220.51** | | ❌ Severely understated — realistic ~$15k–$50k/mo |
+
+### 19b. Root Cause Discovery — Pricing Cache Poisoning
+
+**THE fundamental root cause of ALL EC2 sizer bugs (discovered this session):**
+
+The AWS Pricing API (`GetProducts` for `AmazonEC2`, `us-west-2`) returns products in an arbitrary/alphabetical order. Without explicit `operatingSystem`, `tenancy`, and `preInstalledSw` filters at the API call level, the first 100 products fetched are dominated by non-standard billing artifacts:
+
+- **"UnusedBox" rows**: RI placeholder meters (e.g. `USW2-UnusedBox:m7i.xlarge` at $1.70/hr). Stored as `pricing_tier=on_demand` because they appear under the `OnDemand` term section of the API. They have *real* `unit_price > 0` and `operatingSystem=Linux` — so they pass both the `unit_price > 0` filter and the `linux_only` `operatingSystem` check. They are only distinguishable by `"unusedbox"` in the `usagetype` field.
+- **"DedicatedHost" rows**: `$0.00` per-host meters (`USW2-HostBoxUsage:c6g.4xlarge`). Pass the `operatingSystem=Linux` check. Filtered out by `unit_price > 0` at line 1209 of sizer.py.
+- **"Reservation" placeholders**, Windows, RHEL, SQL-licensed rows.
+
+**The `linux_only` fallback bug**: When all non-$0 rows are UnusedBox/SQL-licensed (i.e. ALL are filtered out by the `linux_only` check), `linux_only` is empty → `if linux_only:` is False → `candidates` reverts to the pre-filter set (the garbage rows with prices). The m7i.xlarge UnusedBox row ($1.70/hr, 4 vCPU) fit the vCPU ceiling for the container workload → selected.
+
+**For AmazonRDS and AmazonElastiCache**: The `_DATABASE_ENGINE_MAP` passes engine names ("PostgreSQL", "cache.r6g") as `sku_name`, which was then used as `instanceType` filter value in `GetProducts`. No RDS/ElastiCache instance type is named "PostgreSQL" or "cache.r6g" — so 0 products returned → 0 cost.
+
+**For AmazonS3**: 87 rows cached, all archival tiers (ZIA, GIR, INT-FA, Glacier, IA). No `General Purpose` (Standard) rows. ZIA slipped through `_EXCLUDE_PATTERNS` because the pattern only had `"infrequent"` (not `"-zia-"`) — and `"USW2-TimedStorage-ZIA-ByteHrs"` doesn't contain "infrequent".
+
+### 19c. Priority 13 Bugs — All Fixed (5 May 2026)
+
+| ID | Component | Symptom | Root Cause | Fix Applied | File |
+|----|-----------|---------|-----------|-------------|------|
+| **13a** ✅ | EC2 (Container, API, VMs) | Garbage RI artifacts selected (UnusedBox m7i.xlarge, g5 GPU) | No OS/tenancy/preInstalledSw filters in `GetProducts` → cache poisoned with billing artifacts | Added `operatingSystem=Linux`, `tenancy=Shared`, `preInstalledSw=NA` EC2 API filters in `search_prices()` per-service-code block | `aws_provider.py` |
+| **13b** ✅ | linux_only fallback | Garbage rows selected when all clean rows filtered | `if linux_only: candidates = linux_only` — if `linux_only` empty, candidates stayed as garbage rows | When `linux_only` is empty, log warning and set `candidates = []` (triggers "no candidates" path) | `sizer.py` ~line 1244 |
+| **13c** ✅ | Virtual Machines | g5.4xlarge GPU selected for non-GPU workload | No GPU exclusion filter in VM candidate list | Added `_GPU_PREFIXES` exclusion (g3/g4/g5/g6/g7/p2-p5/trn/dl1) gated on `component.requires_gpu` | `sizer.py` ~line 1256 |
+| **13d** ✅ | Postgresql Database, Cache Layer | $0.00 / 0 candidates | `sku_name` ("PostgreSQL", "cache.r6g") used as `instanceType` filter → 0 matches. For RDS: `databaseEngine` field needed. For ElastiCache: `cacheEngine` field needed. | Per-service-code `extra_filters` in `search_prices()`: RDS → `databaseEngine+deploymentOption`; ElastiCache → `cacheEngine=Redis` | `aws_provider.py` |
+| **13e** ✅ | Object Storage, Geospatial Storage | ZIA (One Zone-IA) tier selected | `"-zia-"` and `"zia-bytehrs"` not in `_EXCLUDE_PATTERNS`; S3 API returned all archival tiers | Added `"-zia-"` and `"zia-bytehrs"` to `_EXCLUDE_PATTERNS`; added `storageClass=General Purpose` S3 API filter | `sizer.py` ~line 511; `aws_provider.py` |
+| **13f** ✅ | RFP document | Duplicate §5 (SKU Selection) and §13 (Vendor) | Hardcoded section numbers not updated when `_build_managed_services_section` (§5) was added | Fixed 8 hardcoded section numbers: §6 SKU, §7 Cost, §8 TCO, §9 SLA, §10 Security, §14 Vendor, §15 Assumptions, §16 WAF | `rfp_writer.py` |
+
+**Test result**: 142/142 tests pass after P13 fixes. Cache deleted (`data/sku_cache.db`) to force fresh fetch with correct API filters.
+
+**Next step**: Run #6 with fresh AWS credentials to verify corrected SKU selection (expect m-family EC2, RDS `db.*` instances, ElastiCache `cache.r6g.*`, and S3 Standard storage).
+

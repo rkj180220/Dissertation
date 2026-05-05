@@ -161,7 +161,7 @@ def _build_sku_selection_section(
     Returns:
         Markdown section string.
     """
-    lines = ["## 5. SKU Selection & Pricing\n"]
+    lines = ["## 6. SKU Selection & Pricing\n"]
 
     # Group by provider
     by_provider: dict[str, list[SizedWorkloadResult]] = {}
@@ -198,7 +198,7 @@ def _build_cost_comparison_section(
     Returns:
         Markdown section string.
     """
-    lines = ["## 6. Cost Comparison & Savings\n"]
+    lines = ["## 7. Cost Comparison & Savings\n"]
 
     lines.append(
         "| Provider | Compute | Database | Storage | K8s | Networking | "
@@ -268,7 +268,7 @@ def _build_compliance_section(
     Returns:
         Markdown section string.
     """
-    lines = ["## 15. WAF Compliance Report (Well-Architected Framework)\n"]
+    lines = ["## 16. WAF Compliance Report (Well-Architected Framework)\n"]
 
     lines.append(
         f"**Overall Score**: {compliance_report.compliance_score_pct:.0f}% "
@@ -314,7 +314,7 @@ def _build_vendor_shortlist_section(
     Returns:
         Markdown section string.
     """
-    lines = ["## 13. Vendor Recommendation & Shortlist\n"]
+    lines = ["## 14. Vendor Recommendation & Shortlist\n"]
 
     # Rank providers
     sorted_providers = sorted(
@@ -1132,7 +1132,7 @@ def _build_sla_section(
     rpo_str = _fmt_minutes(explicit_rpo_min) if explicit_rpo_min is not None else sla["rpo"]
     rto_str = _fmt_minutes(explicit_rto_min) if explicit_rto_min is not None else sla["rto"]
 
-    lines = ["## 8. Service Level Agreements\n"]
+    lines = ["## 9. Service Level Agreements\n"]
     lines.append(
         f"Service level commitments are defined for the **{tier.replace('_', ' ').title()}** "
         f"workload tier and must be contractually agreed with the selected cloud provider.\n"
@@ -1216,7 +1216,7 @@ def _build_security_section(
     Returns:
         Markdown section string.
     """
-    lines = ["## 9. Security Architecture\n"]
+    lines = ["## 10. Security Architecture\n"]
     lines.append(
         "The security architecture follows a defence-in-depth approach aligned "
         "with the NIST Cybersecurity Framework and the cloud provider's "
@@ -1597,7 +1597,7 @@ def _build_tco_section(
     Returns:
         Markdown section string.
     """
-    lines = ["## 7. Multi-Year Total Cost of Ownership\n"]
+    lines = ["## 8. Multi-Year Total Cost of Ownership\n"]
 
     tco_projections = kpis.get("tco_projections", {})
     growth_pct = tco_projections.get("growth_pct_per_year", 15.0)
@@ -1841,7 +1841,7 @@ def _build_assumptions_section(
     Returns:
         Markdown section string.
     """
-    lines = ["## 14. Assumptions & Exclusions\n"]
+    lines = ["## 15. Assumptions & Exclusions\n"]
 
     lines.append("### Assumptions\n")
     lines.append(

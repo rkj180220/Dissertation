@@ -521,6 +521,10 @@ def _filter_storage_candidates(
         # does not include the word "glacier" in the meter name.
         # e.g. "USW2-TimedStorage-GIR-ByteHrs"
         "-gir-", "gir-bytehrs",
+        # S3 One Zone-IA (Zone Infrequent Access) rows slip through the
+        # "infrequent" filter because their SKU uses the acronym "ZIA".
+        # e.g. "USW2-TimedStorage-ZIA-ByteHrs"
+        "-zia-", "zia-bytehrs",
     )
     filtered = [
         c for c in candidates
@@ -1242,6 +1246,41 @@ async def run_sizer_node(
                             ]
                             if linux_only:
                                 candidates = linux_only
+                            else:
+                                # No standard Linux on-demand rows in the candidate
+                                # set — all non-$0 rows are non-Linux or licensed
+                                # billing artifacts (UnusedBox, SQL, Windows, etc.).
+                                # Clear candidates so the "no SKUs found" path fires
+                                # rather than falling through to a garbage selection.
+                                comp_log.warning(
+                                    "no_standard_linux_rows",
+                                    msg=(
+                                        "All candidates are non-Linux/licensed billing "
+                                        "artifacts.  Clearing to avoid garbage SKU selection."
+                                    ),
+                                )
+                                candidates = []
+
+                        # Exclude GPU instances for workloads that do not require a GPU.
+                        # GPU SKUs (g*, p*, trn*, dl*) are order-of-magnitude more expensive
+                        # than general-purpose instances and should never be selected for
+                        # CPU-only workloads.
+                        if provider == CloudProvider.AWS and not component.requires_gpu:
+                            _GPU_PREFIXES = (
+                                "g3.", "g4.", "g5.", "g6.", "g7.",
+                                "p2.", "p3.", "p4.", "p5.",
+                                "trn", "dl1",
+                            )
+                            no_gpu = [
+                                c for c in candidates
+                                if not any(
+                                    c.sku_name.lower().startswith(pfx)
+                                    for pfx in _GPU_PREFIXES
+                                )
+                            ]
+                            if no_gpu:
+                                candidates = no_gpu
+
                         comp_log.info(
                             "candidates_filtered_to_vms",
                             remaining=len(candidates),

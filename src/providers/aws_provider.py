@@ -557,12 +557,54 @@ class AWSPricingProvider(BaseCloudProvider):
             log.warning("search_prices_no_filter", msg="No service_name or known category")
             return []
 
-        filters = self._build_filters(region=region, sku_name=sku_name)
-
         all_items: list[NormalizedPriceItem] = []
         per_svc_limit = max(max_results // len(service_codes), 20)
 
         for svc_code in service_codes:
+            # Build service-code-specific filters so the Pricing API returns
+            # only standard, directly-billable rows for each service.
+            extra: list[dict[str, str]] = []
+            svc_sku_name: str | None = sku_name
+
+            if svc_code == "AmazonEC2":
+                # Exclude Windows, RHEL, dedicated-host, SQL-licensed, and
+                # Unused-Reservation rows at the source.  Without these filters
+                # the first page of GetProducts is dominated by billing artifacts
+                # (UnusedBox, DedicatedHost) that have $0 or wildly inflated
+                # prices and no meaningful instance-type information.
+                extra = [
+                    {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "Linux"},
+                    {"Type": "TERM_MATCH", "Field": "tenancy", "Value": "Shared"},
+                    {"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "NA"},
+                ]
+            elif svc_code == "AmazonRDS":
+                # For RDS, sku_name is a DB engine identifier (e.g. "PostgreSQL"),
+                # not an instance type — route it to the databaseEngine filter.
+                extra = [
+                    {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": "Single-AZ"},
+                ]
+                if sku_name:
+                    extra.append(
+                        {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": sku_name}
+                    )
+                svc_sku_name = None  # prevent sku_name being used as instanceType
+            elif svc_code == "AmazonElastiCache":
+                # Filter to Redis engine rows only; sku_name is an engine/family
+                # hint (e.g. "cache.r6g"), not a full instance type.
+                extra = [
+                    {"Type": "TERM_MATCH", "Field": "cacheEngine", "Value": "Redis"},
+                ]
+                svc_sku_name = None  # don't filter by instanceType for ElastiCache
+            elif svc_code == "AmazonS3":
+                # Restrict to General Purpose (Standard) storage class to avoid
+                # Glacier, Intelligent-Tiering, and archival rows.
+                extra = [
+                    {"Type": "TERM_MATCH", "Field": "storageClass", "Value": "General Purpose"},
+                ]
+
+            filters = self._build_filters(
+                region=region, sku_name=svc_sku_name, extra_filters=extra
+            )
             items = await self._fetch_products(svc_code, filters, per_svc_limit)
             all_items.extend(items)
             if len(all_items) >= max_results:
