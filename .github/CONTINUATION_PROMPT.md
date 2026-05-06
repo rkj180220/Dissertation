@@ -1,6 +1,6 @@
 # Cloud Orchestrator IDSS — Continuation Prompt
 
-> **Last Updated**: 6 May 2026 (Run #6 verified all P13 fixes working — EC2 c5.xlarge/BoxUsage, RDS db.t3.micro/PostgreSQL, ElastiCache t1.micro/Redis, S3 Standard confirmed. P14 discovered (DATABASE cheapest-price ignores resource requirements: db.t3.micro 1 GiB for 12 GB workload; cache.t1.micro deprecated) and fixed via `_filter_database_candidates()`. Run #7 pending — expect db.r6i.large + cache.r4.large, total ~$916/mo.)
+> **Last Updated**: 7 May 2026 (P14 verified. Presidio RFP gap analysis completed. 11 structural gaps identified. P15 planned: serverless architecture evaluation, profiler microservice decomposition, architecture alternatives RFP section, incremental RFP amendment mode, streaming/queue/analytics workloads. See PROJECT_SPEC §21 for full gap table and P15 priority list.)
 
 ---
 
@@ -470,7 +470,7 @@ Full Cal Fire pipeline completed end-to-end with gemini-2.5-pro via Vertex AI.
 
 ## What Needs to Be Fixed/Built Next ❌
 
-> **Run #6 complete. P14 fixed. Run #7 needed to verify correct DB/Cache sizing.**
+> **Run #6 complete. P14 fixed. Run #7 needed to verify correct DB/Cache sizing. P15 is the next major feature phase.**
 
 ### Priority 13 — COMPLETE ✅ (verified in run #6)
 
@@ -490,16 +490,40 @@ Full Cal Fire pipeline completed end-to-end with gemini-2.5-pro via Vertex AI.
 | 14a — DB cheapest-price ignores resource requirements (db.t3.micro 1 GiB for 12 GB workload) | ✅ Fixed | `sizer.py` `_filter_database_candidates()` — added memory/vCPU minimum filter (80% tolerance). Cheapest passing = `db.r6i.large` (16 GiB, $182.50/mo) |
 | 14b — ElastiCache deprecated instance (cache.t1.micro, `currentGeneration=No`, 0.213 GiB) | ✅ Fixed | `sizer.py` `_filter_database_candidates()` — `currentGeneration=No` exclusion. Cheapest passing = `cache.r4.large` ($132.86/mo) |
 
+### Priority 15 — NOT STARTED ❌ (Next Major Phase)
+
+Four structural gaps identified via Presidio RFP comparison (full analysis in PROJECT_SPEC §21):
+
+| ID | Feature | Component(s) | Description |
+|----|---------|-------------|-------------|
+| **P15a** | Architecture alternatives engine | `src/engines/architecture_selector.py` (NEW) | Score serverless vs container vs VM using WAF pillars + cost + scale factors. Takes `WorkloadProfile` → produces ranked recommendation with costs and tradeoff narrative |
+| **P15b** | Serverless pricing path | `src/models/cloud_resource.py` + `src/agents/sizer.py` | Add `SERVERLESS` to `ServiceCategory` enum (16th value); add Lambda $/request/ms + DynamoDB $/RCU-WCU pricing path in sizer |
+| **P15c** | Profiler microservice decomposition | `src/agents/profiler.py` | Decompose `enriched_input` into 5-8 individual microservices (each a CONTAINER workload) so bin-packing can demonstrate multi-workload packing. Currently produces 1 container workload for all of Cal Fire. |
+| **P15d** | Incremental RFP amendment | `src/orchestrator/graph.py` + `src/api/routes/orchestration.py` | New `POST /orchestrate/amend` endpoint. If `enriched_input` already exists in conversation, detect amendment intent and only re-run affected agents (skip Clarifier, run Profiler delta → Sizer → FinOps → RFP Writer with changelog section). |
+| **P15e** | Streaming/queue/analytics workloads | `src/agents/profiler.py` | Detect streaming (Kinesis), message queue (SQS), and analytics (Redshift) workload keywords in `enriched_input` and add them as distinct NETWORKING/COMPUTE components with appropriate pricing |
+| **P15f** | Architecture alternatives RFP section | `src/agents/rfp_writer.py` | Add "Architecture Alternatives Analysis" section: Option A (Serverless: Lambda+DynamoDB), Option B (Containers: EKS+RDS), Option C (Hybrid) with WAF scores, monthly costs, and recommended choice |
+
+**Build order**: P15b → P15a → P15c → P15e → P15f → P15d
+
 ### Next Immediate Task
 
-**Refresh AWS credentials and run the seventh live Cal Fire run:**
-1. Update `.env` with fresh `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` (run `aws sso login` or re-issue from AWS console)
-2. **Do NOT delete `data/sku_cache.db`** — it has good P13-era data that should still work
-3. Restart API server: `uv run uvicorn src.main:app --port 8001`
-4. Run 2-turn Cal Fire clarify session → `/orchestrate` pipeline
-5. Verify sizer output: PostgreSQL DB = `db.r6i.large` (~$182/mo), Cache = appropriate current-gen instance (>9.6 GiB), ElastiCache NOT `cache.t1.micro`
-6. Expected total: ~$916/mo (vs $630 in run #6)
-7. Save RFP to `docs/test-rfp-document-7.md`
+**Run #7 first (to verify P14), then start P15b:**
+
+**Run #7:**
+1. Refresh AWS credentials (`aws sso login` or re-issue from AWS console)
+2. **Do NOT delete `data/sku_cache.db`** — it has good P13-era data
+3. Restart API: `uv run uvicorn src.main:app --port 8001`
+4. Run Cal Fire clarify session → `/orchestrate`
+5. Verify: PostgreSQL = `db.r6i.large` (~$182/mo), Cache = current-gen >9.6 GiB, NOT `cache.t1.micro`
+6. Expected total: ~$916/mo
+7. Save to `docs/test-rfp-7.md`
+
+**Then P15b (serverless model):**
+- Add `SERVERLESS = "serverless"` to `ServiceCategory` in `cloud_resource.py`
+- Add Lambda + DynamoDB pricing path in `sizer.py` (new `_size_serverless_workload()` method)
+- Lambda: price = requests/mo × avg_duration_ms × memory_gb × $0.0000166667/GB-sec
+- DynamoDB: price = (read_units × $0.25/RCU + write_units × $1.25/WCU) per million
+
 
 
 ## Auth / Credentials (already set in `.env`)
@@ -539,7 +563,79 @@ cd dashboard && npm run build
 
 ## Notes for Future Me
 
+- **P15 gap analysis (7 May 2026)**: Presidio RFP comparison revealed 11 structural gaps. The biggest: (1) We never consider serverless — for 50K→2M concurrent users, Lambda+DynamoDB is objectively better (scales to zero, unlimited concurrency, cost ∝ requests). Our system hardcodes containers/K8s because the clarifier LLM says "Kubernetes" in enriched_input and the profiler blindly maps to CONTAINER. Fix: add `architecture_selector.py` engine that scores alternatives BEFORE profiling workloads. (2) Profiler produces 1 container workload for all of Cal Fire's backend — all 6 microservices collapse to one CONTAINER entry. Bin-packing is correct but pointless with 1 workload. Fix: update profiler LLM prompt to explicitly decompose into named microservices. (3) Incremental amendments: every follow-up message triggers full pipeline restart. Fix: detect `amendment_mode` from existing `enriched_input` in state and route to a shortened graph path.
 - **P14 DATABASE cheapest-price ignores resource requirements (6 May 2026)**: `_size_generic_workload()` calls `_select_best_by_price()` which sorts by unit_price ascending and picks first — no memory/vCPU filter. For DATABASE workloads, the profiler correctly sets 12 GB RAM / 3 vCPU, but the sizer ignores this. Result: `db.t3.micro` ($0.018/hr, 1 GiB) always beats `db.r6i.large` ($0.25/hr, 16 GiB). Fix: added `_filter_database_candidates()` called after the hourly filter in the DATABASE section. Two passes: (1) exclude `currentGeneration=No` instances (deprecated hardware); (2) keep only instances where `memory_gib >= required_memory_gb * 0.8`. Falls back gracefully if filtering removes all candidates. Also needed `_parse_memory_gib()` helper to parse "16 GiB" → 16.0. Note: many ElastiCache instances in the cache lack `memory` attribute (stored as `?`) — these pass through via `cand_mem == 0` check (don't filter unknowns). Expected improvement: db.r6i.large $182/mo vs db.t3.micro $13/mo; cache ~$132/mo vs $16/mo.
+- **P13 AWS pricing cache poisoning root cause (5 May 2026)**: AWS `GetProducts` for `AmazonEC2` WITHOUT `operatingSystem`/`tenancy`/`preInstalledSw` filters returns billing artifacts in alphabetical `usagetype` order. The first 100 items in `us-west-2` are ALL non-standard: `USW2-UnusedBox:m7i.xlarge` (unused RI placeholder, `operatingSystem=Linux`, $1.70/hr — PASSES linux_only filter because it IS Linux), DedicatedHost rows ($0 — filtered by `unit_price > 0`), SQL-licensed rows, etc. **The fix**: add `operatingSystem=Linux`, `tenancy=Shared`, `preInstalledSw=NA` as API-level filters in `search_prices()` BEFORE hitting the pricing endpoint. For RDS: never use engine name (e.g. "PostgreSQL") as `instanceType` filter — use `databaseEngine` field instead. For ElastiCache: use `cacheEngine=Redis`. For S3: use `storageClass=General Purpose` to get only Standard tier. **Key lesson**: always add service-specific attribute filters to AWS `GetProducts` — the API intentionally returns ALL product variants without them.
+- **P13 linux_only silent fallback (5 May 2026)**: `if linux_only: candidates = linux_only` evaluates to `False` when `linux_only` is empty (all remaining rows were non-Linux after filter). The old code silently reverted to the pre-filter set (garbage rows including UnusedBox). Fix: `else: candidates = []` + log warning. This was the root cause of m7i.xlarge (UnusedBox RI placeholder at $1.70/hr) being selected for the Container workload across multiple runs.
+- **P13 RFP section numbers (5 May 2026)**: When `_build_managed_services_section()` was added as §5, 8 downstream section headers were never renumbered. The ToC was already correct (1–17) but body section headers had `## 5.`, `## 6.` etc. in the wrong places. Fixed lines: 164 (§5→§6 SKU), 201 (§6→§7 Cost), 271 (§15→§16 WAF), 317 (§13→§14 Vendor), 1135 (§8→§9 SLA), 1219 (§9→§10 Security), 1600 (§7→§8 TCO), 1844 (§14→§15 Assumptions). Rule: after adding/reordering sections, grep for all `## \d+\.` and verify each matches the ToC.
+- **P10 RFP Writer content gaps (4 May 2026)**: 6 gaps closed vs Presidio reference. Key lessons: (1) `ComponentProfile` has `recommended_instance_families: list[str]`, NOT `recommended_family` — always check model fields before using attribute access; (2) government/greenfield detection uses keyword sets on `raw_user_input` — keep `_GOVERNMENT_KEYWORDS` and `_MIGRATION_KEYWORDS` up to date as new scenarios arise; (3) WCAG + StateRAMP sections must be conditional on `compliance_frameworks` — don't add them for every run; (4) the `_MANAGED_SERVICES` dict is the key lookup for 10e — expand it when new service categories are added to `ServiceCategory` enum.
+- **P10 live pipeline crash fix**: `comp.recommended_family` → `comp.recommended_instance_families[0] if comp.recommended_instance_families else comp.resolved_category.value` — always check model field names against `model_fields.keys()` before referencing.
+- **LLM factory fix (5 May 2026)**: `_create_vertexai()` in `factory.py` now passes `vertexai=True` (routes to Vertex AI, not Google AI Studio), `project=project` (explicit — ADC project can be `None` in dev), and `location=location` (prevents wrong endpoint). Also added `GCP_PROJECT_ID` fallback for `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` env var (default `us-central1`).
+- **Gemini 3.1 Pro Preview (5 May 2026)**: `gemini-3.1-pro-preview` is a restricted preview. `.env` `LLM_MODEL=gemini-3.1-pro-preview` returns 404 "Publisher Model not found" for project `dissertation-rj`. To enable: GCP Console → Vertex AI → Model Garden → search "gemini-3.1-pro-preview" → click Enable. The "Provisioned Throughput" modal that appears is NOT required (that's for guaranteed quota, not basic access). Until enabled, use `gemini-2.5-pro`.
+- **AWS STS credentials expired (5 May 2026)**: `AWS_ACCESS_KEY_ID` in `.env` starts with `ASIA` = temporary STS token. These expire. Run `aws sso login` or re-issue from AWS console → update all three vars: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`. Verify with `aws sts get-caller-identity`.
+- **Always use `uv run python` not `python3`**: System `python3` is macOS default Python 3.9 — incompatible with project (requires 3.13+). Always prefix: `/Users/ramkumarjayakumar/.local/bin/uv run python` or simply `uv run python` after `cd` to the project root.
+- **Run #4 (`4d134426`, 5 May 2026)**: Pipeline ran correctly post-P12-fixes but all compute/DB/storage returned $0 — `GetCallerIdentity` returned `ExpiredToken`. Kubernetes ($73), LB ($22.27), NAT ($32.40), Data Transfer ($9) still correct (fixed-cost paths, no AWS API call). RFP saved to `docs/test-rfp-document-4.md`.
+- **Bug 12d confirmed NOT a bug**: `_parse_explicit_values()` correctly sets `budget_monthly_usd = 266666.0` from `"Budget: $266,666/month"` in enriched_input. RFP §17 NFR-05 shows `Budget ceiling: $266,666/mo`. Previous checkpoint's "Not specified" claim was an incorrect inference from truncated run #3 RFP output.
+- **P12 issues from third live Cal Fire run (5 May 2026)**: (1) EC2 SQL Standard meter still selected — P11b filter only excludes SQL Enterprise via `UnusedBox`/`UnusedDed` usagetypes, but SQL Standard rows have `operatingSystem=Linux` and pass the filter; need `meter_name` check. (2) `i3.4xlarge` is storage-optimized — must be excluded from compute/container preferred families. (3) GIR (Glacier Instant Retrieval) SKU not excluded — `GIR` absent from `_EXCLUDE_PATTERNS`. (4) DB/Cache still $0 — SQLite cache likely stale; clear `data/sku_cache.db` before next run. (5) NFR-05 budget not showing — `workload_request.budget_monthly_usd` is None at RFP Writer time.
+- **P11 issues from live Cal Fire run**: DATABASE at $0 (PostgreSQL + Cache Layer), VM picked GPU instance (g5.4xlarge), Storage at $0 (INT-AIA tier selected, quantity not multiplied). These are the next 3 bugs to fix.
+- **P9 Sizer/Profiler bug fixes (4 May 2026)**: All 6 SKU selection bugs fixed. Key lessons: (1) DATABASE candidates need hourly filter like VM candidates — RDS/ElastiCache return storage/IOPS/backup meters that have low unit prices and win cheapest-price selection; (2) CONTAINER bin-packing needs a vCPU cap `max(8, total_needed × 4)` — otherwise cost-efficiency metric favours oversized memory-optimized hosts (x8i at 192 vCPU wins $/vCPU×GB even for a 3-vCPU workload); (3) CDN/CloudFront is usage-based with no flat SKU row — must use fixed-cost estimate not pricing API; (4) Redis is NOT in `AmazonRDS` — it has its own service `AmazonElastiCache`; (5) NETWORKING and STORAGE are managed services — profiler must assign 0 vCPU (billing is per-GB/per-request, not per-vCPU).
+- **LLM provider switch (4 May 2026)**: AWS Bedrock lost (IAM policy explicitly denies `bedrock:InvokeModel`). Switched to **Vertex AI `gemini-2.5-pro`** using existing GCP ADC. Changes: (1) `LLMProvider.VERTEXAI` added to `settings.py`; (2) `_create_vertexai()` added to `factory.py` (reads `VERTEXAI_PROJECT`/`VERTEXAI_LOCATION`); (3) `langchain-google-vertexai` installed via `uv add`; (4) Vertex AI API enabled: `gcloud services enable aiplatform.googleapis.com --project=dissertation-rj`; (5) `.env` updated: `LLM_PROVIDER=vertexai`, `LLM_MODEL=gemini-2.5-pro`, `VERTEXAI_PROJECT=dissertation-rj`, `VERTEXAI_LOCATION=us-central1`. AWS creds in `.env` are stale — only needed for Pricing API (not LLM).
+- **P7+P8 fixes complete (2 May 2026)**: All 7 Cal Fire defects resolved + 2 new defects found and fixed by E2E test. 142/142 tests pass. Key lessons: (1) enriched input `Scale:` line needs dedicated parser for "50k normal, 2M peak" patterns; (2) `provider_regions["aws"]` must be updated alongside `preferred_region` — Sizer reads the dict not the field; (3) GPU hallucination stripping in `_guard_ai_ml` needs to handle both "GPU without AI keywords" AND "AI keywords without GPU" cases; (4) RFP section numbers must be kept in sync with the ToC when adding/reordering sections; (5) **CRITICAL**: keyword substring matching for short tokens like "ai"/"ml" will false-positive on "availability"/"reliability" — always use whole-word regex `r'\bai\b'`; (6) K8s without explicit count should infer CONTAINER app workloads when "microservices"/"containeris*" present in text.
+- **Cal Fire E2E validation script**: `scripts/test_cal_fire_e2e.py` — runs clarifier node with mocked LLM against the realistic Cal Fire enriched input (10 checks: 8 acceptance criteria + 2 bonus). Run any time after clarifier changes.
+- **Next priority**: Run a full live E2E (with AWS Bedrock) against the Cal Fire scenario to validate pipeline output quality — LLM profiler/sizer/finops enrichment, SKU selection from AWS pricing API, and complete RFP generation. Check RFP against Presidio reference doc.
+- **NormalizedPriceItem in tests**: Always provide `retail_price` (float), `unit_of_measure` (str, e.g. `"1 Hour"`), and `effective_date` (datetime with tzinfo) — all are required fields with no defaults.
+- **BinPackingResult field names**: `total_nodes` (not `node_count`), `nodes` (not `packed_nodes`), `packing_efficiency_pct` (not `avg_cpu_utilization_pct`).
+- **WorkloadRequest.target_providers**: The providers field is called `target_providers`, not `providers`.
+- **WorkloadRequirement.notes**: `str` type with default `""`, NOT `str | None` — pass `""` not `None`.
+- **run_*_node() returns a patch**: Agents return only NEW state (patch dict for LangGraph reducer). In direct calls (integration tests), `result["messages"]` = only the new messages added (not full list). Assert `>= 1` not `> initial_count`.
+- `.venv/` already created with Python 3.13.0 and all deps synced
+- `get_settings.cache_clear()` resets the singleton in tests
+- LangFuse gracefully degrades when keys missing (warns, doesn't crash)
+- LangFuse SDK v3: `from langfuse import observe` (NOT `langfuse.decorators`)
+- LangFuse self-hosted: `docker-compose.langfuse.yml` runs 6 containers (postgres, clickhouse, redis, minio, worker, web). ENCRYPTION_KEY must be real 64-char hex (not zeros). Pre-configured org/project via `LANGFUSE_INIT_*` env vars.
+- **LangFuse env var**: `.env` now has `LANGFUSE_HOST` (was `LANGFUSE_BASE_URL` — fixed in P0). The env var name must match prefix + field name.
+- **LangFuse flush**: `_flush_langfuse()` in `orchestration.py` calls `Langfuse().flush()` in `finally` blocks. SDK batches async, so flush is mandatory.
+- **LangFuse @observe nesting**: `@observe()` lives ONLY on graph node wrappers (in `graph.py`) and agent internal sub-functions. NOT on `run_*_node()` entry points (removed in P0 to avoid double nesting).
+- **LangFuse auth_check**: `client.auth_check()` throws `ValidationError` on self-hosted (missing `organization` field) — this is benign; tracing still works.
+- Azure reserved prices: `retailPrice` = total upfront cost, NOT per-hour (even though `unitOfMeasure='1 Hour'`) — `monthly_cost_estimate` handles this by checking tier first
+- WAF compliance engine public API is `evaluate_compliance()` (NOT `run_compliance_checks`)
+- All 3 new agents (Sizer, FinOps, RFP Writer) use LLM summary with heuristic fallback — if LLM call fails, they produce a rule-based summary instead
+- `PricingService.close()` must be called on shutdown (handled by lifespan)
+- **First pipeline run lesson**: Garbage-in-garbage-out — if Profiler mis-categorizes (K8s→AI_ML), Sizer queries wrong service (SageMaker), FinOps sums wrong prices. Fix must cascade from Clarifier → Profiler → Sizer.
+- **Reference RFPs**: See `docs/Mass Technology Collaborative Template FINAL (2) (1).html` and `docs/Presidio_Response_Cal Fire_Draft 10.7.25 (2) (1).html` for target quality/depth
+- `build_graph()` returns a compiled `StateGraph` — call `.ainvoke(state)` to run
+- SSE streaming endpoint at `POST /api/v1/orchestrate/stream` — uses `sse-starlette`
+- CORS is wide open (`allow_origins=["*"]`) — tighten for production
+- No test scripts exist yet for Sizer, FinOps, or RFP Writer agents
+- **Sizer container fix**: Container workloads now query VM SKUs (EC2/VMs/Compute Engine) for node pools instead of K8s service SKUs. K8s management fee is a separate fixed-cost line item ($73/mo EKS/GKE, $0 AKS).
+- **Sizer DB engine propagation**: `_DATABASE_ENGINE_MAP` maps `(provider, engine)` → `(service_name, sku_name_filter)`. Supports postgresql, mysql, mariadb, aurora-postgresql, aurora-mysql, sqlserver across all 3 providers.
+- **Sizer fixed-cost workloads**: `_is_fixed_cost_workload()` detects `notes="cluster_management_fee"` and `name="Load Balancer"` → produces fixed-cost results without SKU query.
+- **Sizer ancillary costs**: `_build_ancillary_results()` adds NAT gateway ($32-33/mo, only with containers) and data transfer ($9-12/mo, always) per provider.
+- **FinOps RI/Spot fallback rates** (P1d): When live pricing returns no reserved/spot data (common), `_RI_DISCOUNT_RATES` (AWS 30/45%, Azure 35/50%, GCP 25/40%) and `_SPOT_DISCOUNT_RATES` (AWS 70%, Azure 80%, GCP 60%) are applied as estimates. `source: "estimate"` flag marks these entries. Fixed-cost items ([Infra], K8s fee, LB) pass through at on-demand cost for all tiers.
+- **FinOps spot eligibility** (P1d): `_SPOT_INELIGIBLE` = {DATABASE, STORAGE, NETWORKING, MANAGEMENT, SECURITY}. Only stateless workload categories can use spot pricing.
+- **FinOps TCO** (P1d): `_compute_tco(monthly, years, growth_pct)` uses compound growth. Default growth=15%/yr. TCO stored in `state["kpis"]["tco_projections"]` with 1yr, 3yr, 5yr values. Budget comparison: if `workload_request.budget_monthly_usd` is set, compare against 3yr TCO.
+- **Next P1e task**: RFP Writer enterprise-grade output. Reference docs at `docs/Mass Technology Collaborative Template FINAL.html` and `docs/Presidio_Response_Cal Fire_Draft 10.7.25.html`. Target: 15,000-30,000 characters.
+
+- AWS adapter: boto3 sync calls wrapped in `asyncio.to_thread()`, region filtering uses human-readable location names
+- GCP adapter: gRPC sync calls wrapped in `asyncio.to_thread()`, price = `units + nanos/1e9`
+- Bedrock model ID requires `us.` prefix (cross-region inference profile) — bare `anthropic.*` returns `ValidationException`
+- PricingService is the single entry point for agents — never call adapters directly
+- Cache DB at `data/sku_cache.db` (auto-created)
+- `compare_across_providers()` designed for FinOps agent's cross-provider workflow
+- Engines (`bin_packing.py`, `scoring.py`, `waf_compliance.py`) ✅ migrated to `NormalizedPriceItem`/`WorkloadRequirement` — 60/60 checks passed
+- Engines use shared helpers from `src/engines/__init__.py` to extract compute specs from `NormalizedPriceItem.attributes` dict (keys: `vcpus`/`memory_gb`/`gpu_count`/`generation` standardised, `vcpu`/`memory`/`gpu`/`currentGeneration` AWS fallback)
+- **GCP pricing is per-component** (per-vCPU, per-GB-RAM) — NOT per-instance like AWS/Azure. `vm_specs.compose_gcp_vm_instances()` synthesizes standard machine types with calculated hourly prices.
+- **Azure API doesn't return vCPU/memory** — `vm_specs.parse_azure_vm_specs()` parses specs from ARM SKU names using regex + family→memory ratio table.
+- SKU cache at `data/sku_cache.db` auto-recreates on startup. Delete it to force fresh data.
+- Profiler category resolution uses priority ordering (AI_ML first, COMPUTE last) to prevent generic `vcpus` check from shadowing specific signals like `database_engine` or `gpu_count`
+- Profiler degrades gracefully when LLM is unavailable — falls back to `_heuristic_rationale()` and heuristic summary notes
+- `src/main.py` is broken (wrong import) — fix after API routes are ready
+- Dashboard uses Tailwind v3 (NOT v4) — pinned for shadcn/ui compatibility
+- Dashboard `@/` path alias: configured in both `tsconfig.app.json` (paths) and `vite.config.ts` (resolve alias)
+- Dashboard SSE uses `@microsoft/fetch-event-source` because native `EventSource` only supports GET, backend streams on POST
+- Dashboard `.env.example` has `VITE_API_BASE_URL=http://localhost:8000/api/v1`
+- `tsconfig.app.json` has `ignoreDeprecations: "6.0"` for TS 7.0 baseUrl deprecation warning
+
 - **P13 AWS pricing cache poisoning root cause (5 May 2026)**: AWS `GetProducts` for `AmazonEC2` WITHOUT `operatingSystem`/`tenancy`/`preInstalledSw` filters returns billing artifacts in alphabetical `usagetype` order. The first 100 items in `us-west-2` are ALL non-standard: `USW2-UnusedBox:m7i.xlarge` (unused RI placeholder, `operatingSystem=Linux`, $1.70/hr — PASSES linux_only filter because it IS Linux), DedicatedHost rows ($0 — filtered by `unit_price > 0`), SQL-licensed rows, etc. **The fix**: add `operatingSystem=Linux`, `tenancy=Shared`, `preInstalledSw=NA` as API-level filters in `search_prices()` BEFORE hitting the pricing endpoint. For RDS: never use engine name (e.g. "PostgreSQL") as `instanceType` filter — use `databaseEngine` field instead. For ElastiCache: use `cacheEngine=Redis`. For S3: use `storageClass=General Purpose` to get only Standard tier. **Key lesson**: always add service-specific attribute filters to AWS `GetProducts` — the API intentionally returns ALL product variants without them.
 - **P13 linux_only silent fallback (5 May 2026)**: `if linux_only: candidates = linux_only` evaluates to `False` when `linux_only` is empty (all remaining rows were non-Linux after filter). The old code silently reverted to the pre-filter set (garbage rows including UnusedBox). Fix: `else: candidates = []` + log warning. This was the root cause of m7i.xlarge (UnusedBox RI placeholder at $1.70/hr) being selected for the Container workload across multiple runs.
 - **P13 RFP section numbers (5 May 2026)**: When `_build_managed_services_section()` was added as §5, 8 downstream section headers were never renumbered. The ToC was already correct (1–17) but body section headers had `## 5.`, `## 6.` etc. in the wrong places. Fixed lines: 164 (§5→§6 SKU), 201 (§6→§7 Cost), 271 (§15→§16 WAF), 317 (§13→§14 Vendor), 1135 (§8→§9 SLA), 1219 (§9→§10 Security), 1600 (§7→§8 TCO), 1844 (§14→§15 Assumptions). Rule: after adding/reordering sections, grep for all `## \d+\.` and verify each matches the ToC.

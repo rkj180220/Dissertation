@@ -3,7 +3,7 @@
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
 > **Additional Examiner**: Santhosh Kirubakaran
-> **Last Updated**: 6 May 2026 (Run #6 verified all P13 fixes working. P14 discovered and fixed: DATABASE cheapest-price selection was ignoring resource requirements — db.t3.micro (1 GiB) selected for 12 GB PostgreSQL workload, cache.t1.micro (0.213 GiB, deprecated) selected for 12 GB Cache. Fixed via `_filter_database_candidates()` — adds currentGeneration=No exclusion and memory/vCPU minimum filter. Run #7 pending.)
+> **Last Updated**: 7 May 2026 (P14 verified. Deeper gap analysis done: bin-packing works but profiler only generates 1 container workload (should be 5-8 microservices). Serverless (Lambda/DynamoDB) never considered — no architecture alternatives evaluation engine. Presidio RFP gap analysis completed — 11 structural gaps identified. Incremental RFP amendment feature required. P15 planned — see §21.)
 > **LLM**: Gemini 2.5 Pro (`gemini-2.5-pro`) via Google Cloud Vertex AI (`dissertation-rj`, `us-central1`) using ADC
 
 ---
@@ -801,4 +801,120 @@ The AWS Pricing API (`GetProducts` for `AmazonEC2`, `us-west-2`) returns product
 **Expected run #7 total**: ~$916/mo (vs $630 in run #6) — more realistic for mission-critical sizing.
 
 **Next step**: Run #7 with fresh AWS credentials to verify P14 fixes — expect `db.r6i.large` for PostgreSQL and appropriate current-gen ElastiCache instance for Cache Layer.
+
+---
+
+## §21. Gap Analysis & P15 Planning (7 May 2026)
+
+### 21a. Bin-Packing Algorithm Assessment
+
+**Status: Algorithm is correct. The problem is the profiler only produces 1 container workload.**
+
+The FFD/BFD bin-packing engine (`src/engines/bin_packing.py`) is correctly implemented and called from `_size_container_workload()` in the sizer. However, in every Cal Fire test run, the profiler produces only **1 CONTAINER workload** (the main web application), so bin-packing packs "1 workload onto 1 node" — the algorithm runs but demonstrates zero multi-workload packing value.
+
+**Root cause**: `profiler.py`'s `_extract_workload_components()` maps the entire backend to a single component instead of decomposing the enriched_input into individual microservices.
+
+**Expected microservice decomposition for Cal Fire**:
+
+| Microservice | Category | Notes |
+|-------------|----------|-------|
+| Public API / Incident API | CONTAINER | GraphQL/REST for mobile app |
+| Geospatial Service | CONTAINER | ArcGIS layer serving |
+| Notification Service | CONTAINER | Push via SNS/APNs/FCM |
+| Data Ingestion Worker | CONTAINER | Kinesis consumer → DB writer |
+| Admin Portal API | CONTAINER | Staff-facing admin backend |
+| Media Moderation Service | CONTAINER | Async S3 → review workflow |
+
+With 6 container workloads, bin-packing would demonstrably pack them across fewer nodes with optimized CPU/memory utilization — this is the architectural value of the algorithm.
+
+**Fix required (P15c)**: Profiler must decompose `enriched_input` into individual microservices (5-8 CONTAINER workloads). The LLM prompt should explicitly ask for component-level breakdown.
+
+---
+
+### 21b. Serverless Architecture Gap
+
+**Status: Serverless NEVER considered. Architecture decision is hardcoded by LLM in clarifier enriched_input.**
+
+**How the architecture is currently chosen**:
+1. Clarifier LLM writes `enriched_input` describing "Kubernetes cluster" in the narrative
+2. Profiler maps all workloads to CONTAINER/COMPUTE categories
+3. Sizer prices EKS nodes — never evaluates Lambda, Fargate, or DynamoDB
+4. No comparison or scoring of architectural alternatives happens anywhere
+
+**What should happen (Presidio approach)**:
+
+For a workload with 50K→2M concurrent users (40× spike), a proper architecture selection engine would:
+- Score **Serverless** (Lambda + DynamoDB + AppSync): scales to zero, unlimited concurrency, cost ∝ requests — best for extreme spiky loads
+- Score **Container** (EKS + RDS): best for steady-state compute, predictable latency, complex business logic
+- Score **Hybrid** (serverless API + container workers + managed DB): best of both
+
+The score should use: WAF Reliability pillar × WAF Cost Optimization × scale multiplier × compliance fit
+
+**Fix required (P15a + P15b)**:
+- Add `SERVERLESS` to `ServiceCategory` enum (currently 15 values)
+- Add serverless pricing path to sizer (Lambda $/request/ms + DynamoDB $/RCU-WCU)
+- Add architecture alternatives evaluation engine (`src/engines/architecture_selector.py`):
+  - Takes `WorkloadProfile` → scores 3 options (serverless / container / VM)
+  - Produces ranked recommendation with WAF score + monthly cost + tradeoff narrative
+- RFP Writer: add §2 "Architecture Alternatives Analysis" with Option A/B/C table
+- Clarifier enriched_input must be architecture-neutral — the sizer/engine should select
+
+---
+
+### 21c. Presidio RFP vs Our RFP — Gap Table
+
+Reference: `docs/Presidio_Response_Cal Fire_Draft 10.7.25 (2) (1).html` (parsed 7 May 2026)
+
+| # | Section | Presidio Has | Our RFP Has | Gap Level |
+|---|---------|-------------|-------------|-----------|
+| 1 | **Architecture decision** | Explicit serverless-first (Lambda+DynamoDB) with rationale tied to 2M concurrent user requirement | Containers/EKS assumed from clarifier text; no evaluation | 🔴 Critical |
+| 2 | **Architecture alternatives** | Evaluated serverless vs containers; explains WHY serverless was chosen | No multi-option comparison | 🔴 Critical |
+| 3 | **Segregated data paths** | Public path: AppSync→Lambda→DynamoDB; Admin path: APIGW→Lambda→Aurora (separate, explicitly designed) | Single monolithic architecture diagram | 🔴 Critical |
+| 4 | **Streaming workload** | Amazon Kinesis Data Streams + Firehose as explicit, costed components | No streaming workload identified/priced | 🟠 High |
+| 5 | **Analytics workload** | Amazon Redshift for usage analytics and KPI reporting | Not identified in workload profile | 🟠 High |
+| 6 | **Message queue** | Amazon SQS for media upload decoupling (async ingestion) | Not in workload profile | 🟠 High |
+| 7 | **WAF as architecture driver** | Every architectural decision anchored to a WAF pillar ("serverless for reliability pillar") | WAF assessment is post-hoc compliance check; not used to SELECT architecture | 🟠 High |
+| 8 | **Per-requirement mapping** | Every RFO requirement (A.1, B.2, K.1...) mapped to compliant/non-compliant with implementation note | Generic compliance narrative sections | 🟡 Medium |
+| 9 | **Seasonal cost strategy** | Q4 wildfire season reserved Lambda concurrency; DynamoDB reserved capacity; Redshift Spectrum offload | Generic RI/spot optimization horizons | 🟡 Medium |
+| 10 | **Multi-region active-active** | PostgreSQL in active-active multi-region (not passive); DynamoDB Global Tables | Active-passive stated | 🟡 Medium |
+| 11 | **Microservice decomposition** | 6+ named microservices: notification, geospatial, data ingestion, admin portal, media moderation, analytics | 1 container workload; all services collapsed into one | 🔴 Critical |
+
+---
+
+### 21d. Incremental RFP Amendment Feature
+
+**Status: Not implemented. Every follow-up message triggers a full 5-agent pipeline restart.**
+
+**Current flow**: `POST /orchestrate` → Clarifier → Profiler → Sizer → FinOps → RFP Writer (always from scratch)
+
+**Problem**: User says "add SSO integration" or "what if we need 3M concurrent users" after RFP is generated → system starts over, losing all prior context. The clarifier re-asks basic questions.
+
+**Desired flow**:
+- If `conversation_history` already contains a generated RFP + `enriched_input`, detect "amendment intent"
+- Route to **amendment mode**: skip Clarifier, update `WorkloadProfile` delta, re-run Sizer → FinOps → RFP Writer with the new/modified workloads only
+- Produce an **amended RFP** with a changelog section noting what changed
+
+**Design**:
+1. Add `amendment_mode: bool` + `amendment_instructions: str` fields to `OrchestrateRequest`
+2. In orchestrator graph: add conditional edge after Clarifier — if `enriched_input` exists and `amendment_mode=True`, skip to Profiler with delta instructions
+3. Add `POST /orchestrate/amend` endpoint (or `?mode=amend` query param)
+4. Profiler amendment path: merge new workloads into existing `WorkloadProfile` instead of building from scratch
+5. RFP Writer amendment path: append "§N. Amendment — [Date]" section with changelog
+
+**Fix required (P15d)**: Design + implement amendment mode in orchestrator and API.
+
+---
+
+### 21e. P15 Bug/Feature Priority Table
+
+| ID | Component | Description | Priority | Status |
+|----|-----------|-------------|----------|--------|
+| **P15a** | `src/engines/` | New `architecture_selector.py`: score serverless vs container vs VM using WAF + cost + scale factors | 🔴 Critical | ❌ Not started |
+| **P15b** | `src/models/cloud_resource.py` + `sizer.py` | Add `SERVERLESS` to `ServiceCategory`; add Lambda/DynamoDB pricing path to sizer | 🔴 Critical | ❌ Not started |
+| **P15c** | `src/agents/profiler.py` | Decompose enriched_input into 5-8 individual microservices (CONTAINER workloads) so bin-packing works with multiple inputs | 🔴 Critical | ❌ Not started |
+| **P15d** | `src/orchestrator/graph.py` + `src/api/routes/orchestration.py` | Incremental RFP amendment mode: detect existing `enriched_input`, skip Clarifier, run delta updates | 🟠 High | ❌ Not started |
+| **P15e** | `src/agents/profiler.py` | Add streaming (Kinesis), message queue (SQS), analytics (Redshift) workload detection from enriched_input keywords | 🟠 High | ❌ Not started |
+| **P15f** | `src/agents/rfp_writer.py` | Add "Architecture Alternatives Analysis" section (Option A: Serverless, Option B: Containers, Option C: Hybrid) with WAF scores + costs | 🔴 Critical | ❌ Not started |
+
+**Build order for P15**: P15b → P15a → P15c → P15e → P15f → P15d
 
