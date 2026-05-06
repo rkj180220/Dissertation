@@ -491,6 +491,80 @@ def _is_cdn_workload(workload: WorkloadRequirement) -> bool:
     )
 
 
+def _parse_memory_gib(memory_str: str | None) -> float:
+    """Parse a cloud provider memory string like '8 GiB' or '16 GB' to float.
+
+    Args:
+        memory_str: Raw memory string from pricing attributes, e.g. "8 GiB".
+
+    Returns:
+        Memory in GiB as a float, or 0.0 if unparseable.
+    """
+    if not memory_str:
+        return 0.0
+    try:
+        return float(str(memory_str).strip().split()[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def _filter_database_candidates(
+    candidates: list[NormalizedPriceItem],
+    required_memory_gb: float,
+    required_vcpus: int,
+) -> list[NormalizedPriceItem]:
+    """Filter database/cache SKU candidates to exclude deprecated and undersized instances.
+
+    Applies two passes:
+    1. Excludes legacy (``currentGeneration: No``) instances — these are
+       deprecated hardware that AWS continues to price but should not be
+       selected for new workloads.
+    2. Filters to instances that meet the minimum memory and vCPU requirements
+       of the workload (allowing up to 20% undersizing as tolerance).
+
+    Falls back gracefully at each step — if a filter removes all candidates,
+    the previous set is returned so we never return an empty list.
+
+    Args:
+        candidates: Raw candidates (already filtered to instance-hour rows).
+        required_memory_gb: Minimum RAM in GiB required by the workload.
+        required_vcpus: Minimum vCPU count required by the workload.
+
+    Returns:
+        Filtered candidate list with deprecated and undersized SKUs removed.
+    """
+    # Pass 1: exclude deprecated (non-current-generation) instances
+    current_gen = [
+        c for c in candidates
+        if c.attributes.get("currentGeneration", "Yes") != "No"
+    ]
+    working = current_gen if current_gen else candidates
+
+    # Pass 2: filter to instances meeting minimum resource requirements
+    if required_memory_gb > 0 or required_vcpus > 0:
+        resource_ok: list[NormalizedPriceItem] = []
+        for c in working:
+            cand_mem = _parse_memory_gib(c.attributes.get("memory"))
+            try:
+                cand_vcpu = int(str(c.attributes.get("vcpu", "0")).split()[0])
+            except (ValueError, AttributeError):
+                cand_vcpu = 0
+
+            # 0 means the attribute is absent — don't filter those out
+            mem_ok = cand_mem == 0 or cand_mem >= required_memory_gb * 0.8
+            vcpu_ok = cand_vcpu == 0 or cand_vcpu >= max(1, int(required_vcpus * 0.5))
+
+            if mem_ok and vcpu_ok:
+                resource_ok.append(c)
+
+        if resource_ok:
+            return resource_ok
+        # fallback: requirements couldn't be met — return current-gen set
+        return working
+
+    return working
+
+
 def _filter_storage_candidates(
     candidates: list[NormalizedPriceItem],
     provider: CloudProvider,
@@ -1301,6 +1375,23 @@ async def run_sizer_node(
                             "database_candidates_filtered_to_hourly",
                             remaining=len(hourly),
                         )
+
+                    # ── Filter DATABASE to current-gen, resource-adequate SKUs ──
+                    # The cheapest hourly row (e.g. db.t3.micro at $0.018/hr)
+                    # may be massively undersized for the workload requirement.
+                    # This filter removes deprecated instances (currentGeneration=No)
+                    # and instances that cannot meet the memory/vCPU requirements.
+                    candidates = _filter_database_candidates(
+                        candidates,
+                        required_memory_gb=component.estimated_memory_gb,
+                        required_vcpus=component.estimated_vcpus,
+                    )
+                    comp_log.info(
+                        "database_candidates_filtered_to_resource_fit",
+                        required_memory_gb=component.estimated_memory_gb,
+                        required_vcpus=component.estimated_vcpus,
+                        remaining=len(candidates),
+                    )
 
                 # ── Filter STORAGE to standard-tier rows only ──
                 # S3 / Blob / GCS return archival, Glacier early-delete,

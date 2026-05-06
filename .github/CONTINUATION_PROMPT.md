@@ -1,6 +1,6 @@
 # Cloud Orchestrator IDSS — Continuation Prompt
 
-> **Last Updated**: 5 May 2026 (P13 fixes applied — AWS pricing cache poisoning root cause discovered and fixed. Per-service API filters added to `aws_provider.py` (EC2/RDS/ElastiCache/S3). `linux_only` fallback safety net, GPU exclusion, and ZIA pattern added to `sizer.py`. 8 RFP section numbers fixed in `rfp_writer.py`. Stale cache deleted. **Run #5 completed successfully** (254s, 44,057-char RFP, 100% WAF). 142/142 tests pass. **Next: refresh AWS credentials and run #6 to verify correct SKU selection.**)
+> **Last Updated**: 6 May 2026 (Run #6 verified all P13 fixes working — EC2 c5.xlarge/BoxUsage, RDS db.t3.micro/PostgreSQL, ElastiCache t1.micro/Redis, S3 Standard confirmed. P14 discovered (DATABASE cheapest-price ignores resource requirements: db.t3.micro 1 GiB for 12 GB workload; cache.t1.micro deprecated) and fixed via `_filter_database_candidates()`. Run #7 pending — expect db.r6i.large + cache.r4.large, total ~$916/mo.)
 
 ---
 
@@ -470,29 +470,36 @@ Full Cal Fire pipeline completed end-to-end with gemini-2.5-pro via Vertex AI.
 
 ## What Needs to Be Fixed/Built Next ❌
 
-> **All Priority 13 code fixes are done.** Live run #6 is the next step — needs fresh AWS credentials.
+> **Run #6 complete. P14 fixed. Run #7 needed to verify correct DB/Cache sizing.**
 
-### Priority 13 — COMPLETE (code fixes done, live run pending)
+### Priority 13 — COMPLETE ✅ (verified in run #6)
 
 | Bug | Status | Fix location |
 |-----|--------|-----|
-| 13a — RDS/ElastiCache $0 (`instanceType` filter mismatch) | ✅ Fixed | `aws_provider.py` `search_prices()` — RDS uses `databaseEngine` filter; ElastiCache uses `cacheEngine=Redis` filter |
-| 13b — EC2 `linux_only` silent fallback to garbage rows | ✅ Fixed | `sizer.py` ~line 1256 — `else: candidates = []` when `linux_only` empty |
-| 13c — GPU instance (g5.4xlarge) selected for non-GPU VM | ✅ Fixed | `sizer.py` `_GPU_PREFIXES` block excludes `g3–g7`, `p2–p5`, `trn`, `dl1` for `not requires_gpu` |
-| 13d — S3 ZIA tier not excluded | ✅ Fixed | `sizer.py` `_EXCLUDE_PATTERNS`: `"-zia-"`, `"zia-bytehrs"` added; `aws_provider.py` `storageClass=General Purpose` API filter |
-| 13e — S3 API filter missing (cache poisoned with archival tiers) | ✅ Fixed | `aws_provider.py`: EC2 gets `operatingSystem=Linux` + `tenancy=Shared` + `preInstalledSw=NA` filters; S3 gets `storageClass=General Purpose` |
-| 13f — RFP 8 duplicate/wrong section numbers | ✅ Fixed | `rfp_writer.py` lines 164, 201, 271, 317, 1135, 1219, 1600, 1844 |
+| 13a — RDS/ElastiCache $0 (`instanceType` filter mismatch) | ✅ Verified run #6 | `aws_provider.py` `search_prices()` — RDS uses `databaseEngine` filter; ElastiCache uses `cacheEngine=Redis` filter |
+| 13b — EC2 `linux_only` silent fallback to garbage rows | ✅ Verified run #6 | `sizer.py` ~line 1256 — `else: candidates = []` when `linux_only` empty |
+| 13c — GPU instance (g5.4xlarge) selected for non-GPU VM | ✅ Verified run #6 | `sizer.py` `_GPU_PREFIXES` block excludes `g3–g7`, `p2–p5`, `trn`, `dl1` for `not requires_gpu` |
+| 13d — S3 ZIA tier not excluded | ✅ Verified run #6 | `sizer.py` `_EXCLUDE_PATTERNS`: `"-zia-"`, `"zia-bytehrs"` added; `aws_provider.py` `storageClass=General Purpose` API filter |
+| 13e — S3 API filter missing (cache poisoned with archival tiers) | ✅ Verified run #6 | `aws_provider.py`: EC2 gets `operatingSystem=Linux` + `tenancy=Shared` + `preInstalledSw=NA` filters; S3 gets `storageClass=General Purpose` |
+| 13f — RFP 8 duplicate/wrong section numbers | ✅ Verified run #6 | `rfp_writer.py` lines 164, 201, 271, 317, 1135, 1219, 1600, 1844 |
+
+### Priority 14 — COMPLETE ✅ (code done, live run pending)
+
+| Bug | Status | Fix location |
+|-----|--------|-----|
+| 14a — DB cheapest-price ignores resource requirements (db.t3.micro 1 GiB for 12 GB workload) | ✅ Fixed | `sizer.py` `_filter_database_candidates()` — added memory/vCPU minimum filter (80% tolerance). Cheapest passing = `db.r6i.large` (16 GiB, $182.50/mo) |
+| 14b — ElastiCache deprecated instance (cache.t1.micro, `currentGeneration=No`, 0.213 GiB) | ✅ Fixed | `sizer.py` `_filter_database_candidates()` — `currentGeneration=No` exclusion. Cheapest passing = `cache.r4.large` ($132.86/mo) |
 
 ### Next Immediate Task
 
-**Refresh AWS credentials and run the sixth live Cal Fire run:**
+**Refresh AWS credentials and run the seventh live Cal Fire run:**
 1. Update `.env` with fresh `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` (run `aws sso login` or re-issue from AWS console)
-2. Delete `data/sku_cache.db` if it somehow got recreated with old data
+2. **Do NOT delete `data/sku_cache.db`** — it has good P13-era data that should still work
 3. Restart API server: `uv run uvicorn src.main:app --port 8001`
 4. Run 2-turn Cal Fire clarify session → `/orchestrate` pipeline
-5. Verify sizer output: Container=m5/m6i family (~$70–150/mo), DB=RDS `db.m5.large` (~$120–200/mo), Cache=ElastiCache `cache.r6g.large` (~$100–150/mo), VMs=m5/m6i (~$280–350/mo), Storage=S3 Standard (NOT ZIA/GIR)
-6. Total should be ~$15,000–50,000/mo (not $3,220)
-7. Save RFP to `docs/test-rfp-document-6.md`
+5. Verify sizer output: PostgreSQL DB = `db.r6i.large` (~$182/mo), Cache = appropriate current-gen instance (>9.6 GiB), ElastiCache NOT `cache.t1.micro`
+6. Expected total: ~$916/mo (vs $630 in run #6)
+7. Save RFP to `docs/test-rfp-document-7.md`
 
 
 ## Auth / Credentials (already set in `.env`)
@@ -532,6 +539,7 @@ cd dashboard && npm run build
 
 ## Notes for Future Me
 
+- **P14 DATABASE cheapest-price ignores resource requirements (6 May 2026)**: `_size_generic_workload()` calls `_select_best_by_price()` which sorts by unit_price ascending and picks first — no memory/vCPU filter. For DATABASE workloads, the profiler correctly sets 12 GB RAM / 3 vCPU, but the sizer ignores this. Result: `db.t3.micro` ($0.018/hr, 1 GiB) always beats `db.r6i.large` ($0.25/hr, 16 GiB). Fix: added `_filter_database_candidates()` called after the hourly filter in the DATABASE section. Two passes: (1) exclude `currentGeneration=No` instances (deprecated hardware); (2) keep only instances where `memory_gib >= required_memory_gb * 0.8`. Falls back gracefully if filtering removes all candidates. Also needed `_parse_memory_gib()` helper to parse "16 GiB" → 16.0. Note: many ElastiCache instances in the cache lack `memory` attribute (stored as `?`) — these pass through via `cand_mem == 0` check (don't filter unknowns). Expected improvement: db.r6i.large $182/mo vs db.t3.micro $13/mo; cache ~$132/mo vs $16/mo.
 - **P13 AWS pricing cache poisoning root cause (5 May 2026)**: AWS `GetProducts` for `AmazonEC2` WITHOUT `operatingSystem`/`tenancy`/`preInstalledSw` filters returns billing artifacts in alphabetical `usagetype` order. The first 100 items in `us-west-2` are ALL non-standard: `USW2-UnusedBox:m7i.xlarge` (unused RI placeholder, `operatingSystem=Linux`, $1.70/hr — PASSES linux_only filter because it IS Linux), DedicatedHost rows ($0 — filtered by `unit_price > 0`), SQL-licensed rows, etc. **The fix**: add `operatingSystem=Linux`, `tenancy=Shared`, `preInstalledSw=NA` as API-level filters in `search_prices()` BEFORE hitting the pricing endpoint. For RDS: never use engine name (e.g. "PostgreSQL") as `instanceType` filter — use `databaseEngine` field instead. For ElastiCache: use `cacheEngine=Redis`. For S3: use `storageClass=General Purpose` to get only Standard tier. **Key lesson**: always add service-specific attribute filters to AWS `GetProducts` — the API intentionally returns ALL product variants without them.
 - **P13 linux_only silent fallback (5 May 2026)**: `if linux_only: candidates = linux_only` evaluates to `False` when `linux_only` is empty (all remaining rows were non-Linux after filter). The old code silently reverted to the pre-filter set (garbage rows including UnusedBox). Fix: `else: candidates = []` + log warning. This was the root cause of m7i.xlarge (UnusedBox RI placeholder at $1.70/hr) being selected for the Container workload across multiple runs.
 - **P13 RFP section numbers (5 May 2026)**: When `_build_managed_services_section()` was added as §5, 8 downstream section headers were never renumbered. The ToC was already correct (1–17) but body section headers had `## 5.`, `## 6.` etc. in the wrong places. Fixed lines: 164 (§5→§6 SKU), 201 (§6→§7 Cost), 271 (§15→§16 WAF), 317 (§13→§14 Vendor), 1135 (§8→§9 SLA), 1219 (§9→§10 Security), 1600 (§7→§8 TCO), 1844 (§14→§15 Assumptions). Rule: after adding/reordering sections, grep for all `## \d+\.` and verify each matches the ToC.

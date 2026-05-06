@@ -3,7 +3,7 @@
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
 > **Additional Examiner**: Santhosh Kirubakaran
-> **Last Updated**: 5 May 2026 (P13 fixes applied — EC2/RDS/ElastiCache/S3 API filters, linux_only fallback safety, GPU exclusion, ZIA exclusion, RFP section numbers. Run #5 root cause discovered: AWS pricing cache was poisoned with billing artifacts. All 142 tests pass. Cache deleted. Ready for run #6.)
+> **Last Updated**: 6 May 2026 (Run #6 verified all P13 fixes working. P14 discovered and fixed: DATABASE cheapest-price selection was ignoring resource requirements — db.t3.micro (1 GiB) selected for 12 GB PostgreSQL workload, cache.t1.micro (0.213 GiB, deprecated) selected for 12 GB Cache. Fixed via `_filter_database_candidates()` — adds currentGeneration=No exclusion and memory/vCPU minimum filter. Run #7 pending.)
 > **LLM**: Gemini 2.5 Pro (`gemini-2.5-pro`) via Google Cloud Vertex AI (`dissertation-rj`, `us-central1`) using ADC
 
 ---
@@ -767,4 +767,38 @@ The AWS Pricing API (`GetProducts` for `AmazonEC2`, `us-west-2`) returns product
 **Test result**: 142/142 tests pass after P13 fixes. Cache deleted (`data/sku_cache.db`) to force fresh fetch with correct API filters.
 
 **Next step**: Run #6 with fresh AWS credentials to verify corrected SKU selection (expect m-family EC2, RDS `db.*` instances, ElastiCache `cache.r6g.*`, and S3 Standard storage).
+
+---
+
+## 20. Sixth Cal Fire Run — P13 Verified ✅, P14 Discovered & Fixed (6 May 2026)
+
+### 20a. Run #6 Results (request_id: 3c95b188)
+
+**Run summary**: Run #6 with fresh AWS STS credentials (P13 fixes applied). Clarifier: 2 turns → ready (down from 4 in run #5 — table format provided all answers in turn 2). 9 workloads identified. Profiler: 9 components, 12 vCPU, 32.2 GB RAM, 12,540 GB storage. Sizer: 11 combinations (inc. 2 infra). RFP: 43,182 chars, 19 sections, 100% WAF (5/5). Runtime: **246,181ms (~4.1 min)**.
+
+### 20b. P13 Fix Verification (via `cost_comparison.selected_skus`)
+
+| Fix | SKU attribute confirmed | Status |
+|-----|------------------------|--------|
+| EC2 API filters (OS/tenancy) | `usagetype: "USW2-BoxUsage:c5.xlarge"`, `operatingSystem: "Linux"` | ✅ CONFIRMED |
+| RDS databaseEngine filter | `databaseEngine: "PostgreSQL"`, `db.t3.micro` at $0.018/hr | ✅ CONFIRMED |
+| ElastiCache cacheEngine=Redis filter | `cache.t1.micro` Redis row at $0.022/hr | ✅ CONFIRMED |
+| S3 storageClass=General Purpose | `storageClass: "General Purpose"`, `volumeType: "Standard"` | ✅ CONFIRMED |
+| GPU exclusion | No g4/g5/p-series instances selected | ✅ CONFIRMED |
+| ZIA exclusion | `USW2-TimedStorage-ByteHrs` (not ZIA) for both storage workloads | ✅ CONFIRMED |
+
+**Total cost run #6**: $630.07/mo (vs $3,220.51 in run #5 with garbage SKUs). All P13 fixes confirmed working.
+
+### 20c. Priority 14 Bugs — Discovered in Run #6, Fixed (6 May 2026)
+
+**Root cause**: `_size_generic_workload()` calls `_select_best_by_price()` which picks the cheapest hourly row with no resource minimum filtering. The profiler correctly sets 12 GB RAM / 3 vCPU for both DB/cache, but the sizer ignores resource requirements for DATABASE category workloads.
+
+| ID | Component | Symptom | Root Cause | Fix Applied | File |
+|----|-----------|---------|-----------|-------------|------|
+| **14a** ✅ | Postgresql Database | `db.t3.micro` (1 GiB) selected for 12 GB requirement — 12× undersized at $13.14/mo | Cheapest-price strategy has no vCPU/memory minimum filter | Added `_filter_database_candidates()`: filters deprecated instances (`currentGeneration=No`) and candidates with `memory < required_memory_gb × 0.8`. Cheapest passing = `db.r6i.large` (16 GiB, $182.50/mo) | `sizer.py` |
+| **14b** ✅ | Cache Layer | `cache.t1.micro` (0.213 GiB, `currentGeneration=No`) selected for 12 GB Redis requirement — deprecated, 56× undersized at $16.06/mo | Same cheapest-price strategy; no currentGeneration filter | Same fix — `currentGeneration=No` filter removes `cache.t1.micro`; resource filter removes under-memory instances. Cheapest passing = `cache.r4.large` ($132.86/mo) | `sizer.py` |
+
+**Expected run #7 total**: ~$916/mo (vs $630 in run #6) — more realistic for mission-critical sizing.
+
+**Next step**: Run #7 with fresh AWS credentials to verify P14 fixes — expect `db.r6i.large` for PostgreSQL and appropriate current-gen ElastiCache instance for Cache Layer.
 
