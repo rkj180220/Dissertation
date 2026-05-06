@@ -3,7 +3,7 @@
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
 > **Additional Examiner**: Santhosh Kirubakaran
-> **Last Updated**: 7 May 2026 (P14 verified. Deeper gap analysis done: bin-packing works but profiler only generates 1 container workload (should be 5-8 microservices). Serverless (Lambda/DynamoDB) never considered — no architecture alternatives evaluation engine. Presidio RFP gap analysis completed — 11 structural gaps identified. Incremental RFP amendment feature required. P15 planned — see §21.)
+> **Last Updated**: 8 May 2026 (Router Agent + Validator Agent + Session Persistence designed — see §22. P15 table expanded with 4 new items: P15d Router Agent, P15e Validator Agent, P15f Session Persistence/LangGraph checkpointing, P15h graph+API refactor. Build order updated. Architecture diagram updated to show new nodes.)
 > **LLM**: Gemini 2.5 Pro (`gemini-2.5-pro`) via Google Cloud Vertex AI (`dissertation-rj`, `us-central1`) using ADC
 
 ---
@@ -14,26 +14,45 @@
 User (React chat) → FastAPI (SSE) → LangGraph Orchestrator
                                          │
                   ┌──────────────────────┤
-                  │    Clarifier Agent    │ ← Multi-turn requirement refinement
-                  │  (conditional loop)   │   Asks follow-up questions until
-                  └──────────┬───────────┘   requirements are unambiguous
+                  │    Router Agent      │ ← NEW (P15d). LLM-based intent router.
+                  │  (entry on turn≥2)   │   Reads OrchestratorState + new input.
+                  └──────┬──────┬────────┘   Decides which path to take.
+          new_request ───┘      └─── amendment / validate / answer
+                  │
+                  ▼
+                  ┌──────────────────────┐
+                  │    Clarifier Agent   │ ← Multi-turn requirement refinement
+                  │  (conditional loop)  │   Only invoked for new_request or
+                  └──────────┬───────────┘   clarification_needed routes
                              │ complete
                              ▼
                   ┌──────────────────────┐
-                  │    Profiler Agent     │ ← Analyzes workload → WorkloadProfile
+                  │    Profiler Agent    │ ← Analyzes workload → WorkloadProfile
+                  │  (5-8 microservices) │   (P15c: decomposes into named services)
                   └──────────┬───────────┘
                              ▼
                   ┌──────────────────────┐
-                  │     Sizer Agent      │ ← Calls PricingService → scoring → bin-packing
+                  │     Sizer Agent      │ ← PricingService → scoring → bin-packing
+                  │  (+ serverless path) │   (P15b: Lambda/DynamoDB pricing added)
                   └──────────┬───────────┘
                              ▼
                   ┌──────────────────────┐
-                  │    FinOps Agent      │ ← Multi-provider cost comparison
+                  │    FinOps Agent      │ ← Multi-provider cost comparison + TCO
                   └──────────┬───────────┘
+                             ▼
+                  ┌──────────────────────┐
+                  │   Validator Agent    │ ← NEW (P15e). Architecture scoring +
+                  │  (architecture eval) │   sizing validation + budget fit +
+                  └──────────┬───────────┘   WAF compliance check.
                              ▼
                   ┌──────────────────────┐
                   │   RFP Writer Agent   │ ← Generates procurement document
+                  │  (with alternatives) │   (P15i: Architecture Alternatives §)
                   └──────────────────────┘
+
+  Session State (P15f): LangGraph SqliteSaver checkpointing — thread_id=session_id
+  persists OrchestratorState across requests. Router reads prior state on turn≥2.
+  Amendment path: Router → Profiler(delta) → Sizer → FinOps → Validator → RFP Writer
 
   All agents share OrchestratorState (LangGraph TypedDict):
   ┌─────────────┐    ┌──────────────┐    ┌─────────────────────────┐
@@ -912,9 +931,261 @@ Reference: `docs/Presidio_Response_Cal Fire_Draft 10.7.25 (2) (1).html` (parsed 
 | **P15a** | `src/engines/` | New `architecture_selector.py`: score serverless vs container vs VM using WAF + cost + scale factors | 🔴 Critical | ❌ Not started |
 | **P15b** | `src/models/cloud_resource.py` + `sizer.py` | Add `SERVERLESS` to `ServiceCategory`; add Lambda/DynamoDB pricing path to sizer | 🔴 Critical | ❌ Not started |
 | **P15c** | `src/agents/profiler.py` | Decompose enriched_input into 5-8 individual microservices (CONTAINER workloads) so bin-packing works with multiple inputs | 🔴 Critical | ❌ Not started |
-| **P15d** | `src/orchestrator/graph.py` + `src/api/routes/orchestration.py` | Incremental RFP amendment mode: detect existing `enriched_input`, skip Clarifier, run delta updates | 🟠 High | ❌ Not started |
-| **P15e** | `src/agents/profiler.py` | Add streaming (Kinesis), message queue (SQS), analytics (Redshift) workload detection from enriched_input keywords | 🟠 High | ❌ Not started |
-| **P15f** | `src/agents/rfp_writer.py` | Add "Architecture Alternatives Analysis" section (Option A: Serverless, Option B: Containers, Option C: Hybrid) with WAF scores + costs | 🔴 Critical | ❌ Not started |
+| **P15d** | `src/agents/router.py` (NEW) | LLM Router Agent: reads state + new input, classifies intent (`new_request\|amendment\|validate\|answer`), routes to correct graph path | 🔴 Critical | ❌ Not started |
+| **P15e** | `src/agents/validator.py` (NEW) | Validator Agent: architecture scoring (calls architecture_selector), sizing validation, budget fit, WAF check. Auto-runs after FinOps; also on-demand via Router | 🔴 Critical | ❌ Not started |
+| **P15f** | `src/services/session_store.py` (NEW) | Session persistence: LangGraph `SqliteSaver` checkpointing (`data/sessions.db`). Thread ID = session_id. Cross-request state continuity. | 🔴 Critical | ❌ Not started |
+| **P15g** | `src/agents/profiler.py` | Add streaming (Kinesis), message queue (SQS), analytics (Redshift) workload detection from enriched_input keywords | 🟠 High | ❌ Not started |
+| **P15h** | `graph.py` + `orchestration.py` + `state.py` | Update graph (router node at START, validator node before rfp_writer, conditional edges, LangGraph checkpointing). Add `session_id` to request/response. | 🔴 Critical | ❌ Not started |
+| **P15i** | `src/agents/rfp_writer.py` | Add "Architecture Alternatives Analysis" section (Option A: Serverless, Option B: Containers, Option C: Hybrid) with WAF scores + costs from Validator output | 🔴 Critical | ❌ Not started |
 
-**Build order for P15**: P15b → P15a → P15c → P15e → P15f → P15d
+**Build order for P15**: P15b → P15a → P15c → P15g → P15d → P15e → P15f → P15h → P15i
+
+---
+
+## §22. Router Agent + Validator Agent + Session Persistence Design (8 May 2026)
+
+### 22a. Problem Statement
+
+Two major architectural gaps identified from user testing and Presidio comparison:
+
+1. **No intelligent routing**: every user message (including follow-ups like "add SSO integration") triggers a full 5-agent pipeline from scratch. The system re-clarifies requirements already gathered, loses prior context, and produces a replacement RFP instead of an amendment.
+
+2. **No architecture validation**: the system never checks whether its own recommendation is correct. Lambda+DynamoDB was objectively the better choice for 50K→2M users, but the system blindly produces an EKS recommendation because the clarifier LLM wrote "Kubernetes" in enriched_input.
+
+### 22b. Router Agent Design (`src/agents/router.py`) — NEW FILE
+
+The Router Agent is an LLM-powered intent classifier. It sits at the **entry point of the graph** for all requests where a prior session exists.
+
+**Trigger condition**: present when `session_id` is provided AND `rfp_document` is non-empty in the restored state (i.e., this is turn ≥ 2 of a session). Turn 1 (no session) goes directly to Clarifier.
+
+**Intent types**:
+
+| Route | Trigger Pattern | Graph Path |
+|-------|----------------|-----------|
+| `new_request` | No prior session / explicit restart | START → Clarifier → Profiler → Sizer → FinOps → Validator → RFP Writer |
+| `amendment` | "add X", "change Y to Z", "what if we add…", "include [feature]", "update the [section]" | START → Router → Profiler(delta) → Sizer → FinOps → Validator → RFP Writer(amend) |
+| `validate` | "is this the right architecture?", "why EKS not Lambda?", "validate the architecture", "check if this is correct" | START → Router → Validator → END |
+| `answer` | "what does [term] mean?", "explain [section]", "why was X chosen?" — can be answered from state without pipeline | START → Router → END (router writes direct answer to messages) |
+| `clarify` | Ambiguous follow-up, missing context | START → Router → Clarifier(amendment-mode) → ... |
+
+**LLM prompt structure**:
+```
+SYSTEM: You are a cloud architecture routing agent. You have access to the current
+conversation state (prior RFP exists) and the user's new message. Classify intent.
+
+STATE_SUMMARY: {rfp_excerpt + workload_summary + prior_messages[-3:]}
+USER_INPUT: {new_message}
+
+Respond with exactly one line:
+ROUTE: <new_request|amendment|validate|answer|clarify>
+DELTA: <one-sentence summary of what changed, or "N/A">
+CONFIDENCE: <high|medium|low>
+DIRECT_ANSWER: <if ROUTE=answer, write the answer here; else "N/A">
+```
+
+**RouterDecision model** (added to `OrchestratorState`):
+```python
+routing_decision: str  # "new_request" | "amendment" | "validate" | "answer" | "clarify"
+amendment_instructions: str  # delta description for amendment mode
+pipeline_mode: str  # "full" | "amendment" | "validation" | "query"
+turn_number: int  # increments per user message within a session
+```
+
+**Key design rule**: the Router is lightweight — it reads state and makes a routing decision in one LLM call. It does NOT execute any business logic itself.
+
+---
+
+### 22c. Validator Agent Design (`src/agents/validator.py`) — NEW FILE
+
+The Validator Agent runs **after FinOps** in every pipeline and can also be triggered **on-demand** via the Router for `validate` routes. It is the system's architecture quality gate.
+
+**What it validates** (4 checks):
+
+1. **Architecture Correctness** (calls `architecture_selector.py`):
+   - Scores Serverless (Lambda+DynamoDB), Container (EKS+RDS), Hybrid for the given `WorkloadProfile`
+   - Score factors: `WAF_reliability × WAF_cost_opt × scale_fit × compliance_fit`
+   - If the selected architecture is NOT the top-scored option, writes a warning with reasoning
+   - Example: for 2M concurrent users, Serverless scores 0.92 vs Container 0.67 → validator flags this
+
+2. **Sizing Adequacy**:
+   - Verifies that each selected SKU meets the workload's resource requirements (memory_gb, vcpus)
+   - Re-runs `_filter_database_candidates` logic as a validation pass
+   - Flags any SKU that is undersized by > 20%
+
+3. **Budget Fit**:
+   - Compares `sum(monthly_costs)` against `workload_request.budget_monthly_usd`
+   - If over budget: flags excess percentage and suggests optimization paths (spot, RI, downgrade)
+   - If under budget by >50%: flags as potentially under-provisioned
+
+4. **WAF Compliance** (calls `waf_compliance.py`):
+   - Runs `evaluate_compliance()` on the current `WorkloadRequest`
+   - Appends compliance report to `validation_report`
+
+**Output model** (added to `OrchestratorState`):
+```python
+validation_report: dict[str, Any]  # structure below
+architecture_alternatives: list[dict]  # ranked options from architecture_selector
+```
+
+```python
+# validation_report structure
+{
+  "architecture_validation": {
+    "selected": "containers",
+    "recommended": "serverless",
+    "ranked": [
+      {"option": "serverless", "score": 0.92, "monthly_cost_estimate": 4200, "rationale": "..."},
+      {"option": "containers", "score": 0.67, "monthly_cost_estimate": 12800, "rationale": "..."},
+      {"option": "hybrid", "score": 0.78, "monthly_cost_estimate": 7100, "rationale": "..."}
+    ],
+    "warning": "Serverless is recommended for 2M concurrent user workloads — consider revising"
+  },
+  "sizing_validation": [
+    {"workload": "PostgreSQL Database", "status": "pass", "selected_memory_gb": 16, "required_memory_gb": 12},
+    {"workload": "Cache Layer", "status": "warning", "selected_memory_gb": 13.1, "required_memory_gb": 12}
+  ],
+  "budget_validation": {
+    "monthly_total": 916.0, "budget_monthly": 266666.0,
+    "utilization_pct": 0.34, "status": "pass",
+    "note": "Well within budget — consider higher availability tier"
+  },
+  "waf_report": {...}  # ComplianceReport from waf_compliance.py
+}
+```
+
+**Integration with RFP Writer**: `_build_architecture_alternatives_section()` reads `validation_report["architecture_validation"]["ranked"]` to produce Option A/B/C comparison table.
+
+---
+
+### 22d. Session Persistence Design (`src/services/session_store.py` + LangGraph)
+
+**Approach**: Use LangGraph's built-in `SqliteSaver` checkpointer (from `langgraph-checkpoint-sqlite` package). This natively persists the full `OrchestratorState` (as JSON) keyed by `thread_id = session_id`, enabling the graph to automatically resume prior state on the next request.
+
+**Session lifecycle**:
+1. **First request** (no `session_id`): API generates `session_id = uuid4()`, creates blank state, runs full pipeline, returns `session_id` in response
+2. **Follow-up requests** (with `session_id`): API calls `graph.ainvoke(state, config={"configurable": {"thread_id": session_id}})` — LangGraph restores prior state, Router Agent runs, correct path executes
+3. **Session expiry**: `SqliteSaver` stores checkpoints in `data/sessions.db`. A background cleanup job (or TTL query) removes sessions older than 7 days.
+
+**API changes** (`src/api/routes/orchestration.py`):
+```python
+class OrchestrationRequest(BaseModel):
+    user_input: str
+    project_name: str = "untitled"
+    session_id: str | None = None  # NEW — if None, starts new session
+
+class OrchestrationResponse(BaseModel):
+    ...
+    session_id: str  # NEW — always returned, client must persist and send back
+    route_taken: str  # NEW — "new_request" | "amendment" | "validate" | "answer"
+    turn_number: int  # NEW — increments per turn within session
+```
+
+**CRITICAL FIX**: Current code deletes `_clarify_sessions[request_id]` when `status=ready`. This must be preserved — the session must NOT be deleted. Instead, the enriched_input must be written to the LangGraph checkpoint so it's available on subsequent requests.
+
+**`create_initial_state()` update**:
+```python
+def create_initial_state(
+    user_input: str, project_name: str = "untitled", session_id: str | None = None
+) -> OrchestratorState:
+    return {
+        ...,
+        "session_id": session_id or str(uuid4()),
+        "routing_decision": "new_request",
+        "amendment_instructions": "",
+        "validation_report": {},
+        "architecture_alternatives": [],
+        "pipeline_mode": "full",
+        "turn_number": 1,
+    }
+```
+
+**LangGraph wiring** (`src/orchestrator/graph.py`):
+```python
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+def build_graph(llm, pricing_service, db_path: str = "data/sessions.db") -> CompiledStateGraph:
+    checkpointer = SqliteSaver.from_conn_string(db_path)
+    graph = StateGraph(OrchestratorState)
+    graph.add_node("router", _make_router_node(llm))
+    graph.add_node("clarifier", ...)
+    ...
+    graph.add_node("validator", _make_validator_node(llm, pricing_service))
+    graph.add_node("rfp_writer", ...)
+    
+    # Entry: new session → clarifier; existing session → router
+    graph.add_conditional_edges(START, _route_entry)
+    
+    # Router conditional edges
+    graph.add_conditional_edges("router", _route_from_router, {
+        "new_request": "clarifier",
+        "amendment": "profiler",
+        "validate": "validator",
+        "answer": END,
+    })
+    ...
+    # Validator → RFP Writer (in every path that produces an RFP)
+    graph.add_edge("validator", "rfp_writer")
+    graph.add_edge("rfp_writer", END)
+    
+    return graph.compile(checkpointer=checkpointer)
+```
+
+**`_route_entry` function**:
+```python
+def _route_entry(state: OrchestratorState) -> str:
+    # If prior RFP exists in state, route to router (it's a follow-up)
+    if state.get("rfp_document"):
+        return "router"
+    return "clarifier"
+```
+
+---
+
+### 22e. Updated OrchestratorState Fields
+
+6 new fields added to `OrchestratorState` TypedDict (`src/orchestrator/state.py`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | `str` | UUID — identifies the LangGraph thread. Persists across requests. |
+| `routing_decision` | `str` | Router's classification: `"new_request"` / `"amendment"` / `"validate"` / `"answer"` |
+| `amendment_instructions` | `str` | Delta description when `routing_decision == "amendment"` |
+| `validation_report` | `dict[str, Any]` | Validator Agent's full output (architecture scores, sizing, budget, WAF) |
+| `architecture_alternatives` | `list[dict]` | Ranked options from `architecture_selector.py` |
+| `pipeline_mode` | `str` | `"full"` / `"amendment"` / `"validation"` / `"query"` |
+| `turn_number` | `int` | Increments per user message within the session (reducer: `lambda a, b: b`) |
+
+---
+
+### 22f. Architecture Selector Engine (`src/engines/architecture_selector.py`) — NEW FILE
+
+Purpose: score architectural patterns against a `WorkloadProfile` to recommend serverless vs containers vs hybrid.
+
+**Scoring formula**:
+```
+score = (reliability_weight × reliability_score)
+      + (cost_weight × cost_score)
+      + (scale_weight × scale_score)
+      + (compliance_weight × compliance_score)
+      + (latency_weight × latency_score)
+```
+
+Default weights: `reliability=0.30, cost=0.25, scale=0.25, compliance=0.10, latency=0.10`
+
+**Per-option scoring logic**:
+
+| Factor | Serverless | Containers | Hybrid |
+|--------|-----------|-----------|--------|
+| Scale score (peak/normal ratio > 20×) | 1.0 (Lambda scales to 0→∞) | 0.5 (EKS HPA ~10× burst) | 0.75 |
+| Cost score (req/sec < 1000 avg) | 1.0 (pay per request) | 0.4 (always-on nodes) | 0.7 |
+| Reliability score (SLA ≥ 99.99%) | 0.9 (no warm-up, multi-AZ native) | 0.85 (multi-AZ, pod restart) | 0.87 |
+| Compliance score (StateRAMP/FedRAMP) | 0.8 (Lambda has FedRAMP) | 0.9 (more control plane control) | 0.85 |
+| Latency score (p99 < 100ms required) | 0.6 (cold start risk) | 1.0 (persistent process) | 0.8 |
+
+**Cal Fire example** (50K→2M = 40× spike, $266K/mo budget):
+- Serverless: `0.30×0.9 + 0.25×1.0 + 0.25×1.0 + 0.10×0.8 + 0.10×0.6 = 0.895`
+- Containers: `0.30×0.85 + 0.25×0.4 + 0.25×0.5 + 0.10×0.9 + 0.10×1.0 = 0.670`
+- Hybrid: `0.30×0.87 + 0.25×0.7 + 0.25×0.75 + 0.10×0.85 + 0.10×0.8 = 0.793`
+
+→ Recommendation: **Serverless** with 0.895 score, Hybrid as runner-up.
 
