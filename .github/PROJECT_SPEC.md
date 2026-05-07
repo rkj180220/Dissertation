@@ -934,17 +934,34 @@ Reference: `docs/Presidio_Response_Cal Fire_Draft 10.7.25 (2) (1).html` (parsed 
 
 | ID | Component | Description | Priority | Status |
 |----|-----------|-------------|----------|--------|
-| **P15a** | `src/engines/` | New `architecture_selector.py`: score serverless vs container vs VM using WAF + cost + scale factors | 🔴 Critical | ❌ Not started |
-| **P15b** | `src/models/cloud_resource.py` + `sizer.py` | Add `SERVERLESS` to `ServiceCategory`; add Lambda/DynamoDB pricing path to sizer | 🔴 Critical | ❌ Not started |
+| **P15a** | `src/engines/` | New `architecture_selector.py`: score **4 options** (managed-serverless, self-hosted-serverless, containers, hybrid) using real sizer pricing + WAF scoring. Self-hosted serverless = K8s+Knative/KEDA with K8s node cost model (not per-invocation). Cost score uses actual monthly estimates from pricing API, not heuristics. | 🔴 Critical | ❌ Not started |
+| **P15b** | `src/models/cloud_resource.py` + `sizer.py` | Add `SERVERLESS` to `ServiceCategory`; add Lambda/DynamoDB pricing path to sizer; add Knative/KEDA self-hosted path (re-uses K8s node pricing from CONTAINER path) | 🔴 Critical | ❌ Not started |
 | **P15c** | `src/agents/profiler.py` | Decompose enriched_input into 5-8 individual microservices (CONTAINER workloads) so bin-packing works with multiple inputs | 🔴 Critical | ❌ Not started |
 | **P15d** | `src/agents/router.py` (NEW) | LLM Router Agent: reads state + new input, classifies intent (`new_request\|amendment\|validate\|answer`), routes to correct graph path | 🔴 Critical | ❌ Not started |
 | **P15e** | `src/agents/validator.py` (NEW) | Validator Agent: architecture scoring (calls architecture_selector), sizing validation, budget fit, WAF check. Auto-runs after FinOps; also on-demand via Router | 🔴 Critical | ❌ Not started |
 | **P15f** | `src/services/session_store.py` (NEW) | Session persistence: LangGraph `SqliteSaver` checkpointing (`data/sessions.db`). Thread ID = session_id. Cross-request state continuity. | 🔴 Critical | ❌ Not started |
 | **P15g** | `src/agents/profiler.py` | Add streaming (Kinesis), message queue (SQS), analytics (Redshift) workload detection from enriched_input keywords | 🟠 High | ❌ Not started |
 | **P15h** | `graph.py` + `orchestration.py` + `state.py` | Update graph (router node at START, validator node before rfp_writer, conditional edges, LangGraph checkpointing). Add `session_id` to request/response. | 🔴 Critical | ❌ Not started |
-| **P15i** | `src/agents/rfp_writer.py` | Add "Architecture Alternatives Analysis" section (Option A: Serverless, Option B: Containers, Option C: Hybrid) with WAF scores + costs from Validator output | 🔴 Critical | ❌ Not started |
+| **P15i** | `src/agents/rfp_writer.py` | Add "Architecture Alternatives Analysis" section (all 4 options: Managed Serverless / Self-Hosted Serverless / Containers / Hybrid) with WAF scores + REAL costs from Validator output | 🔴 Critical | ❌ Not started |
+| **P15j** | `src/engines/architecture_selector.py` | Dynamic WAF weight profiles: Clarifier detects user priority ("cost is #1") → adjusts scoring weights (cost_weight=0.40, reliability=0.20, etc.) at runtime | 🟠 High | ❌ Not started |
 
-**Build order for P15**: P15b → P15a → P15c → P15g → P15d → P15e → P15f → P15h → P15i
+**Build order for P15**: P15b → P15a → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j
+
+---
+
+### 21f. P16 Completeness Gaps (Dissertation Quality)
+
+Features needed to reach dissertation-grade completeness. Not bugs — architectural enhancements.
+
+| ID | Component | Description | Priority |
+|----|-----------|-------------|----------|
+| **P16a** | `src/engines/architecture_selector.py` | **Real-cost architecture comparison**: price all 4 architectures using actual sizer output (not heuristic scores). Validator prices Managed-Serverless + Self-Hosted-Serverless paths, compares against already-priced Container path. Produces actual $/month for each option. | 🔴 Critical |
+| **P16b** | `src/agents/profiler.py` | **Self-hosted serverless workload type**: when architecture_selector picks self-hosted-serverless, profiler re-labels CONTAINER workloads as `SERVERLESS_COMPUTE` (Knative) — sizer then queries K8s node pools + KEDA scaling config. Not Lambda. | 🔴 Critical |
+| **P16c** | `src/agents/rfp_writer.py` | **RFP compliance verification pass**: after generating RFP, use LLM to check generated text against StateRAMP Moderate control list. Flag missing controls. Add "Compliance Gap Analysis" appendix. | 🟠 High |
+| **P16d** | `scripts/` | **Multi-scenario benchmark**: script to run 3 test scenarios (Cal Fire, healthcare API, e-commerce platform) through the full pipeline and compare output quality vs. reference architectures. Dissertation evaluation chapter data. | 🟠 High |
+| **P16e** | `dashboard/` | **Architecture comparison radar chart**: React component showing 4 architecture options scored on 5 WAF axes (reliability, cost, scale, compliance, latency) as a radar/spider chart. Makes the multi-option comparison visual. | 🟡 Medium |
+| **P16f** | `src/agents/rfp_writer.py` | **IaC appendix (Terraform sketches)**: for the recommended architecture, generate Terraform resource blocks (aws_lambda_function, aws_eks_cluster, etc.) as a starting-point appendix to the RFP. SKU names already known from Sizer output. | 🟡 Medium |
+| **P16g** | `dashboard/` | **User rating / feedback capture**: after RFP is generated, user rates recommendation quality (1–5 stars + comment). Logged to LangFuse as custom event. Dissertation can report on system accuracy. | 🟡 Medium |
 
 ---
 
@@ -1165,9 +1182,27 @@ def _route_entry(state: OrchestratorState) -> str:
 
 ### 22f. Architecture Selector Engine (`src/engines/architecture_selector.py`) — NEW FILE
 
-Purpose: score architectural patterns against a `WorkloadProfile` to recommend serverless vs containers vs hybrid.
+Purpose: score **4 architectural patterns** against a `WorkloadProfile` to recommend the best option, using real pricing where available plus WAF-pillar scoring.
 
-**Scoring formula**:
+**4 Architecture Options**:
+
+| Option | Stack | Cost Model |
+|--------|-------|-----------|
+| `managed_serverless` | Lambda + DynamoDB + API Gateway + CloudFront | Per-invocation pricing ($0.20/1M req + $0.0000166667/GB-sec). Cheap at low RPS, expensive at sustained >1K RPS. |
+| `self_hosted_serverless` | EKS + Knative/KEDA + DynamoDB/Redis (open source FaaS on K8s) | K8s node pool pricing (same as CONTAINER path in sizer) ÷ pod density. No cold start. No per-invocation fee. Cost-efficient at sustained high throughput. |
+| `containers` | EKS + RDS + ElastiCache + ALB | Always-on node pricing. Predictable cost. Best for stateful, latency-sensitive workloads. |
+| `hybrid` | Lambda for event ingestion + K8s for stateful + RDS | Combined: Lambda pricing for bursty paths + node pricing for always-on services. Most complex operationally. |
+
+**Key insight**: "Managed Serverless" is NOT the same as "Self-Hosted Serverless". At >1K sustained RPS, managed serverless (Lambda) costs 10-50× more than self-hosted serverless (Knative on K8s) because K8s nodes have no per-request premium. The architecture selector MUST differentiate these.
+
+**Cost scoring (uses real pricing from PricingService, not heuristics)**:
+- For `managed_serverless`: estimate `avg_rps × $0.0000002 × 3600 × 24 × 30` for request cost + memory cost
+- For `self_hosted_serverless`: query K8s node pool pricing (same as CONTAINER sizer path) for estimated peak capacity ÷ 2 (pods scale down off-peak)
+- For `containers`: use existing sizer output (already priced)
+- For `hybrid`: weight = (Lambda cost × event_fraction) + (K8s cost × (1 - event_fraction))
+- **Cost score = 1 - (option_cost / max_option_cost)**: normalized so cheapest gets 1.0
+
+**WAF scoring formula**:
 ```
 score = (reliability_weight × reliability_score)
       + (cost_weight × cost_score)
@@ -1177,21 +1212,54 @@ score = (reliability_weight × reliability_score)
 ```
 
 Default weights: `reliability=0.30, cost=0.25, scale=0.25, compliance=0.10, latency=0.10`
+Dynamic weights (P15j): Clarifier extracts user priority → adjusts weights at runtime.
 
-**Per-option scoring logic**:
+**Per-option WAF factor scoring**:
 
-| Factor | Serverless | Containers | Hybrid |
-|--------|-----------|-----------|--------|
-| Scale score (peak/normal ratio > 20×) | 1.0 (Lambda scales to 0→∞) | 0.5 (EKS HPA ~10× burst) | 0.75 |
-| Cost score (req/sec < 1000 avg) | 1.0 (pay per request) | 0.4 (always-on nodes) | 0.7 |
-| Reliability score (SLA ≥ 99.99%) | 0.9 (no warm-up, multi-AZ native) | 0.85 (multi-AZ, pod restart) | 0.87 |
-| Compliance score (StateRAMP/FedRAMP) | 0.8 (Lambda has FedRAMP) | 0.9 (more control plane control) | 0.85 |
-| Latency score (p99 < 100ms required) | 0.6 (cold start risk) | 1.0 (persistent process) | 0.8 |
+| Factor | Managed Serverless | Self-Hosted Serverless | Containers | Hybrid |
+|--------|--------------------|------------------------|------------|--------|
+| Scale (peak/normal > 20×) | 1.0 (Lambda 0→∞) | 0.90 (KEDA scales pods to 0 off-hours, fast burst) | 0.50 (HPA ~10× burst limit) | 0.80 |
+| Cost (at avg RPS) | Dynamic from pricing | Dynamic from K8s pricing | Dynamic from sizer | Dynamic weighted | 
+| Reliability (SLA ≥ 99.99%) | 0.90 (multi-AZ, no warm-up) | 0.88 (K8s pod restart risk) | 0.85 (multi-AZ) | 0.87 |
+| Compliance (StateRAMP/FedRAMP) | 0.80 (Lambda has FedRAMP boundary) | 0.90 (full control, audit trail) | 0.90 (full control) | 0.85 |
+| Latency (p99 < 100ms) | 0.60 (cold start risk 500ms–2s) | 0.95 (persistent pods, no cold start) | 1.00 (persistent process) | 0.80 |
 
-**Cal Fire example** (50K→2M = 40× spike, $266K/mo budget):
-- Serverless: `0.30×0.9 + 0.25×1.0 + 0.25×1.0 + 0.10×0.8 + 0.10×0.6 = 0.895`
-- Containers: `0.30×0.85 + 0.25×0.4 + 0.25×0.5 + 0.10×0.9 + 0.10×1.0 = 0.670`
-- Hybrid: `0.30×0.87 + 0.25×0.7 + 0.25×0.75 + 0.10×0.85 + 0.10×0.8 = 0.793`
+**Cal Fire recalculated** (50K→2M = 40× spike; avg 50K = ~833 RPS; Lambda at 833 RPS = ~$14K/mo; Knative-on-K8s at same load = ~$1.8K/mo; EKS containers = ~$12K/mo):
 
-→ Recommendation: **Serverless** with 0.895 score, Hybrid as runner-up.
+Cost scores (normalized: cheapest Knative = 1.0):
+- Managed Serverless: 1 - (14000/14000) = 0.0 (most expensive at this sustained scale)
+- Self-Hosted Serverless: 1 - (1800/14000) = 0.87
+- Containers: 1 - (12000/14000) = 0.14
+- Hybrid: 1 - (6000/14000) = 0.57 (Lambda for spikes + small K8s cluster for base)
+
+Final scores with cost weights applied:
+- Managed Serverless: `0.30×0.90 + 0.25×0.00 + 0.25×1.00 + 0.10×0.80 + 0.10×0.60 = 0.655`
+- **Self-Hosted Serverless: `0.30×0.88 + 0.25×0.87 + 0.25×0.90 + 0.10×0.90 + 0.10×0.95 = 0.888`** ← WINNER
+- Containers: `0.30×0.85 + 0.25×0.14 + 0.25×0.50 + 0.10×0.90 + 0.10×1.00 = 0.560`
+- Hybrid: `0.30×0.87 + 0.25×0.57 + 0.25×0.80 + 0.10×0.85 + 0.10×0.80 = 0.776`
+
+→ Recommendation: **Self-Hosted Serverless (EKS + Knative/KEDA)** wins for Cal Fire. Hybrid as runner-up. This is the correct answer — NOT managed Lambda.
+
+**`ArchitectureRecommendation` model**:
+```python
+class ArchitectureOption(BaseModel):
+    name: str           # "managed_serverless" | "self_hosted_serverless" | "containers" | "hybrid"
+    label: str          # Human label: "AWS Lambda + DynamoDB (Managed Serverless)"
+    score: float        # 0.0–1.0 composite WAF score
+    monthly_cost_estimate: float   # Real pricing from API where available
+    reliability_score: float
+    cost_score: float
+    scale_score: float
+    compliance_score: float
+    latency_score: float
+    rationale: str      # Why this option scored as it did
+    trade_offs: str     # What you give up with this option
+
+class ArchitectureRecommendation(BaseModel):
+    winner: ArchitectureOption
+    ranked: list[ArchitectureOption]   # All 4, sorted by score desc
+    weights_used: dict[str, float]     # Actual weights (dynamic or default)
+    recommendation_rationale: str
+    warning: str | None                # If winner != what the LLM/clarifier initially suggested
+```
 

@@ -174,25 +174,38 @@ All priorities through P14 are complete. Full per-fix breakdowns are in `PROJECT
 
 ## What Needs to Be Fixed/Built Next ❌
 
-> **Run #6 complete (P13 ✅). P14 fixed (DB undersizing). Run #7 needed to verify P14 with live AWS pricing. P15 is the next major feature phase — 9 items (architecture_selector, serverless path, profiler decomposition, Router Agent, Validator Agent, Session Persistence, streaming workloads, graph+API refactor, RFP alternatives section).**
+> **Run #6 complete (P13 ✅). P14 fixed (DB undersizing). Run #7 needed to verify P14. P15 = 10 items (adds self-hosted serverless + dynamic weights). P16 = dissertation-completeness features.**
 
-### Priority 15 — NOT STARTED ❌ (Next Major Phase — 9 items)
+### Priority 15 — NOT STARTED ❌ (Next Major Phase — 10 items)
 
-Full design in PROJECT_SPEC §21 (gap analysis) and §22 (Router/Validator/Session design):
+Full design in PROJECT_SPEC §21 (gap analysis) and §22 (Router/Validator/Session/Architecture design):
 
 | ID | Feature | Component(s) | Description | Priority |
 |----|---------|-------------|-------------|----------|
-| **P15a** | Architecture alternatives engine | `src/engines/architecture_selector.py` (NEW) | Score serverless vs container vs VM using WAF pillars + cost + scale factors. Takes `WorkloadProfile` → produces ranked recommendation with costs and rationale | 🔴 Critical |
-| **P15b** | Serverless pricing path | `src/models/cloud_resource.py` + `src/agents/sizer.py` | Add `SERVERLESS` to `ServiceCategory` enum (16th value); add Lambda $/request/ms + DynamoDB $/RCU-WCU pricing path in sizer | 🔴 Critical |
-| **P15c** | Profiler microservice decomposition | `src/agents/profiler.py` | Decompose `enriched_input` into 5-8 individual microservices (each a CONTAINER workload) so bin-packing demonstrates multi-workload packing. | 🔴 Critical |
-| **P15d** | **Router Agent** (NEW) | `src/agents/router.py` (NEW) | LLM-based intent router. Entry point for turn≥2. Classifies: `new_request \| amendment \| validate \| answer \| clarify`. Routes to correct graph path. Amendment path skips Clarifier. | 🔴 Critical |
-| **P15e** | **Validator Agent** (NEW) | `src/agents/validator.py` (NEW) | Validates architecture (calls architecture_selector), sizing adequacy, budget fit, WAF compliance. Auto-runs after FinOps every pipeline; also routable on-demand from Router. Writes `validation_report` to state. | 🔴 Critical |
-| **P15f** | **Session persistence** (NEW) | `src/services/session_store.py` (NEW) + `graph.py` | LangGraph `SqliteSaver` checkpointing (`data/sessions.db`). Thread ID = `session_id`. State persists across requests. `session_id` added to `OrchestrationRequest`/`Response`. | 🔴 Critical |
-| **P15g** | Streaming/queue/analytics workloads | `src/agents/profiler.py` | Detect streaming (Kinesis), message queue (SQS), analytics (Redshift) from `enriched_input` keywords. Add as distinct NETWORKING/COMPUTE components. | 🟠 High |
-| **P15h** | Graph + API refactor | `graph.py` + `state.py` + `orchestration.py` | Add router_node at START, validator_node before rfp_writer, conditional edges, LangGraph checkpointing. `session_id` + `route_taken` + `turn_number` in request/response. 6 new state fields. | 🔴 Critical |
-| **P15i** | RFP Architecture Alternatives section | `src/agents/rfp_writer.py` | Add §3 "Architecture Alternatives Analysis": Option A (Serverless), Option B (Containers), Option C (Hybrid) with WAF scores + monthly costs + recommendation. Reads from `validation_report`. | 🔴 Critical |
+| **P15a** | Architecture alternatives engine | `src/engines/architecture_selector.py` (NEW) | Score **4 options**: managed-serverless (Lambda), **self-hosted-serverless (Knative/KEDA on K8s)**, containers (EKS), hybrid. Uses **real pricing from sizer** for cost scores — not heuristics. Cal Fire winner: self-hosted-serverless (0.888) not Lambda. | 🔴 Critical |
+| **P15b** | Serverless pricing path | `src/models/cloud_resource.py` + `src/agents/sizer.py` | Add `SERVERLESS` to `ServiceCategory`; add Lambda/DynamoDB pricing path; add Knative self-hosted path (reuses K8s node pricing) | 🔴 Critical |
+| **P15c** | Profiler microservice decomposition | `src/agents/profiler.py` | Decompose `enriched_input` into 5-8 individual microservices so bin-packing works with multiple inputs | 🔴 Critical |
+| **P15d** | **Router Agent** (NEW) | `src/agents/router.py` (NEW) | LLM intent router at turn>=2. Classifies: `new_request / amendment / validate / answer / clarify`. Amendment path skips Clarifier. | 🔴 Critical |
+| **P15e** | **Validator Agent** (NEW) | `src/agents/validator.py` (NEW) | Validates architecture (calls architecture_selector), sizing adequacy, budget fit, WAF compliance. Writes `validation_report` to state. | 🔴 Critical |
+| **P15f** | **Session persistence** (NEW) | `src/services/session_store.py` (NEW) + `graph.py` | LangGraph `SqliteSaver` checkpointing. Thread ID = `session_id`. State persists across requests. | 🔴 Critical |
+| **P15g** | Streaming/queue/analytics workloads | `src/agents/profiler.py` | Detect Kinesis, SQS, Redshift from `enriched_input` keywords | 🟠 High |
+| **P15h** | Graph + API refactor | `graph.py` + `state.py` + `orchestration.py` | Add router_node, validator_node, conditional edges, checkpointing. 6 new state fields. `session_id` in request/response. | 🔴 Critical |
+| **P15i** | RFP Architecture Alternatives section | `src/agents/rfp_writer.py` | All 4 options with WAF scores + REAL monthly costs from `validation_report`. | 🔴 Critical |
+| **P15j** | Dynamic WAF weights | `src/engines/architecture_selector.py` | Clarifier detects user priority ("cost is #1") and adjusts scoring weights at runtime. | 🟠 High |
 
-**Build order**: P15b → P15a → P15c → P15g → P15d → P15e → P15f → P15h → P15i
+**Build order**: P15b → P15a → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j
+
+### Priority 16 — Dissertation Completeness Features (After P15)
+
+| ID | Feature | Description | Priority |
+|----|---------|-------------|----------|
+| **P16a** | Real-cost architecture comparison | Price all 4 architectures using actual sizer output — Lambda per-invocation math + Knative K8s node pricing + container always-on. Validator computes all 4 before selecting winner. | 🔴 Critical |
+| **P16b** | Self-hosted serverless workload type | After architecture_selector picks self-hosted-serverless, profiler relabels CONTAINER workloads as SERVERLESS_COMPUTE (Knative). Sizer queries K8s nodes at pod density, not Lambda pricing. | 🔴 Critical |
+| **P16c** | RFP compliance verification | Post-generation LLM pass against StateRAMP Moderate control list. Outputs Compliance Gap Analysis appendix in RFP. | 🟠 High |
+| **P16d** | Multi-scenario benchmark script | Run Cal Fire + healthcare + e-commerce through full pipeline. Compare vs. reference architectures. Dissertation evaluation chapter data. | 🟠 High |
+| **P16e** | Architecture radar chart (dashboard) | React component: 4 options x 5 WAF axes as spider chart. Makes the comparison visual and tangible. | 🟡 Medium |
+| **P16f** | IaC appendix in RFP | For winning architecture, generate Terraform resource stubs. SKU names from sizer already available. | 🟡 Medium |
+| **P16g** | User feedback capture | 1-5 star rating after RFP generated, logged to LangFuse. Dissertation accuracy reporting. | 🟡 Medium |
 
 ### Next Immediate Task
 
@@ -212,6 +225,8 @@ Full design in PROJECT_SPEC §21 (gap analysis) and §22 (Router/Validator/Sessi
 - Add Lambda + DynamoDB pricing path in `sizer.py` (new `_size_serverless_workload()` method)
 - Lambda: price = requests/mo × avg_duration_ms × memory_gb × $0.0000166667/GB-sec
 - DynamoDB: price = (read_units × $0.25/RCU + write_units × $1.25/WCU) per million
+- **Also add Knative/self-hosted path**: reuse existing K8s/CONTAINER node pricing; pod_density factor (e.g. 8 pods/node) divides node cost across workloads
+- CRITICAL: architecture_selector will call BOTH paths — one for Lambda cost estimate, one for Knative cost estimate
 
 
 
@@ -256,8 +271,8 @@ cd dashboard && npm run build
 - **Router Agent** (`src/agents/router.py`): LLM intent classifier at turn≥2 entry. Classifies: `new_request|amendment|validate|answer|clarify`. Amendment path skips Clarifier, runs Profiler(delta)→Sizer→FinOps→Validator→RFP Writer. Entry conditional: if `state.get("rfp_document")` → router else → clarifier. Full design in PROJECT_SPEC §22b.
 - **Validator Agent** (`src/agents/validator.py`): Scores architecture alternatives (serverless=0.895 vs containers=0.670 for Cal Fire's 40× spike ratio). Also checks sizing adequacy, budget fit, WAF compliance. Runs after FinOps every pipeline. Full design in PROJECT_SPEC §22c.
 - **Session Persistence** (`src/services/session_store.py`): `langgraph-checkpoint-sqlite` → `SqliteSaver`. `graph.compile(checkpointer=checkpointer)`. Thread ID = `session_id`. CRITICAL: current `orchestration.py` deletes `_clarify_sessions[request_id]` on `status=ready` — must NOT do this. Full design in PROJECT_SPEC §22d.
-- **Architecture Selector** (`src/engines/architecture_selector.py`): `score = reliability×0.30 + cost×0.25 + scale×0.25 + compliance×0.10 + latency×0.10`. Cal Fire: serverless=0.895 wins. Full formula in PROJECT_SPEC §22f.
-- **Biggest gap vs Presidio**: Serverless never evaluated. Clarifier writes "Kubernetes" in enriched_input → profiler maps to CONTAINER → sizer prices EKS. No path evaluates Lambda/DynamoDB. Fix order: P15b (SERVERLESS enum) → P15a (architecture_selector) → P15c (profiler decomposition) → P15d (Router) → P15e (Validator) → P15f (Session) → P15h (graph refactor) → P15i (RFP alternatives).
+- **Architecture Selector** (`src/engines/architecture_selector.py`): Evaluates **4 options** — managed-serverless (Lambda), **self-hosted-serverless (Knative/KEDA on K8s)**, containers (EKS), hybrid. Cost score uses REAL pricing from PricingService (not heuristics). Managed Lambda is expensive at sustained high RPS (>1K). Knative on K8s wins for Cal Fire at 40x spike (score 0.888). CRITICAL: old design scored managed serverless as winner (0.895) — WRONG because cost score was a heuristic 1.0. Real cost at 50K avg users, Lambda = ~$14K/mo; Knative K8s = ~$1.8K/mo. Full updated design in PROJECT_SPEC §22f.
+- **Biggest gap vs Presidio**: Serverless never evaluated, and when evaluated must distinguish managed (Lambda) vs self-hosted (Knative on K8s). Clarifier writes "Kubernetes" in enriched_input → profiler maps to CONTAINER → sizer prices EKS. No path evaluates Lambda or Knative. Fix order: P15b (SERVERLESS enum + both pricing paths) → P15a (architecture_selector with 4 options + real pricing) → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j.
 
 ### Credentials & Environment
 - **AWS STS**: Temporary creds (`ASIA` prefix) expire. Run `aws sso login` → update `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`. Bedrock is DENIED (IAM policy). AWS used only for Pricing API.
