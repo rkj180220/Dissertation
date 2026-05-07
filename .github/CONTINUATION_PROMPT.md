@@ -1,6 +1,6 @@
 # Cloud Orchestrator IDSS — Continuation Prompt
 
-> **Last Updated**: 8 May 2026 (Router Agent + Validator Agent + Session Persistence designed. P15 table expanded: P15d = Router Agent, P15e = Validator Agent, P15f = LangGraph SqliteSaver session persistence, P15g = streaming workloads, P15h = graph+API refactor, P15i = RFP Architecture Alternatives section. Build order updated. See PROJECT_SPEC §22 for full design with scoring formula and graph topology.)
+> **Last Updated**: 9 May 2026 (Architecture selector redesigned — unbiased 4-option scoring with cost crossover formula; managed Lambda CAN win at low avg RPS; P16f IaC generation removed; P16g renamed P16f.)
 
 ---
 
@@ -182,7 +182,7 @@ Full design in PROJECT_SPEC §21 (gap analysis) and §22 (Router/Validator/Sessi
 
 | ID | Feature | Component(s) | Description | Priority |
 |----|---------|-------------|-------------|----------|
-| **P15a** | Architecture alternatives engine | `src/engines/architecture_selector.py` (NEW) | Score **4 options**: managed-serverless (Lambda), **self-hosted-serverless (Knative/KEDA on K8s)**, containers (EKS), hybrid. Uses **real pricing from sizer** for cost scores — not heuristics. Cal Fire winner: self-hosted-serverless (0.888) not Lambda. | 🔴 Critical |
+| **P15a** | Architecture alternatives engine | `src/engines/architecture_selector.py` (NEW) | Score **4 options**: managed-serverless (Lambda), **self-hosted-serverless (Knative/KEDA)**, containers (EKS), hybrid. **Unbiased**: managed Lambda wins at low avg RPS (< ~300 RPS crossover); Knative wins at sustained high RPS. Uses REAL pricing for cost scores — 3 signal groups: traffic pattern (burst ratio + cost crossover), workload characteristics (latency, stateful), compliance. | 🔴 Critical |
 | **P15b** | Serverless pricing path | `src/models/cloud_resource.py` + `src/agents/sizer.py` | Add `SERVERLESS` to `ServiceCategory`; add Lambda/DynamoDB pricing path; add Knative self-hosted path (reuses K8s node pricing) | 🔴 Critical |
 | **P15c** | Profiler microservice decomposition | `src/agents/profiler.py` | Decompose `enriched_input` into 5-8 individual microservices so bin-packing works with multiple inputs | 🔴 Critical |
 | **P15d** | **Router Agent** (NEW) | `src/agents/router.py` (NEW) | LLM intent router at turn>=2. Classifies: `new_request / amendment / validate / answer / clarify`. Amendment path skips Clarifier. | 🔴 Critical |
@@ -204,8 +204,7 @@ Full design in PROJECT_SPEC §21 (gap analysis) and §22 (Router/Validator/Sessi
 | **P16c** | RFP compliance verification | Post-generation LLM pass against StateRAMP Moderate control list. Outputs Compliance Gap Analysis appendix in RFP. | 🟠 High |
 | **P16d** | Multi-scenario benchmark script | Run Cal Fire + healthcare + e-commerce through full pipeline. Compare vs. reference architectures. Dissertation evaluation chapter data. | 🟠 High |
 | **P16e** | Architecture radar chart (dashboard) | React component: 4 options x 5 WAF axes as spider chart. Makes the comparison visual and tangible. | 🟡 Medium |
-| **P16f** | IaC appendix in RFP | For winning architecture, generate Terraform resource stubs. SKU names from sizer already available. | 🟡 Medium |
-| **P16g** | User feedback capture | 1-5 star rating after RFP generated, logged to LangFuse. Dissertation accuracy reporting. | 🟡 Medium |
+| **P16f** | User feedback capture | 1-5 star rating after RFP generated, logged to LangFuse. Dissertation accuracy reporting. | 🟡 Medium |
 
 ### Next Immediate Task
 
@@ -269,10 +268,10 @@ cd dashboard && npm run build
 
 ### P15 Design (8 May 2026)
 - **Router Agent** (`src/agents/router.py`): LLM intent classifier at turn≥2 entry. Classifies: `new_request|amendment|validate|answer|clarify`. Amendment path skips Clarifier, runs Profiler(delta)→Sizer→FinOps→Validator→RFP Writer. Entry conditional: if `state.get("rfp_document")` → router else → clarifier. Full design in PROJECT_SPEC §22b.
-- **Validator Agent** (`src/agents/validator.py`): Scores architecture alternatives (serverless=0.895 vs containers=0.670 for Cal Fire's 40× spike ratio). Also checks sizing adequacy, budget fit, WAF compliance. Runs after FinOps every pipeline. Full design in PROJECT_SPEC §22c.
+- **Validator Agent** (`src/agents/validator.py`): Calls architecture_selector for all 4 options, validates sizing adequacy, budget fit, WAF compliance. Runs after FinOps every pipeline. Full design in PROJECT_SPEC §22c.
 - **Session Persistence** (`src/services/session_store.py`): `langgraph-checkpoint-sqlite` → `SqliteSaver`. `graph.compile(checkpointer=checkpointer)`. Thread ID = `session_id`. CRITICAL: current `orchestration.py` deletes `_clarify_sessions[request_id]` on `status=ready` — must NOT do this. Full design in PROJECT_SPEC §22d.
-- **Architecture Selector** (`src/engines/architecture_selector.py`): Evaluates **4 options** — managed-serverless (Lambda), **self-hosted-serverless (Knative/KEDA on K8s)**, containers (EKS), hybrid. Cost score uses REAL pricing from PricingService (not heuristics). Managed Lambda is expensive at sustained high RPS (>1K). Knative on K8s wins for Cal Fire at 40x spike (score 0.888). CRITICAL: old design scored managed serverless as winner (0.895) — WRONG because cost score was a heuristic 1.0. Real cost at 50K avg users, Lambda = ~$14K/mo; Knative K8s = ~$1.8K/mo. Full updated design in PROJECT_SPEC §22f.
-- **Biggest gap vs Presidio**: Serverless never evaluated, and when evaluated must distinguish managed (Lambda) vs self-hosted (Knative on K8s). Clarifier writes "Kubernetes" in enriched_input → profiler maps to CONTAINER → sizer prices EKS. No path evaluates Lambda or Knative. Fix order: P15b (SERVERLESS enum + both pricing paths) → P15a (architecture_selector with 4 options + real pricing) → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j.
+- **Architecture Selector** (`src/engines/architecture_selector.py`): Evaluates **4 options** — managed-serverless (Lambda), **self-hosted-serverless (Knative/KEDA on K8s)**, containers (EKS), hybrid. **Completely unbiased** — managed Lambda CAN and SHOULD win when avg RPS is low (e.g. tax portal at 40 avg RPS: Lambda = $21/mo vs Knative = $2,190/mo). Self-hosted serverless wins at sustained high throughput (Cal Fire at 800 avg RPS: Lambda = $14K/mo vs Knative = $1.8K/mo). Cost crossover ≈ **300–500 avg RPS** — computed per-workload. Score uses REAL pricing from PricingService (not heuristics). Three signal groups: traffic pattern, workload characteristics, compliance. Dynamic WAF weights (P15j). Full design in PROJECT_SPEC §22f.
+- **Biggest gap vs Presidio**: Serverless never evaluated. Clarifier writes "Kubernetes" in enriched_input → profiler maps to CONTAINER → sizer prices EKS only. Fix order: P15b (SERVERLESS enum + both pricing paths) → P15a (architecture_selector with 4 options + real cost crossover) → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j.
 
 ### Credentials & Environment
 - **AWS STS**: Temporary creds (`ASIA` prefix) expire. Run `aws sso login` → update `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`. Bedrock is DENIED (IAM policy). AWS used only for Pricing API.
