@@ -3,7 +3,7 @@
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
 > **Additional Examiner**: Santhosh Kirubakaran
-> **Last Updated**: 9 May 2026 (Architecture selector redesigned — unbiased 4-option scoring with cost crossover formula; managed Lambda CAN win at low avg RPS; P16f IaC generation removed; P16g renamed P16f. See §22f for full 3-signal-group scoring design with Tax Portal counterexample.)
+> **Last Updated**: 9 May 2026 (Router+Orchestrator with ExecutionPlan §22b; Pricing Comparison Validator P15k §22h; Principal Architect Reasoning §22g; 5-check Validator Agent §22c; P15 build order: P15b→P15a→P15k→P15c→P15g→P15d→P15e→P15f→P15h→P15i→P15j.)
 > **LLM**: Gemini 2.5 Pro (`gemini-2.5-pro`) via Google Cloud Vertex AI (`dissertation-rj`, `us-central1`) using ADC
 
 ---
@@ -14,12 +14,13 @@
 User (React chat) → FastAPI (SSE) → LangGraph Orchestrator
                                          │
                   ┌──────────────────────┤
-                  │    Router Agent      │ ← NEW (P15d). LLM-based intent router.
-                  │  (entry on turn≥2)   │   Reads OrchestratorState + new input.
-                  └──────┬──────┬────────┘   Decides which path to take.
-          new_request ───┘      └─── amendment / validate / answer
-                  │
-                  ▼
+                  │  Router+Orchestrator │ ← NEW (P15d). LLM-based intent router
+                  │      Agent           │   AND execution planner. Reads full
+                  │  (entry on turn≥2)   │   OrchestratorState + new input.
+                  └──────┬──────┬────────┘   Produces ExecutionPlan: which agents
+          new_request ───┘      └─── amendment / validate / answer / clarify       to run, scope (full vs delta),
+                  │                                                                  which components to reprocess,
+                  ▼                                                                  which RFP sections to amend.
                   ┌──────────────────────┐
                   │    Clarifier Agent   │ ← Multi-turn requirement refinement
                   │  (conditional loop)  │   Only invoked for new_request or
@@ -28,8 +29,8 @@ User (React chat) → FastAPI (SSE) → LangGraph Orchestrator
                              ▼
                   ┌──────────────────────┐
                   │    Profiler Agent    │ ← Analyzes workload → WorkloadProfile
-                  │  (5-8 microservices) │   (P15c: decomposes into named services)
-                  └──────────┬───────────┘
+                  │  (5-8 microservices) │   Reads ExecutionPlan.scope_components
+                  └──────────┬───────────┘   (P15c: decomposes into named services)
                              ▼
                   ┌──────────────────────┐
                   │     Sizer Agent      │ ← PricingService → scoring → bin-packing
@@ -41,18 +42,19 @@ User (React chat) → FastAPI (SSE) → LangGraph Orchestrator
                   └──────────┬───────────┘
                              ▼
                   ┌──────────────────────┐
-                  │   Validator Agent    │ ← NEW (P15e). Architecture scoring +
-                  │  (architecture eval) │   sizing validation + budget fit +
-                  └──────────┬───────────┘   WAF compliance check.
-                             ▼
+                  │   Validator Agent    │ ← NEW (P15e). 5-check quality gate:
+                  │  (quality gate)      │   [0] Pricing data integrity (P15k engine)
+                  └──────────┬───────────┘   [1] Architecture correctness (P15a engine)
+                             │               [2] Sizing adequacy  [3] Budget fit
+                             ▼               [4] WAF compliance
                   ┌──────────────────────┐
                   │   RFP Writer Agent   │ ← Generates procurement document
                   │  (with alternatives) │   (P15i: Architecture Alternatives §)
                   └──────────────────────┘
 
   Session State (P15f): LangGraph SqliteSaver checkpointing — thread_id=session_id
-  persists OrchestratorState across requests. Router reads prior state on turn≥2.
-  Amendment path: Router → Profiler(delta) → Sizer → FinOps → Validator → RFP Writer
+  persists OrchestratorState across requests. Router+Orchestrator reads prior state on turn≥2.
+  Amendment path: Router+Orch → Profiler(delta) → Sizer → FinOps → Validator → RFP Writer(amend)
 
   All agents share OrchestratorState (LangGraph TypedDict):
   ┌─────────────┐    ┌──────────────┐    ┌─────────────────────────┐
@@ -227,8 +229,8 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 | `sizer.py` | ✅ | **~1250 lines.** Category-aware SKU selection: scored (COMPUTE/AI_ML), bin-packed (CONTAINER), cheapest (others). Container vCPU guard, DATABASE hourly filter, ElastiCache routing, CDN fixed estimate, K8s/LB fixed costs. `run_sizer_node`. |
 | `finops.py` | ✅ | **~900 lines.** RI/spot pricing queries with industry-standard fallbacks. TCO 1yr/3yr/5yr. Savings opportunities. `run_finops_node`. |
 | `rfp_writer.py` | ✅ | **~2100 lines.** ~25,000-char enterprise Markdown RFP. Gov/greenfield/mobile detection. Managed services table, requirements traceability (F-xx/C-xx/NFR-xx), WCAG 2.2 AA + StateRAMP tables, 16-section ToC. `run_rfp_writer_node`. |
-| `router.py` | ❌ | **P15d — NOT YET BUILT.** LLM intent classifier. Reads new user input + current state. Emits `RouterDecision` (intent: `new_request` \| `amendment` \| `validate` \| `answer` \| `clarify`). Entry point for Turn ≥ 2. See §22b. |
-| `validator.py` | ❌ | **P15e — NOT YET BUILT.** Architecture quality gate. 4 checks: (1) architecture_selector score, (2) sizing adequacy, (3) budget fit, (4) WAF compliance. Writes `validation_report` + `architecture_alternatives` to state. Auto-runs after FinOps. See §22c. |
+| `router.py` | ❌ | **P15d — NOT YET BUILT.** LLM **Router+Orchestrator Agent**. Reads new user input + full state. Classifies intent AND produces `ExecutionPlan` (agents to run, scope_components, rfp_amendment_sections, amendment_delta). Entry point for Turn ≥ 2. Uses Principal Architect Reasoning (§22g). See §22b. |
+| `validator.py` | ❌ | **P15e — NOT YET BUILT.** Architecture quality gate. **5 checks**: [0] Pricing data integrity (calls `pricing_validator.py`), [1] architecture_selector score, [2] sizing adequacy, [3] budget fit, [4] WAF compliance. Uses Principal Architect Reasoning. Writes `validation_report` + `architecture_alternatives` to state. See §22c. |
 | `__init__.py` | ✅ | Exists (empty re-export shell). |
 
 ---
@@ -244,7 +246,8 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 | `bin_packing.py` | ✅ | **313 lines.** FFD + BFD algorithms. `NormalizedPriceItem` node SKUs + `WorkloadRequirement` container workloads. **Validated: 60/60 checks.** |
 | `scoring.py` | ✅ | **182 lines.** Weighted multi-criteria scorer (cost 40%, CPU fit 25%, memory fit 25%, generation 10%). **Validated: 60/60 checks.** |
 | `waf_compliance.py` | ✅ | **303 lines.** Rule-based WAF pillar checks. Filters by `ServiceCategory`. **Validated: 60/60 checks.** |
-| `architecture_selector.py` | ❌ | **P15a — NOT YET BUILT.** Scores architecture patterns (serverless, containers, VMs, hybrid) against 5 weighted factors: reliability×0.30, cost×0.25, scale×0.25, compliance×0.10, latency×0.10. Returns ranked `ArchitectureRecommendation` list. Cal Fire example: serverless=0.895 > hybrid=0.793 > containers=0.670. Used by Validator Agent. See §22a. |
+| `architecture_selector.py` | ❌ | **P15a — NOT YET BUILT.** Unbiased 4-option scorer (managed-serverless, self-hosted-serverless, containers, hybrid). 3 signal groups: traffic pattern (cost crossover), workload characteristics, compliance. Real pricing from PricingService. Returns ranked `ArchitectureRecommendation`. Used by Validator Agent. See §22f. |
+| `pricing_validator.py` | ❌ | **P15k — NOT YET BUILT.** 7-check apples-to-apples pricing comparison validator. Pure algorithmic — no LLM. Catches size mismatches, wrong SKU families, price anomalies before FinOps picks a vendor. Returns `PricingValidationResult`. See §22h. |
 
 ---
 
@@ -937,15 +940,16 @@ Reference: `docs/Presidio_Response_Cal Fire_Draft 10.7.25 (2) (1).html` (parsed 
 | **P15a** | `src/engines/` | New `architecture_selector.py`: score **4 options** (managed-serverless, self-hosted-serverless, containers, hybrid) using real sizer pricing + WAF scoring. Self-hosted serverless = K8s+Knative/KEDA with K8s node cost model (not per-invocation). Cost score uses actual monthly estimates from pricing API, not heuristics. | 🔴 Critical | ❌ Not started |
 | **P15b** | `src/models/cloud_resource.py` + `sizer.py` | Add `SERVERLESS` to `ServiceCategory`; add Lambda/DynamoDB pricing path to sizer; add Knative/KEDA self-hosted path (re-uses K8s node pricing from CONTAINER path) | 🔴 Critical | ❌ Not started |
 | **P15c** | `src/agents/profiler.py` | Decompose enriched_input into 5-8 individual microservices (CONTAINER workloads) so bin-packing works with multiple inputs | 🔴 Critical | ❌ Not started |
-| **P15d** | `src/agents/router.py` (NEW) | LLM Router Agent: reads state + new input, classifies intent (`new_request\|amendment\|validate\|answer`), routes to correct graph path | 🔴 Critical | ❌ Not started |
-| **P15e** | `src/agents/validator.py` (NEW) | Validator Agent: architecture scoring (calls architecture_selector), sizing validation, budget fit, WAF check. Auto-runs after FinOps; also on-demand via Router | 🔴 Critical | ❌ Not started |
+| **P15d** | `src/agents/router.py` (NEW) | **Router+Orchestrator Agent**: LLM intent classifier AND execution planner. Reads state + new input. Emits `ExecutionPlan`: intent type, agents to run, scope (full vs delta), affected components by name, RFP sections to amend. Downstream agents read `execution_plan` to understand their scope. See §22b. | 🔴 Critical | ❌ Not started |
+| **P15e** | `src/agents/validator.py` (NEW) | **Validator Agent** (5 checks): [0] Pricing data integrity via `pricing_validator.py` (apples-to-apples SKU comparison check), [1] Architecture correctness (architecture_selector), [2] Sizing adequacy, [3] Budget fit, [4] WAF compliance. Auto-runs after FinOps. On-demand via Router. See §22c. | 🔴 Critical | ❌ Not started |
 | **P15f** | `src/services/session_store.py` (NEW) | Session persistence: LangGraph `SqliteSaver` checkpointing (`data/sessions.db`). Thread ID = session_id. Cross-request state continuity. | 🔴 Critical | ❌ Not started |
 | **P15g** | `src/agents/profiler.py` | Add streaming (Kinesis), message queue (SQS), analytics (Redshift) workload detection from enriched_input keywords | 🟠 High | ❌ Not started |
-| **P15h** | `graph.py` + `orchestration.py` + `state.py` | Update graph (router node at START, validator node before rfp_writer, conditional edges, LangGraph checkpointing). Add `session_id` to request/response. | 🔴 Critical | ❌ Not started |
-| **P15i** | `src/agents/rfp_writer.py` | Add "Architecture Alternatives Analysis" section (all 4 options: Managed Serverless / Self-Hosted Serverless / Containers / Hybrid) with WAF scores + REAL costs from Validator output | 🔴 Critical | ❌ Not started |
+| **P15h** | `graph.py` + `orchestration.py` + `state.py` | Update graph (router+orchestrator node at START, validator node before rfp_writer, conditional edges, LangGraph checkpointing). Add `session_id` + `execution_plan` to state. Add `session_id` to API request/response. | 🔴 Critical | ❌ Not started |
+| **P15i** | `src/agents/rfp_writer.py` | Add "Architecture Alternatives Analysis" section (all 4 options) with WAF scores + REAL costs from Validator output. Add "Pricing Data Caveats" note if pricing_validation has errors. | 🔴 Critical | ❌ Not started |
 | **P15j** | `src/engines/architecture_selector.py` | Dynamic WAF weight profiles: Clarifier detects user priority ("cost is #1") → adjusts scoring weights (cost_weight=0.40, reliability=0.20, etc.) at runtime | 🟠 High | ❌ Not started |
+| **P15k** | `src/engines/pricing_validator.py` (NEW) | **Pricing Comparison Validator**: 7-check engine ensuring cross-provider SKU comparisons are valid before FinOps picks a vendor. Checks: size adequacy, tier consistency, price anomaly (>5× variance), SKU staleness, category match, provider parity (all providers represented), memory:vCPU ratio. See §22h. | 🔴 Critical | ❌ Not started |
 
-**Build order for P15**: P15b → P15a → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j
+**Build order for P15**: P15b → P15a → P15k → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j
 
 ---
 
@@ -968,15 +972,19 @@ Features needed to reach dissertation-grade completeness. Not bugs — architect
 
 ### 22a. Problem Statement
 
-Two major architectural gaps identified from user testing and Presidio comparison:
+Three major architectural gaps identified from user testing and Presidio comparison:
 
 1. **No intelligent routing**: every user message (including follow-ups like "add SSO integration") triggers a full 5-agent pipeline from scratch. The system re-clarifies requirements already gathered, loses prior context, and produces a replacement RFP instead of an amendment.
 
 2. **No architecture validation**: the system never checks whether its own recommendation is correct. Lambda+DynamoDB was objectively the better choice for 50K→2M users, but the system blindly produces an EKS recommendation because the clarifier LLM wrote "Kubernetes" in enriched_input.
 
-### 22b. Router Agent Design (`src/agents/router.py`) — NEW FILE
+3. **No pricing comparison integrity check**: when the Sizer returns SKU results for cross-provider comparison, nothing verifies the SKUs are equivalent in size/tier. An undersized Azure SKU may appear cheaper than a correctly-sized AWS SKU, causing FinOps to incorrectly recommend Azure — not because it's cheaper, but because the comparison was invalid.
 
-The Router Agent is an LLM-powered intent classifier. It sits at the **entry point of the graph** for all requests where a prior session exists.
+### 22b. Router+Orchestrator Agent Design (`src/agents/router.py`) — NEW FILE
+
+The Router+Orchestrator Agent is an LLM-powered **intent classifier AND execution planner**. It sits at the entry point of the graph for all requests where a prior session exists. It does two things in a single LLM call: (1) classify what the user wants, and (2) produce a concrete `ExecutionPlan` that tells every downstream agent exactly what to run and how.
+
+**Why not just a simple router?** A pure intent classifier says "this is an amendment." An orchestrator says "this is an amendment — specifically, add a Redis caching layer. Profiler needs to add one new CACHE component. Sizer needs to price only that component. FinOps re-runs full comparison. Validator runs. RFP Writer amends §4 Architecture and §7 Cost." That specificity prevents agents from doing unnecessary work or missing the actual scope of change.
 
 **Trigger condition**: present when `session_id` is provided AND `rfp_document` is non-empty in the restored state (i.e., this is turn ≥ 2 of a session). Turn 1 (no session) goes directly to Clarifier.
 
@@ -985,61 +993,97 @@ The Router Agent is an LLM-powered intent classifier. It sits at the **entry poi
 | Route | Trigger Pattern | Graph Path |
 |-------|----------------|-----------|
 | `new_request` | No prior session / explicit restart | START → Clarifier → Profiler → Sizer → FinOps → Validator → RFP Writer |
-| `amendment` | "add X", "change Y to Z", "what if we add…", "include [feature]", "update the [section]" | START → Router → Profiler(delta) → Sizer → FinOps → Validator → RFP Writer(amend) |
-| `validate` | "is this the right architecture?", "why EKS not Lambda?", "validate the architecture", "check if this is correct" | START → Router → Validator → END |
-| `answer` | "what does [term] mean?", "explain [section]", "why was X chosen?" — can be answered from state without pipeline | START → Router → END (router writes direct answer to messages) |
-| `clarify` | Ambiguous follow-up, missing context | START → Router → Clarifier(amendment-mode) → ... |
+| `amendment` | "add X", "change Y to Z", "what if we add…", "include [feature]", "update the [section]" | START → Router+Orch → Profiler(delta) → Sizer → FinOps → Validator → RFP Writer(amend) |
+| `validate` | "is this the right architecture?", "why EKS not Lambda?", "validate the architecture", "check if this is correct" | START → Router+Orch → Validator → END |
+| `answer` | "what does [term] mean?", "explain [section]", "why was X chosen?" — can be answered from state without pipeline | START → Router+Orch → END (router writes direct answer to messages) |
+| `clarify` | Ambiguous follow-up, missing context | START → Router+Orch → Clarifier(amendment-mode) → ... |
 
-**LLM prompt structure**:
+**LLM prompt structure** (uses Principal Architect Reasoning — see §22g):
 ```
-SYSTEM: You are a cloud architecture routing agent. You have access to the current
-conversation state (prior RFP exists) and the user's new message. Classify intent.
+SYSTEM: You are a principal cloud architect acting as an intelligent orchestration agent.
+You have the full conversation history and current state. Your job is to:
+(1) Understand what the user ACTUALLY wants (not just surface intent)
+(2) Identify the MINIMUM set of agents that need to run
+(3) Identify the SPECIFIC components that changed (not "everything")
+(4) Identify which RFP sections are affected
+
+Think step by step:
+STEP 1 — UNDERSTAND: What is the user asking for? What specifically changed?
+STEP 2 — SCOPE: Which workload components are affected? (list them by name)
+STEP 3 — PLAN: Which agents need to run, and in what mode (full vs. delta)?
+STEP 4 — IMPACT: Which RFP sections need updating?
+STEP 5 — CLASSIFY: What is the route type?
 
 STATE_SUMMARY: {rfp_excerpt + workload_summary + prior_messages[-3:]}
 USER_INPUT: {new_message}
 
-Respond with exactly one line:
+Respond in this exact format:
 ROUTE: <new_request|amendment|validate|answer|clarify>
-DELTA: <one-sentence summary of what changed, or "N/A">
 CONFIDENCE: <high|medium|low>
-DIRECT_ANSWER: <if ROUTE=answer, write the answer here; else "N/A">
+CHANGED_COMPONENTS: <comma-separated component names, or "ALL" or "NONE">
+AGENTS_TO_RUN: <comma-separated: profiler,sizer,finops,validator,rfp_writer — only those needed>
+SCOPE: <full|delta_only>
+RFP_SECTIONS: <comma-separated section numbers that need updating, e.g. "§4,§7,§9">
+AMENDMENT_DELTA: <one-sentence description of what changed>
+DIRECT_ANSWER: <if ROUTE=answer, write the full answer here; else "N/A">
 ```
 
-**RouterDecision model** (added to `OrchestratorState`):
+**`ExecutionPlan` model** (added to `OrchestratorState`):
 ```python
-routing_decision: str  # "new_request" | "amendment" | "validate" | "answer" | "clarify"
-amendment_instructions: str  # delta description for amendment mode
-pipeline_mode: str  # "full" | "amendment" | "validation" | "query"
-turn_number: int  # increments per user message within a session
+class ExecutionPlan(TypedDict):
+    intent: str              # "new_request" | "amendment" | "validate" | "answer" | "clarify"
+    pipeline_mode: str       # "full" | "amendment" | "validation" | "query"
+    agents_to_run: list[str] # e.g., ["profiler", "sizer", "finops", "validator", "rfp_writer"]
+    scope: str               # "full" | "delta_only"
+    scope_components: list[str]   # specific component names to reprocess
+    rfp_amendment_sections: list[str]   # e.g., ["§4", "§7"]
+    amendment_delta: str     # human-readable description of what changed
+    confidence: str          # "high" | "medium" | "low"
+    turn_number: int         # increments per user message within a session
 ```
 
-**Key design rule**: the Router is lightweight — it reads state and makes a routing decision in one LLM call. It does NOT execute any business logic itself.
+**State fields** (added to `OrchestratorState`):
+```python
+execution_plan: ExecutionPlan    # written by Router+Orchestrator, read by all agents
+routing_decision: str            # mirrors execution_plan.intent for quick access
+pipeline_mode: str               # mirrors execution_plan.pipeline_mode
+turn_number: int                 # mirrors execution_plan.turn_number
+```
+
+**Key design rule**: The Router+Orchestrator is the ONLY agent that decides what runs. Downstream agents read `state["execution_plan"]` to understand their scope — they do NOT make routing decisions themselves. For `scope="delta_only"`, Profiler only re-profiles components listed in `scope_components`; Sizer only re-prices those components; FinOps runs a full comparison (always needed for cross-provider); RFP Writer only regenerates sections in `rfp_amendment_sections`.
 
 ---
 
 ### 22c. Validator Agent Design (`src/agents/validator.py`) — NEW FILE
 
-The Validator Agent runs **after FinOps** in every pipeline and can also be triggered **on-demand** via the Router for `validate` routes. It is the system's architecture quality gate.
+The Validator Agent runs **after FinOps** in every pipeline and can also be triggered **on-demand** via the Router+Orchestrator for `validate` routes. It is the system's architecture quality gate. All LLM reasoning in this agent uses the **Principal Architect Reasoning Pattern** (§22g).
 
-**What it validates** (4 checks):
+**What it validates** (5 checks, in order):
 
-1. **Architecture Correctness** (calls `architecture_selector.py`):
-   - Scores Serverless (Lambda+DynamoDB), Container (EKS+RDS), Hybrid for the given `WorkloadProfile`
-   - Score factors: `WAF_reliability × WAF_cost_opt × scale_fit × compliance_fit`
-   - If the selected architecture is NOT the top-scored option, writes a warning with reasoning
-   - Example: for 2M concurrent users, Serverless scores 0.92 vs Container 0.67 → validator flags this
+**Check 0: Pricing Data Integrity** (calls `pricing_validator.py` — see §22h):
+   - Validates that the `sized_results` from Sizer represent an apples-to-apples cross-provider comparison
+   - 7 sub-checks: size adequacy, tier consistency, price anomaly, SKU staleness, category match, provider parity, memory:vCPU ratio
+   - If any `severity="error"` warnings exist, logs prominently and writes to `validation_report["pricing_validation"]`
+   - Does NOT block the pipeline — flags are surfaced in the RFP but analysis continues
+   - **Why Check 0?** Downstream architecture scoring and FinOps vendor selection are meaningless if the underlying pricing data is invalid (e.g., FinOps recommends Azure because an undersized t2.micro was matched instead of the correct r6i.large)
 
-2. **Sizing Adequacy**:
-   - Verifies that each selected SKU meets the workload's resource requirements (memory_gb, vcpus)
-   - Re-runs `_filter_database_candidates` logic as a validation pass
-   - Flags any SKU that is undersized by > 20%
+**Check 1: Architecture Correctness** (calls `architecture_selector.py`):
+   - Uses Principal Architect Reasoning to score all 4 options (managed-serverless, self-hosted-serverless, containers, hybrid)
+   - Cost scores use REAL pricing from the already-priced `sized_results`
+   - If the system's current architecture (from clarifier's enriched_input) is NOT the top-scored option, writes a warning
+   - The LLM step in architecture_selector explains WHY each option scores as it does — not just numbers
 
-3. **Budget Fit**:
+**Check 2: Sizing Adequacy**:
+   - Verifies each selected SKU meets the workload's resource requirements (memory_gb, vcpus, storage_gb)
+   - Tolerance: selected must be ≥ required × 0.80 (within 20%)
+   - Flags any SKU that is undersized. If DB undersized — this is a hard failure pattern (P14 fix history)
+
+**Check 3: Budget Fit**:
    - Compares `sum(monthly_costs)` against `workload_request.budget_monthly_usd`
    - If over budget: flags excess percentage and suggests optimization paths (spot, RI, downgrade)
-   - If under budget by >50%: flags as potentially under-provisioned
+   - If under budget by > 50%: flags as potentially under-provisioned (worth reviewing)
 
-4. **WAF Compliance** (calls `waf_compliance.py`):
+**Check 4: WAF Compliance** (calls `waf_compliance.py`):
    - Runs `evaluate_compliance()` on the current `WorkloadRequest`
    - Appends compliance report to `validation_report`
 
@@ -1052,30 +1096,40 @@ architecture_alternatives: list[dict]  # ranked options from architecture_select
 ```python
 # validation_report structure
 {
-  "architecture_validation": {
-    "selected": "containers",
-    "recommended": "serverless",
-    "ranked": [
-      {"option": "serverless", "score": 0.92, "monthly_cost_estimate": 4200, "rationale": "..."},
-      {"option": "containers", "score": 0.67, "monthly_cost_estimate": 12800, "rationale": "..."},
-      {"option": "hybrid", "score": 0.78, "monthly_cost_estimate": 7100, "rationale": "..."}
-    ],
-    "warning": "Serverless is recommended for 2M concurrent user workloads — consider revising"
+  "pricing_validation": {   # Check 0 — NEW
+    "is_valid": True,
+    "warnings": [
+      {"workload": "Cache Layer", "type": "undersized", "severity": "error",
+       "description": "Selected cache.t3.micro (13.1 GB) < required 16 GB",
+       "recommended_action": "Re-run sizer with memory_gb=16 minimum filter"}
+    ]
   },
-  "sizing_validation": [
-    {"workload": "PostgreSQL Database", "status": "pass", "selected_memory_gb": 16, "required_memory_gb": 12},
-    {"workload": "Cache Layer", "status": "warning", "selected_memory_gb": 13.1, "required_memory_gb": 12}
+  "architecture_validation": {   # Check 1
+    "selected": "containers",
+    "recommended": "self_hosted_serverless",
+    "ranked": [
+      {"option": "self_hosted_serverless", "score": 0.888, "monthly_cost_estimate": 1800,
+       "rationale": "800 avg RPS is 2.3× above cost crossover. Knative KEDA eliminates cold start risk for 99.99% SLA."},
+      {"option": "containers", "score": 0.560, "monthly_cost_estimate": 12000, "rationale": "..."},
+      {"option": "hybrid", "score": 0.776, "monthly_cost_estimate": 6000, "rationale": "..."},
+      {"option": "managed_serverless", "score": 0.655, "monthly_cost_estimate": 14000, "rationale": "..."}
+    ],
+    "warning": "Self-hosted serverless (Knative) recommended. Lambda is 7.8× more expensive at 800 avg RPS."
+  },
+  "sizing_validation": [   # Check 2
+    {"workload": "PostgreSQL Database", "status": "pass", "selected_memory_gb": 64, "required_memory_gb": 48},
+    {"workload": "Cache Layer", "status": "fail", "selected_memory_gb": 13.1, "required_memory_gb": 16}
   ],
-  "budget_validation": {
+  "budget_validation": {   # Check 3
     "monthly_total": 916.0, "budget_monthly": 266666.0,
     "utilization_pct": 0.34, "status": "pass",
     "note": "Well within budget — consider higher availability tier"
   },
-  "waf_report": {...}  # ComplianceReport from waf_compliance.py
+  "waf_report": {...}   # Check 4 — ComplianceReport from waf_compliance.py
 }
 ```
 
-**Integration with RFP Writer**: `_build_architecture_alternatives_section()` reads `validation_report["architecture_validation"]["ranked"]` to produce Option A/B/C comparison table.
+**Integration with RFP Writer**: `_build_architecture_alternatives_section()` reads `validation_report["architecture_validation"]["ranked"]` to produce Option A/B/C comparison table. If `pricing_validation.warnings` has errors, RFP Writer adds a "Pricing Data Caveats" note in the cost section.
 
 ---
 
@@ -1097,28 +1151,10 @@ class OrchestrationRequest(BaseModel):
 
 class OrchestrationResponse(BaseModel):
     ...
-    session_id: str  # NEW — always returned, client must persist and send back
-    route_taken: str  # NEW — "new_request" | "amendment" | "validate" | "answer"
-    turn_number: int  # NEW — increments per turn within session
-```
-
-**CRITICAL FIX**: Current code deletes `_clarify_sessions[request_id]` when `status=ready`. This must be preserved — the session must NOT be deleted. Instead, the enriched_input must be written to the LangGraph checkpoint so it's available on subsequent requests.
-
-**`create_initial_state()` update**:
-```python
-def create_initial_state(
-    user_input: str, project_name: str = "untitled", session_id: str | None = None
-) -> OrchestratorState:
-    return {
-        ...,
-        "session_id": session_id or str(uuid4()),
-        "routing_decision": "new_request",
-        "amendment_instructions": "",
-        "validation_report": {},
-        "architecture_alternatives": [],
-        "pipeline_mode": "full",
-        "turn_number": 1,
-    }
+    session_id: str        # NEW — always returned, client must persist and send back
+    route_taken: str       # NEW — "new_request" | "amendment" | "validate" | "answer"
+    turn_number: int       # NEW — increments per turn within session
+    execution_plan: dict   # NEW — full ExecutionPlan for debugging/observability
 ```
 
 **LangGraph wiring** (`src/orchestrator/graph.py`):
@@ -1165,17 +1201,44 @@ def _route_entry(state: OrchestratorState) -> str:
 
 ### 22e. Updated OrchestratorState Fields
 
-6 new fields added to `OrchestratorState` TypedDict (`src/orchestrator/state.py`):
+7 new fields added to `OrchestratorState` TypedDict (`src/orchestrator/state.py`):
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `session_id` | `str` | UUID — identifies the LangGraph thread. Persists across requests. |
-| `routing_decision` | `str` | Router's classification: `"new_request"` / `"amendment"` / `"validate"` / `"answer"` |
-| `amendment_instructions` | `str` | Delta description when `routing_decision == "amendment"` |
-| `validation_report` | `dict[str, Any]` | Validator Agent's full output (architecture scores, sizing, budget, WAF) |
-| `architecture_alternatives` | `list[dict]` | Ranked options from `architecture_selector.py` |
-| `pipeline_mode` | `str` | `"full"` / `"amendment"` / `"validation"` / `"query"` |
-| `turn_number` | `int` | Increments per user message within the session (reducer: `lambda a, b: b`) |
+| Field | Type | Reducer | Description |
+|-------|------|---------|-------------|
+| `session_id` | `str` | last-write | UUID — identifies the LangGraph thread. Persists across requests. |
+| `execution_plan` | `dict[str, Any]` | last-write | Full `ExecutionPlan` produced by Router+Orchestrator. Read by all downstream agents. |
+| `routing_decision` | `str` | last-write | Quick-access mirror of `execution_plan["intent"]`: `"new_request"` / `"amendment"` / `"validate"` / `"answer"` |
+| `pipeline_mode` | `str` | last-write | Mirror of `execution_plan["pipeline_mode"]`: `"full"` / `"amendment"` / `"validation"` / `"query"` |
+| `turn_number` | `int` | last-write | Increments per user message within the session |
+| `validation_report` | `dict[str, Any]` | last-write | Validator Agent's 5-check output (pricing integrity, architecture scores, sizing, budget, WAF) |
+| `architecture_alternatives` | `list[dict]` | last-write | Ranked options from `architecture_selector.py` (mirrors `validation_report["architecture_validation"]["ranked"]` for RFP Writer convenience) |
+
+**Updated `create_initial_state()`** (`src/orchestrator/state.py`):
+```python
+def create_initial_state(
+    user_input: str, project_name: str = "untitled", session_id: str | None = None
+) -> OrchestratorState:
+    return {
+        # ... existing fields unchanged ...
+        "session_id": session_id or str(uuid4()),
+        "execution_plan": {
+            "intent": "new_request",
+            "pipeline_mode": "full",
+            "agents_to_run": ["clarifier", "profiler", "sizer", "finops", "validator", "rfp_writer"],
+            "scope": "full",
+            "scope_components": [],
+            "rfp_amendment_sections": [],
+            "amendment_delta": "",
+            "confidence": "high",
+            "turn_number": 1,
+        },
+        "routing_decision": "new_request",
+        "pipeline_mode": "full",
+        "turn_number": 1,
+        "validation_report": {},
+        "architecture_alternatives": [],
+    }
+```
 
 ---
 
@@ -1334,3 +1397,111 @@ class ArchitectureRecommendation(BaseModel):
     warning: str | None                # If winner != what the LLM/clarifier initially assumed
 ```
 
+---
+
+### 22g. Principal Architect Reasoning Pattern (All LLM Agents)
+
+Every agent that invokes an LLM must simulate the thought process of a **super-experienced principal  someone who doesn't just answer the question asked, but dissects the problem layer by layer before committing to any output. Implemented as a structured Chain-of-Thought (CoT) prompt baked into each agent's system prompt.architect** 
+
+**Core Principle**: The agent reasons through the problem explicitly in a structured scratchpad before producing output. The scratchpad is included in the LangFuse trace (full explainability) but not surfaced to the user.
+
+**Standard Reasoning Template** (injected into every agent's system prompt):
+```
+You are a principal cloud architect with 20+ years of experience across AWS, Azure, and GCP.
+You have designed systems at every  from solo startup MVPs to Fortune 100 global platforms.scale 
+Before producing any output, reason through the problem using this framework:
+
+<architect_reasoning>
+STEP  UNDERSTAND THE PROBLEM1 
+  - What is the user ACTUALLY trying to achieve? (not just surface intent)
+  - What constraints are non-negotiable? (compliance, availability, budget, latency)
+  - What assumptions am I making that could be wrong?
+
+STEP  IDENTIFY THE RISKS2 
+  - What are the top 3 ways this architecture could fail in production?
+  - What scaling inflection points exist? (where does behavior change drastically?)
+  - What compliance or security traps are present?
+
+STEP  EVALUATE ALTERNATIVES3 
+  - What would I recommend if cost were unlimited?
+  - What would I recommend if cost were the only constraint?
+  - What is the simplest architecture that meets the requirements?
+
+STEP  CHALLENGE MY INITIAL ASSUMPTION4 
+  - Am I recommending this because it is genuinely best, or because it is familiar?
+  - If a junior architect proposed the opposite, what would be their best argument?
+  - What data or signals would change my recommendation?
+
+STEP  COMMIT WITH RATIONALE5 
+  - State the recommendation clearly
+  - Top 3 reasons it wins
+  - Top 2 trade-offs the customer must accept
+  - Trigger conditions that would change this recommendation
+</architect_reasoning>
+
+After completing your reasoning, produce the requested output.
+```
+
+**Per-agent application**:
+
+| Agent | Most relevant steps | Key forcing question |
+|-------|--------------------|-----------------------|
+| Clarifier | 1, 4 | "Is the user saying 'cloud-native' but actually describing a lift-and-shift?" |
+| Profiler | 1, 2, 4 | "Is this really stateless, or will it need sticky sessions at scale?" |
+| Sizer | 2, 3 | "Is this SKU sized for the p99 load, or just the average?" |
+| FinOps | 3, 4 | "Is Azure cheaper because it genuinely is, or because I compared different tiers?" |
+| Router+Orchestrator | 1, 4, 5 | "Is this an amendment, or a new request disguised as a follow-up?" |
+| Validator | 2, 3, 4 | "Would I stake my professional reputation on this recommendation?" |
+| Architecture Selector | 5 | "Is self-hosted serverless winning because of workload signals, or because I haven't priced it correctly?" |1
+| RFP Writer | 5 | "Does this RFP read like it was written by someone who actually built this system?" |
+
+**LangFuse observability**: the `<architect_reasoning>` scratchpad is captured as a `reasoning` span attribute in every LangFuse trace. Full explainability of every  a key dissertation differentiator.decision 
+
+---
+
+### 22h. Pricing Comparison Validator Engine (`src/engines/pricing_validator. NEW FILEpy`) 
+
+**Purpose**: Before FinOps picks a vendor based on cross-provider cost comparison, validate that the `sized_results` represent a genuine apples-to-apples comparison. A wrong SKU match (e.g., `cache.t3.micro` instead of `cache.r6g.xlarge` for a 16 GB Redis workload) causes FinOps to recommend the wrong  not because that vendor is cheaper, but because the comparison was invalid.vendor 
+
+**When it runs**: Called by Validator Agent as Check 0. Findings written to `validation_report["pricing_validation"]`. `severity="error"` findings surface in the RFP cost section as caveats.
+
+**7 Checks**:
+
+| Check ID | What It Validates | Severity |
+|----------|------------------|----------|
+| `size_adequacy` | Each selected SKU meets `required_memory_gb  0.80` AND `required_vcpus  0.80` | `error` if either fails |
+| `tier_consistency` | Same pricing tier (on-demand / reserved / spot) used for all providers in comparison | `warning` if mixed |
+| `price_anomaly` | Any SKU monthly cost > 5 or < 0.2 the median for that category | ` likely wrong SKU family |error` 
+| `sku_staleness` | Cached SKU data not older than `ttl  2` for its tier | ` price may be stale |warning` 
+ RDS/Cloud SQL, NOT EC2) | `error` if mismatch |
+| `provider_parity` | All requested providers  1 priced result per workload (no provider missing from comparison) | `warning` if missing |have 
+| `ratio_check` | Selected instance memory:vCPU ratio is within 0.25 of workload's required ratio | `warning` if wrong family |
+
+**`PricingValidationResult` model**:
+```python
+class PricingValidationFinding(BaseModel):
+    check_id: str           # e.g., "size_adequacy"
+    workload_name: str
+    provider: str
+    severity: str           # "error" | "warning" | "info"
+    description: str        # Human-readable explanation
+    actual_value: str       # e.g., "selected: 13.1 GB"
+    expected_value: str     # e.g., "required: >= 16 GB"
+    recommended_action: str # e.g., "Re-run sizer with memory_gb=16 minimum filter"
+
+class PricingValidationResult(BaseModel):
+    is_valid: bool          # True only if zero "error" severity findings
+    findings: list[PricingValidationFinding]
+    error_count: int
+    warning_count: int
+    summary: str            # "3 errors, 2  comparison may be unreliable"warnings 
+```
+
+**Implementation notes**:
+- Input: `list[SizedWorkloadResult]` from `state["sized_results"]`
+- **No LLM  purely algorithmic (fast, deterministic, fully unit-testable)call** 
+- Each check is a separate method: `_check_size_adequacy()`, `_check_price_anomaly()`, etc.
+- `_check_price_anomaly()` uses `statistics.median()` over per-category cost list
+- Does NOT re-run the  validates what is already there and flags issuesSizer 
+- If `is_valid=False`: Validator logs `log.warning("pricing_comparison_invalid", error_count= never silentN, ...)` 
+  Pricing Data Caveats" subsection in cost sectionadds "

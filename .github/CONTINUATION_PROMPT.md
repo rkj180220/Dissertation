@@ -1,6 +1,6 @@
 # Cloud Orchestrator IDSS — Continuation Prompt
 
-> **Last Updated**: 9 May 2026 (Architecture selector redesigned — unbiased 4-option scoring with cost crossover formula; managed Lambda CAN win at low avg RPS; P16f IaC generation removed; P16g renamed P16f.)
+> **Last Updated**: 9 May 2026 (Router+Orchestrator Agent with ExecutionPlan; Pricing Comparison Validator engine P15k; Principal Architect Reasoning pattern §22g/§22h; P15 table updated; build order finalised.)
 
 ---
 
@@ -185,21 +185,22 @@ Full design in PROJECT_SPEC §21 (gap analysis) and §22 (Router/Validator/Sessi
 | **P15a** | Architecture alternatives engine | `src/engines/architecture_selector.py` (NEW) | Score **4 options**: managed-serverless (Lambda), **self-hosted-serverless (Knative/KEDA)**, containers (EKS), hybrid. **Unbiased**: managed Lambda wins at low avg RPS (< ~300 RPS crossover); Knative wins at sustained high RPS. Uses REAL pricing for cost scores — 3 signal groups: traffic pattern (burst ratio + cost crossover), workload characteristics (latency, stateful), compliance. | 🔴 Critical |
 | **P15b** | Serverless pricing path | `src/models/cloud_resource.py` + `src/agents/sizer.py` | Add `SERVERLESS` to `ServiceCategory`; add Lambda/DynamoDB pricing path; add Knative self-hosted path (reuses K8s node pricing) | 🔴 Critical |
 | **P15c** | Profiler microservice decomposition | `src/agents/profiler.py` | Decompose `enriched_input` into 5-8 individual microservices so bin-packing works with multiple inputs | 🔴 Critical |
-| **P15d** | **Router Agent** (NEW) | `src/agents/router.py` (NEW) | LLM intent router at turn>=2. Classifies: `new_request / amendment / validate / answer / clarify`. Amendment path skips Clarifier. | 🔴 Critical |
-| **P15e** | **Validator Agent** (NEW) | `src/agents/validator.py` (NEW) | Validates architecture (calls architecture_selector), sizing adequacy, budget fit, WAF compliance. Writes `validation_report` to state. | 🔴 Critical |
-| **P15f** | **Session persistence** (NEW) | `src/services/session_store.py` (NEW) + `graph.py` | LangGraph `SqliteSaver` checkpointing. Thread ID = `session_id`. State persists across requests. | 🔴 Critical |
-| **P15g** | Streaming/queue/analytics workloads | `src/agents/profiler.py` | Detect Kinesis, SQS, Redshift from `enriched_input` keywords | 🟠 High |
-| **P15h** | Graph + API refactor | `graph.py` + `state.py` + `orchestration.py` | Add router_node, validator_node, conditional edges, checkpointing. 6 new state fields. `session_id` in request/response. | 🔴 Critical |
-| **P15i** | RFP Architecture Alternatives section | `src/agents/rfp_writer.py` | All 4 options with WAF scores + REAL monthly costs from `validation_report`. | 🔴 Critical |
-| **P15j** | Dynamic WAF weights | `src/engines/architecture_selector.py` | Clarifier detects user priority ("cost is #1") and adjusts scoring weights at runtime. | 🟠 High |
+| **P15d** | **Router+Orchestrator Agent** | `src/agents/router.py` (NEW) | LLM intent classifier **AND execution planner**. Produces `ExecutionPlan`: agents to run, scope (full/delta), affected component names, RFP sections to amend. Downstream agents read `execution_plan` — they never make routing decisions themselves. Uses Principal Architect Reasoning (§22g). | 🔴 Critical |
+| **P15e** | **Validator Agent** | `src/agents/validator.py` (NEW) | 5-check quality gate: [0] Pricing integrity (calls `pricing_validator.py`), [1] Architecture correctness (architecture_selector), [2] Sizing adequacy, [3] Budget fit, [4] WAF compliance. Auto-runs after FinOps; on-demand via Router. | 🔴 Critical |
+| **P15f** | **Session persistence** | `src/services/session_store.py` (NEW) + `graph.py` | LangGraph `SqliteSaver` checkpointing. Thread ID = `session_id`. State persists across requests. | 🔴 Critical |
+| **P15g** | Streaming/queue/analytics | `src/agents/profiler.py` | Detect Kinesis, SQS, Redshift from `enriched_input` keywords | 🟠 High |
+| **P15h** | Graph + API refactor | `graph.py` + `state.py` + `orchestration.py` | Add router+orchestrator node, validator node, conditional edges, checkpointing. `ExecutionPlan` + `session_id` in state. `session_id` in API request/response. | 🔴 Critical |
+| **P15i** | RFP Architecture Alternatives | `src/agents/rfp_writer.py` | All 4 options with WAF scores + REAL costs from `validation_report`. Pricing caveats subsection if `error_count > 0`. | 🔴 Critical |
+| **P15j** | Dynamic WAF weights | `src/engines/architecture_selector.py` | Clarifier detects user priority → adjusts scoring weights at runtime. | 🟠 High |
+| **P15k** | **Pricing Comparison Validator** | `src/engines/pricing_validator.py` (NEW) | 7-check apples-to-apples validator (size adequacy, tier consistency, price anomaly, staleness, category match, provider parity, memory:vCPU ratio). Pure algorithmic — no LLM. Prevents wrong vendor selection from bad SKU matches. See §22h. | 🔴 Critical |
 
-**Build order**: P15b → P15a → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j
+**Build order**: P15b → P15a → P15k → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j
 
 ### Priority 16 — Dissertation Completeness Features (After P15)
 
 | ID | Feature | Description | Priority |
 |----|---------|-------------|----------|
-| **P16a** | Real-cost architecture comparison | Price all 4 architectures using actual sizer output — Lambda per-invocation math + Knative K8s node pricing + container always-on. Validator computes all 4 before selecting winner. | 🔴 Critical |
+| **P16a** | Real-cost architecture comparison | Price all 4 architectures using actual sizer output — Lambda per-invocation math + Knative K8s node pricing + container always-on. (Note: partially covered by P15a + P15k — P16a ensures the pricing flow is wired end-to-end in Validator.) | 🔴 Critical |
 | **P16b** | Self-hosted serverless workload type | After architecture_selector picks self-hosted-serverless, profiler relabels CONTAINER workloads as SERVERLESS_COMPUTE (Knative). Sizer queries K8s nodes at pod density, not Lambda pricing. | 🔴 Critical |
 | **P16c** | RFP compliance verification | Post-generation LLM pass against StateRAMP Moderate control list. Outputs Compliance Gap Analysis appendix in RFP. | 🟠 High |
 | **P16d** | Multi-scenario benchmark script | Run Cal Fire + healthcare + e-commerce through full pipeline. Compare vs. reference architectures. Dissertation evaluation chapter data. | 🟠 High |
@@ -266,12 +267,15 @@ cd dashboard && npm run build
 
 ## Notes for Future Me
 
-### P15 Design (8 May 2026)
-- **Router Agent** (`src/agents/router.py`): LLM intent classifier at turn≥2 entry. Classifies: `new_request|amendment|validate|answer|clarify`. Amendment path skips Clarifier, runs Profiler(delta)→Sizer→FinOps→Validator→RFP Writer. Entry conditional: if `state.get("rfp_document")` → router else → clarifier. Full design in PROJECT_SPEC §22b.
-- **Validator Agent** (`src/agents/validator.py`): Calls architecture_selector for all 4 options, validates sizing adequacy, budget fit, WAF compliance. Runs after FinOps every pipeline. Full design in PROJECT_SPEC §22c.
+### P15 Design (9 May 2026 — final pre-implementation)
+- **Router+Orchestrator Agent** (`src/agents/router.py`): LLM intent classifier **and execution planner** in one step. Produces `ExecutionPlan` (not just a route label): intent, `agents_to_run`, `scope_components` (specific component names), `rfp_amendment_sections`, `amendment_delta`, `confidence`. Downstream agents read `execution_plan` to understand exactly what to reprocess. Entry conditional: if `state.get("rfp_document")` → router+orchestrator, else → clarifier. Uses Principal Architect Reasoning (§22g). Full design in PROJECT_SPEC §22b.
+- **Validator Agent** (`src/agents/validator.py`): 5-check quality gate. Check 0 is pricing integrity (calls `pricing_validator.py` FIRST — prevents wrong vendor selection from bad SKU matches). Checks 1–4: architecture_selector, sizing adequacy, budget fit, WAF compliance. Full design in PROJECT_SPEC §22c.
+- **Pricing Comparison Validator** (`src/engines/pricing_validator.py`): 7-check pure algorithmic engine. No LLM. Validates that cross-provider cost comparison is valid before FinOps picks a vendor. Key checks: size_adequacy (memory/vCPU ≥ 80% of required), price_anomaly (> 5× median = wrong SKU family), category_match (DATABASE workload → RDS, not EC2). Full design in PROJECT_SPEC §22h.
+- **Principal Architect Reasoning** (§22g): ALL agent system prompts now include a structured `<architect_reasoning>` CoT template — 5 steps: understand, identify risks, evaluate alternatives, challenge assumptions, commit with rationale. Scratchpad captured in LangFuse as `reasoning` span. NOT returned to user. Each agent has a key forcing question specific to its role.
 - **Session Persistence** (`src/services/session_store.py`): `langgraph-checkpoint-sqlite` → `SqliteSaver`. `graph.compile(checkpointer=checkpointer)`. Thread ID = `session_id`. CRITICAL: current `orchestration.py` deletes `_clarify_sessions[request_id]` on `status=ready` — must NOT do this. Full design in PROJECT_SPEC §22d.
-- **Architecture Selector** (`src/engines/architecture_selector.py`): Evaluates **4 options** — managed-serverless (Lambda), **self-hosted-serverless (Knative/KEDA on K8s)**, containers (EKS), hybrid. **Completely unbiased** — managed Lambda CAN and SHOULD win when avg RPS is low (e.g. tax portal at 40 avg RPS: Lambda = $21/mo vs Knative = $2,190/mo). Self-hosted serverless wins at sustained high throughput (Cal Fire at 800 avg RPS: Lambda = $14K/mo vs Knative = $1.8K/mo). Cost crossover ≈ **300–500 avg RPS** — computed per-workload. Score uses REAL pricing from PricingService (not heuristics). Three signal groups: traffic pattern, workload characteristics, compliance. Dynamic WAF weights (P15j). Full design in PROJECT_SPEC §22f.
-- **Biggest gap vs Presidio**: Serverless never evaluated. Clarifier writes "Kubernetes" in enriched_input → profiler maps to CONTAINER → sizer prices EKS only. Fix order: P15b (SERVERLESS enum + both pricing paths) → P15a (architecture_selector with 4 options + real cost crossover) → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j.
+- **Architecture Selector** (`src/engines/architecture_selector.py`): 4-option unbiased scoring. Managed Lambda wins at low avg RPS (< ~300 crossover); Knative wins at sustained high throughput. 3 signal groups: traffic pattern + workload characteristics + compliance. Dynamic WAF weights via P15j. Full design in PROJECT_SPEC §22f.
+- **Build order**: P15b → P15a → P15k → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j
+- **Biggest gap vs Presidio**: Serverless never evaluated; no session continuity; amendments trigger full re-run; no pricing integrity check before vendor selection.
 
 ### Credentials & Environment
 - **AWS STS**: Temporary creds (`ASIA` prefix) expire. Run `aws sso login` → update `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`. Bedrock is DENIED (IAM policy). AWS used only for Pricing API.
