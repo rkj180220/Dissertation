@@ -86,6 +86,7 @@ _CATEGORY_TO_COST_FIELD: dict[ServiceCategory, str] = {
     ServiceCategory.AI_ML: "compute_monthly_usd",
     ServiceCategory.SERVERLESS_COMPUTE: "serverless_monthly_usd",
     ServiceCategory.SERVERLESS_FUNCTION: "serverless_monthly_usd",
+    ServiceCategory.SERVERLESS: "serverless_monthly_usd",
     ServiceCategory.KUBERNETES: "kubernetes_monthly_usd",
     ServiceCategory.CONTAINER: "kubernetes_monthly_usd",
     ServiceCategory.DATABASE: "database_monthly_usd",
