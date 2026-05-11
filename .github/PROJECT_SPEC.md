@@ -3,7 +3,7 @@
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
 > **Additional Examiner**: Santhosh Kirubakaran
-> **Last Updated**: 11 May 2026 (P16a–P16f ALL COMPLETE. B1–B8 RFP output bugs ALL FIXED. NEW-1–NEW-5 post-fire-test bugs ALL FIXED: AWS PostgreSQL RDS fallback, compute vCPU cap (c8a oversize fix), GCP IP-reservation DB filter, SLA RPS heuristic fix, mobile subsection recommended-provider. 142 tests passing.)
+> **Last Updated**: 11 May 2026 (P16a–P16f ALL COMPLETE. B1–B8 RFP output bugs ALL FIXED. NEW-1–NEW-5 post-fire-test bugs ALL FIXED. PROV-1–PROV-3 Cal Fire provider+workload+budget bugs ALL FIXED: provider now defaults to best_price_all when user has no preference, WORKLOAD_SUMMARY forces explicit component listing, $3.2M/year budget now parses correctly. 142 tests passing.)
 > **LLM**: Gemini 2.5 Pro (`gemini-2.5-pro`) via Google Cloud Vertex AI (`dissertation-rj`, `us-central1`) using ADC
 
 ---
@@ -1559,3 +1559,40 @@ Full pipeline run with 12-workload Fire-1 scenario (50k to 2M concurrent users, 
 **GCP total**: $1,041/mo | **Azure total**: $184.80/mo (Azure compute API gaps noted)
 
 **Potential NEW-6**: Several AWS compute workloads (API Server, VMs, streaming-pipeline) all landing on c7a.large (2 vCPU) for 4-6 vCPU requirements — vCPU cap or candidate pool issue to investigate.
+
+---
+
+## 24. Cal Fire Provider + Workload  PROV-1, PROV-2, PROV-3 Fixed (11 May 2026)Bugs 
+
+**Context**: New Cal Fire test run using `/clarify` conversation flow (not pre-written enriched_input).
+Pipeline incorrectly produced `single_aws` provider strategy and only 3 workloads when the user said
+"no preference on app framework" and provided a $3.2M/year budget.
+
+### 24a. PROV- Provider defaults to AWS when user has no preference1 
+
+| | Detail |
+|---|---|
+| **Root cause** | LLM in `llm_clarify_turn` outputs `PROVIDER_STRATEGY: single_aws` because the clarifier's own "additional components" note mentions AWS service names (Aurora, Route 53, CloudFront). The user said " whatever is best" about *app framework*, not provider. |No 
+| **Fix** | Added `_user_named_single_provider(all_user_text)` function that scans the full conversation for explicit single-provider patterns (e.g. "use AWS", "AWS only", "prefer Azure"). If the user never named a single provider, deterministic override sets `provider_strategy = best_price_all` and `providers = [aws, azure, gcp]` regardless of what the LLM inferred. |
+| **Location** | `src/agents/clarifier. `llm_clarify_turn()`, new helper `_user_named_single_provider()` |py` 
+| **Status Fixed |** | 
+
+### 24b. PROV- Only 3 workloads identified for a 12-component architecture2 
+
+| | Detail |
+|---|---|
+| **Root cause** | `WORKLOAD_SUMMARY` prompt only asked for "2-5 sentences" in prose form. LLM described the architecture generically, only mentioning K8s, LB, CDN. The heuristic extractor `_extract_workloads_from_text` only triggers on specific keywords. |
+| **Fix** | Rewrote `WORKLOAD_SUMMARY` prompt to require a **bulleted  one component per line in format `- <component>: <brief role>`. Added mandatory components list: kubernetes cluster, load balancer, CDN, API gateway, relational database, redis cache, object storage. Clarified that "every component listed becomes a separately priced line item." |list** 
+| **Location** | `src/agents/clarifier. `_CLARIFY_SYSTEM_PROMPT` |py` 
+| **Status Fixed (requires LLM to follow new format; deterministic extraction handles the rest) |** | 
+
+### 24c. PROV- $3.2M/year budget not extracted3 
+
+| | Detail |
+|---|---|
+| **Root cause** | `_parse_budget()` only matched `$N,NNN.NN` dollar-sign amounts or bare integers. `$3.2 million per year` has a decimal + "million" + "per  no existing pattern matched. |year" 
+ 266667. Also strengthened `BUDGET_MONTHLY_USD` LLM prompt with explicit conversion examples. |
+| **Location** | `src/agents/clarifier. `_parse_budget()` and `_CLARIFY_SYSTEM_PROMPT` |py` 
+| **Status Fixed |** | 
+
+**Test result**: 142/142 tests pass after all PROV-1 through PROV-3 fixes.

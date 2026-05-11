@@ -1,6 +1,6 @@
 # Cloud Orchestrator IDSS — Continuation Prompt
 
-> **Last Updated**: 11 May 2026 (P16a–P16f COMPLETE. All Dissertation Completeness Features done. B1–B8 RFP output bugs ALL FIXED. NEW-1 through NEW-5 post-fire-test bugs FIXED. 142 tests, 0 TS build errors.)
+> **Last Updated**: 11 May 2026 (P16a–P16f COMPLETE. All Dissertation Completeness Features done. B1–B8 RFP output bugs ALL FIXED. NEW-1 through NEW-5 post-fire-test bugs FIXED. PROV-1 through PROV-3 Cal Fire provider/workload/budget bugs FIXED. 142 tests, 0 TS build errors.)
 
 ---
 
@@ -218,6 +218,16 @@ All 8 bugs found during the Cal Fire live test have been fixed:
 | **NEW-4** | SLA section: Peak Throughput shows unrealistic RPS (×10 multiplier) | ✅ Fixed — clarifier RPS heuristic changed from `peak_users × 10` to `max(500, peak_users // 2)`, capped at 500K |
 | **NEW-5** | Mobile architecture subsection hardcodes AWS services | ✅ Fixed — `_build_mobile_subsection()` now takes `recommended_provider` param; call site passes it |
 
+### Cal Fire Conversation Flow Bugs (PROV-1 through PROV-3) — ALL FIXED ✅
+
+These bugs only appear when using the `/clarify` conversation flow (not pre-built enriched_input):
+
+| ID | Bug | Fix | Status |
+|----|-----|-----|--------|
+| **PROV-1** | Clarifier sets `single_aws` when user has no provider preference | Deterministic `_user_named_single_provider()` check — if user never explicitly said "use AWS/Azure/GCP", override to `best_price_all` + all 3 providers | ✅ Fixed |
+| **PROV-2** | Only 3 workloads identified for 12-component architecture | `WORKLOAD_SUMMARY` prompt rewritten to require explicit bulleted list `- component: role` with mandatory components list | ✅ Fixed |
+| **PROV-3** | `$3.2 million/year` budget not extracted | `_parse_budget()` now handles million/billion shorthand + annual→monthly conversion ($3.2M/yr → 266667) | ✅ Fixed |
+
 ## What Needs to Be Fixed/Built Next ❌
 
 > **P15 COMPLETE ✅ — All 11 items done. 142 tests passing. Move to P16.**
@@ -235,7 +245,7 @@ All 8 bugs found during the Cal Fire live test have been fixed:
 
 ### Next Immediate Task
 
-**All P16 items are complete ✅**
+**All P16 items are complete ✅. PROV-1 through PROV-3 clarifier conversation bugs are fixed ✅**
 
 The system is feature-complete for dissertation submission. What remains is optional polish:
 - P17 (optional): End-to-end live demo run with real LLM — record/screenshot results for the dissertation appendix.

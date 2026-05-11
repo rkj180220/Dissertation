@@ -125,15 +125,43 @@ def _parse_budget(text: str) -> float | None:
 
     Matches explicit ``$`` amounts (e.g. ``$5000``, ``$5,000/mo``) or
     standalone numbers when the user answers a direct budget question.
+    Handles million/billion shorthand and annual→monthly conversion.
     Avoids matching incidental numbers like "3 microservices".
     """
     text = text.strip()
     if not text or text.lower() in ("skip", "none", "no"):
         return None
-    # Explicit dollar sign: $5000, $5,000.00
+
+    # Fix PROV-3: million/billion shorthand with annual→monthly conversion
+    # Matches: $3.2 million/year, $3.2M per year, $3.2 million annually, $3M/yr, $3.2B/year
+    million_match = re.search(
+        r"\$\s*(\d+(?:\.\d+)?)\s*(million|M|billion|B)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if million_match:
+        val = float(million_match.group(1))
+        unit = million_match.group(2).lower()
+        if unit in ("billion", "b"):
+            val *= 1_000_000_000
+        else:
+            val *= 1_000_000
+        # Convert annual to monthly if the surrounding text says "year" / "annual"
+        text_lower = text.lower()
+        if any(kw in text_lower for kw in ("/year", "per year", "/yr", "per yr", "annually", "annual")):
+            val = val / 12
+        return round(val)
+
+    # Explicit dollar sign: $5000, $5,000.00, $266,666/mo
     match = re.search(r"\$\s*(\d+(?:,\d{3})*(?:\.\d{2})?)", text)
     if match:
-        return float(match.group(1).replace(",", ""))
+        raw = float(match.group(1).replace(",", ""))
+        # Convert annual to monthly if flagged
+        text_lower = text.lower()
+        if any(kw in text_lower for kw in ("/year", "per year", "/yr", "per yr", "annually", "annual")):
+            raw = raw / 12
+        return round(raw)
+
     # Standalone number (direct answer to "what's your budget?"): "5000"
     match = re.match(
         r"^\s*(\d+(?:,\d{3})*(?:\.\d{2})?)\s*(?:/\s*(?:mo|month))?\s*$",
@@ -986,9 +1014,13 @@ def _propagate_scale_and_sla(
     for workload in req.workloads:
         if peak_users and workload.concurrent_users is None:
             workload.concurrent_users = peak_users
-            # Rough RPS estimate: peak users × 10 RPS each
+            # Rough RPS estimate: assume ~1 request per 2 seconds per concurrent user.
+            # This is realistic for web/API platforms (0.5 RPS/user).
+            # The previous multiplier of ×10 (10 RPS/user) was 20× too aggressive,
+            # producing implausible values like "20,000,000 RPS" for 2M-user systems.
             if workload.throughput_rps is None:
-                workload.throughput_rps = peak_users * 10
+                # 0.5 RPS per concurrent user, floored at 500, capped at 500,000
+                workload.throughput_rps = max(500, min(peak_users // 2, 500_000))
 
         if uptime_sla and workload.uptime_sla is None:
             workload.uptime_sla = uptime_sla
@@ -1279,21 +1311,32 @@ AVAILABILITY: <e.g. 99.99% public app, 99.95% internal portal>
 DR: <e.g. cross-region active-passive, us-west-2 primary us-east-1 secondary, RTO < 1hr RPO < 15min — \
 or inferred from SLA if client did not specify>
 
-BUDGET_MONTHLY_USD: <number only e.g. 266666, or null>
+BUDGET_MONTHLY_USD: <Monthly budget as a number only. IMPORTANT: convert to monthly if stated \
+as annual (e.g. "$3.2 million/year" → 266667, "$3.2M/yr" → 266667, "$1.2M annually" → 100000, \
+"$500k/year" → 41667). Output only the integer, no symbols, no units. \
+Example: 266667 or null if no budget was stated.>
 
 ENVIRONMENTS: <e.g. production, staging, dr>
 
 INTEGRATIONS: <e.g. CAL FIRE dispatch, GIS feeds, CalID SSO — or none>
 
-WORKLOAD_SUMMARY: <2-5 sentences describing the full logical architecture using \
-PROVIDER-NEUTRAL component names. Use generic technology names, not cloud-vendor service \
-names. Correct: "kubernetes cluster", "postgresql database", "redis cache", "CDN", \
-"object storage", "API gateway", "streaming pipeline". \
+WORKLOAD_SUMMARY: <List EVERY infrastructure component the workload requires, one per line \
+in the format "- <component>: <brief role>". Be exhaustive — do NOT stop at 3 components. \
+Use PROVIDER-NEUTRAL technology names only. \
+Correct: "- kubernetes cluster: container orchestration", "- postgresql database: primary OLTP store", \
+"- redis cache: session and query cache", "- CDN: edge delivery for static assets and map tiles", \
+"- object storage: geospatial data, logs, backups", "- api gateway: request routing and rate limiting", \
+"- load balancer: L7 traffic distribution", "- streaming pipeline: real-time event ingestion". \
 Wrong: "EKS", "RDS", "CloudFront", "S3", "Azure SQL", "GKE". \
 Provider-specific service selection happens AFTER cost comparison by the Sizer agent. \
-Include: all logical components, HA topology (multi-AZ yes/no), DR region strategy \
-(e.g. "US West primary, US East DR"), and compliance-driven constraints. \
-This text feeds automated workload extraction — be specific about component types.>
+MANDATORY components for a containerised public web app: kubernetes cluster, load balancer, \
+CDN, API gateway, relational database (postgresql or mysql), redis cache, object storage. \
+Add any additional components inferred from the use case (e.g. geospatial data store for \
+mapping, streaming pipeline for real-time events, message queue for async tasks). \
+After listing components, add 1-2 sentences on HA topology (multi-AZ yes/no) and DR region \
+strategy (e.g. US West primary, US East DR). \
+This text feeds automated workload extraction — every component you list here becomes a \
+separately sized and priced line item.>
 
 ARCHITECTURE_PATTERN: <1-3 sentences naming the overall design pattern, completely \
 provider-neutral. This is the "what" of the architecture — not the "where" (provider). \
@@ -1457,6 +1500,26 @@ async def llm_clarify_turn(
             response_len=len(response_text),
             turn=len(history) + 1,
         )
+
+        # PROV-1 fix: deterministic provider override.
+        # If the user never explicitly named a single provider, always use best_price_all.
+        # This prevents the LLM from inferring "single_aws" when it mentions AWS services
+        # in its own architectural notes, while the user actually said "no preference".
+        if status == "ready":
+            all_user_text = (
+                " ".join(content for role, content in history if role == "user")
+                + " "
+                + user_input
+            )
+            if not _user_named_single_provider(all_user_text):
+                result["structured"]["provider_strategy"] = "best_price_all"
+                result["structured"]["providers"] = ["aws", "azure", "gcp"]
+                log.info(
+                    "provider_override_applied",
+                    reason="no_explicit_single_provider_in_conversation",
+                    strategy="best_price_all",
+                )
+
         return result
 
     except Exception:
@@ -1472,6 +1535,64 @@ async def llm_clarify_turn(
                 "(we can compare all three and recommend the best price)?"
             ),
         }
+
+
+def _user_named_single_provider(all_user_text: str) -> bool:
+    """Return True only if the user explicitly requested a single cloud provider.
+
+    Patterns that indicate explicit single-provider preference:
+    - "use AWS", "AWS only", "we use AWS", "prefer AWS", "on AWS"
+    - "Azure only", "Microsoft Azure", "prefer Azure"
+    - "GCP only", "Google Cloud", "prefer GCP", "we use GCP"
+
+    Patterns that do NOT indicate provider preference (return False):
+    - "no preference", "whatever is best", "best price", "compare all"
+    - Mentioning AWS service names in passing (e.g. "like Route 53", "similar to S3")
+    """
+    text = all_user_text.lower()
+
+    # Explicit "no preference" / "compare all" signals → NOT single provider
+    no_pref_patterns = [
+        "no preference",
+        "no provider preference",
+        "no cloud preference",
+        "whatever is best",
+        "best price",
+        "compare all",
+        "all three",
+        "no specific preference",
+        "doesn't matter",
+        "don't have a preference",
+    ]
+    if any(p in text for p in no_pref_patterns):
+        return False
+
+    # Explicit single-provider patterns
+    single_patterns = [
+        r"\buse aws\b",
+        r"\baws only\b",
+        r"\bamazon only\b",
+        r"\bwe(?:'re| are) on aws\b",
+        r"\bwe use aws\b",
+        r"\bprefer aws\b",
+        r"\bmust be aws\b",
+        r"\baws[\s-]first\b",
+        r"\bonly aws\b",
+        r"\buse azure\b",
+        r"\bazure only\b",
+        r"\bprefer azure\b",
+        r"\bmust be azure\b",
+        r"\bonly azure\b",
+        r"\bwe use azure\b",
+        r"\buse gcp\b",
+        r"\bgcp only\b",
+        r"\bprefer gcp\b",
+        r"\bgoogle cloud only\b",
+        r"\bmust be gcp\b",
+        r"\bonly gcp\b",
+        r"\bwe use gcp\b",
+    ]
+    return any(re.search(pat, text) for pat in single_patterns)
 
 
 def _extract_clarify_section(text: str, section: str) -> str:
