@@ -78,6 +78,7 @@ from src.models.workload import (
     WorkloadProfile,
     WorkloadRequest,
     WorkloadRequirement,
+    WorkloadTier,
 )
 from src.orchestrator.state import (
     AgentExecution,
@@ -106,6 +107,8 @@ _SERVICE_NAME_MAP: dict[tuple[str, ServiceCategory], str] = {
     ("aws", ServiceCategory.CONTAINER): "AmazonEKS",
     ("aws", ServiceCategory.AI_ML): "AmazonSageMaker",
     ("aws", ServiceCategory.SERVERLESS_FUNCTION): "AWSLambda",
+    ("aws", ServiceCategory.SERVERLESS): "AWSLambda",
+    ("aws", ServiceCategory.SERVERLESS_COMPUTE): "AmazonEKS",  # Knative runs on EKS nodes
     ("aws", ServiceCategory.NETWORKING): "AmazonVPC",
     ("aws", ServiceCategory.ANALYTICS): "AmazonRedshift",
     # Azure
@@ -116,6 +119,8 @@ _SERVICE_NAME_MAP: dict[tuple[str, ServiceCategory], str] = {
     ("azure", ServiceCategory.CONTAINER): "Azure Kubernetes Service",
     ("azure", ServiceCategory.AI_ML): "Azure Machine Learning",
     ("azure", ServiceCategory.SERVERLESS_FUNCTION): "Functions",
+    ("azure", ServiceCategory.SERVERLESS): "Functions",
+    ("azure", ServiceCategory.SERVERLESS_COMPUTE): "Azure Kubernetes Service",  # Knative on AKS
     ("azure", ServiceCategory.NETWORKING): "Virtual Network",
     ("azure", ServiceCategory.ANALYTICS): "Azure Synapse Analytics",
     # GCP
@@ -126,6 +131,8 @@ _SERVICE_NAME_MAP: dict[tuple[str, ServiceCategory], str] = {
     ("gcp", ServiceCategory.CONTAINER): "Kubernetes Engine",
     ("gcp", ServiceCategory.AI_ML): "Vertex AI",
     ("gcp", ServiceCategory.SERVERLESS_FUNCTION): "Cloud Functions",
+    ("gcp", ServiceCategory.SERVERLESS): "Cloud Run",
+    ("gcp", ServiceCategory.SERVERLESS_COMPUTE): "Kubernetes Engine",  # Knative on GKE
     ("gcp", ServiceCategory.NETWORKING): "Cloud Networking",
     ("gcp", ServiceCategory.ANALYTICS): "BigQuery",
 }
@@ -139,6 +146,8 @@ _SCORED_CATEGORIES: set[ServiceCategory] = {
 #: Categories that should use the bin-packing engine
 _BINPACKED_CATEGORIES: set[ServiceCategory] = {
     ServiceCategory.CONTAINER,
+    # P16b: Knative/KEDA self-hosted serverless also bins onto K8s nodes.
+    ServiceCategory.SERVERLESS_COMPUTE,
 }
 
 #: Max alternative SKUs to keep per workload
@@ -192,9 +201,9 @@ _DATABASE_ENGINE_MAP: dict[tuple[str, str], tuple[str, str | None]] = {
     # Azure Cache for Redis
     ("azure", "redis"): ("Azure Cache for Redis", None),
     ("azure", "memcached"): ("Azure Cache for Redis", None),
-    # GCP Memorystore
-    ("gcp", "redis"): ("Cloud Memorystore", None),
-    ("gcp", "memcached"): ("Cloud Memorystore", None),
+    # GCP Memorystore (correct service display names as used by GCP Billing API)
+    ("gcp", "redis"): ("Cloud Memorystore for Redis", None),
+    ("gcp", "memcached"): ("Cloud Memorystore for Memcached", None),
 }
 
 #: Known load balancer base costs (monthly USD).
@@ -228,6 +237,66 @@ _CDN_COST_MONTHLY: dict[str, float] = {
     "gcp": 60.00,    # Cloud CDN: ~500 GB transfer
 }
 
+#: Fixed-cost estimates for Redis / Memcached cache services (monthly USD).
+#: Used when the pricing API returns no SKU candidates for a cache workload,
+#: which can happen for services billed via reserved capacity (e.g., Azure
+#: Cache for Redis in some regions).
+_REDIS_CACHE_COST_MONTHLY: dict[str, float] = {
+    "aws": 65.00,    # ElastiCache cache.r6g.large: ~$0.084/hr  × 730h ≈ $61
+    "azure": 55.00,  # Azure Cache for Redis C1 Standard: ~$55/mo
+    "gcp": 48.00,    # Cloud Memorystore for Redis 1 GB Basic: ~$0.065/hr × 730h ≈ $47
+}
+
+#: Fixed-cost estimates for PostgreSQL / relational databases (monthly USD).
+#: Applied when the pricing API returns zero candidates — most commonly AWS RDS
+#: in regions where the Bulk Pricing API does not index RDS SKUs.
+#: Values represent a multi-AZ db.t3.medium (2 vCPU / 4 GiB) baseline.
+_RDS_COST_MONTHLY: dict[str, float] = {
+    "aws": 185.00,   # RDS PostgreSQL db.t3.medium Multi-AZ: ~$0.253/hr × 730h ≈ $185
+    "azure": 0.0,    # Azure PostgreSQL Flexible Server returns candidates; no fallback needed
+    "gcp": 0.0,      # GCP Cloud SQL returns candidates; no fallback needed
+}
+
+#: Cross-provider region equivalence: AWS region → nearest Azure region.
+#: Used to translate the user's AWS preferred_region to a geographically
+#: equivalent Azure region when the Azure region hasn't been explicitly set.
+_AWS_TO_AZURE_REGION: dict[str, str] = {
+    "us-east-1": "eastus",
+    "us-east-2": "eastus2",
+    "us-west-1": "westus",
+    "us-west-2": "westus2",
+    "eu-west-1": "westeurope",
+    "eu-west-2": "uksouth",
+    "eu-west-3": "francecentral",
+    "eu-central-1": "germanywestcentral",
+    "eu-north-1": "swedencentral",
+    "ap-southeast-1": "southeastasia",
+    "ap-southeast-2": "australiaeast",
+    "ap-northeast-1": "japaneast",
+    "ap-south-1": "centralindia",
+    "sa-east-1": "brazilsouth",
+    "ca-central-1": "canadacentral",
+}
+
+#: Cross-provider region equivalence: AWS region → nearest GCP region.
+_AWS_TO_GCP_REGION: dict[str, str] = {
+    "us-east-1": "us-central1",
+    "us-east-2": "us-east4",
+    "us-west-1": "us-west2",
+    "us-west-2": "us-west1",
+    "eu-west-1": "europe-west1",
+    "eu-west-2": "europe-west2",
+    "eu-west-3": "europe-west9",
+    "eu-central-1": "europe-west3",
+    "eu-north-1": "europe-north1",
+    "ap-southeast-1": "asia-southeast1",
+    "ap-southeast-2": "australia-southeast1",
+    "ap-northeast-1": "asia-northeast1",
+    "ap-south-1": "asia-south1",
+    "sa-east-1": "southamerica-east1",
+    "ca-central-1": "northamerica-northeast1",
+}
+
 #: Preferred general-purpose instance families for container node pools.
 #: Sorting viable nodes by these families prevents selecting oversized
 #: memory-optimized (x, u, hpc) or specialized instance types.
@@ -255,6 +324,11 @@ def _get_region_for_provider(
 
     Priority: workload region_affinity > provider_regions map > preferred_region.
 
+    If ``preferred_region`` is an AWS region slug and the provider-specific
+    region is still the model default (i.e. the user never explicitly set it),
+    a cross-provider equivalent region is used instead of the default so that
+    all three providers price in the same geography.
+
     Args:
         provider: The target cloud provider.
         workload_request: Top-level request with region info.
@@ -270,6 +344,32 @@ def _get_region_for_provider(
         provider.value,
         workload_request.preferred_region,
     )
+
+    # Cross-provider region mapping: if preferred_region is an AWS region
+    # and the provider-specific entry is still the model default, translate
+    # to a geographically equivalent region for that provider.
+    preferred = workload_request.preferred_region
+    _AZURE_DEFAULT = "eastus"
+    _GCP_DEFAULT = "us-central1"
+
+    if (
+        provider == CloudProvider.AZURE
+        and region == _AZURE_DEFAULT
+        and preferred not in (_AZURE_DEFAULT, "")
+    ):
+        mapped = _AWS_TO_AZURE_REGION.get(preferred)
+        if mapped:
+            region = mapped
+
+    elif (
+        provider == CloudProvider.GCP
+        and region == _GCP_DEFAULT
+        and preferred not in (_GCP_DEFAULT, "")
+    ):
+        mapped = _AWS_TO_GCP_REGION.get(preferred)
+        if mapped:
+            region = mapped
+
     return region
 
 
@@ -491,6 +591,53 @@ def _is_cdn_workload(workload: WorkloadRequirement) -> bool:
     )
 
 
+def _is_redis_workload(workload: WorkloadRequirement) -> bool:
+    """Detect Redis / Memcached cache workloads that need a fixed-cost fallback.
+
+    Azure Cache for Redis and GCP Memorystore are not always returned by the
+    pricing API for all regions.  When SKU lookup fails, we apply a monthly
+    fixed-cost estimate rather than reporting $0.
+
+    Args:
+        workload: The workload requirement to check.
+
+    Returns:
+        True when the workload represents an in-memory cache service.
+    """
+    name_lower = workload.name.lower()
+    engine = (workload.resources.database_engine or "").lower()
+    return (
+        "redis" in name_lower
+        or "memcached" in name_lower
+        or "cache" in name_lower
+        or engine in ("redis", "memcached", "elasticache", "memorystore")
+    )
+
+
+def _is_postgres_workload(workload: WorkloadRequirement) -> bool:
+    """Detect PostgreSQL / relational database workloads that need a fixed-cost fallback.
+
+    AWS RDS pricing is not indexed in the Bulk Pricing API for all regions.
+    When SKU lookup returns zero candidates for a database workload on AWS,
+    apply a monthly fixed-cost estimate rather than reporting $0.
+
+    Args:
+        workload: The workload requirement to check.
+
+    Returns:
+        True when the workload represents a relational database service.
+    """
+    name_lower = workload.name.lower()
+    engine = (workload.resources.database_engine or "").lower()
+    return (
+        "postgres" in name_lower
+        or "database" in name_lower
+        or "rds" in name_lower
+        or "sql" in name_lower
+        or engine in ("postgresql", "postgres", "mysql", "mariadb", "rds", "aurora")
+    )
+
+
 def _parse_memory_gib(memory_str: str | None) -> float:
     """Parse a cloud provider memory string like '8 GiB' or '16 GB' to float.
 
@@ -600,7 +747,19 @@ def _filter_storage_candidates(
         # e.g. "USW2-TimedStorage-ZIA-ByteHrs"
         "-zia-", "zia-bytehrs",
     )
-    filtered = [
+    # Pre-filter: remove per-request / per-IOPS / per-provisioned-unit rows.
+    # These use units like "10K", "1/Month" (flat per-disk), or "1/Hour"
+    # (per-IOPS), which are not per-GB capacity pricing and produce nonsensical
+    # estimates when multiplied by storage_gb.
+    _GB_UNITS = ("gb", "gib")
+    per_gb_only = [
+        c for c in candidates
+        if any(u in c.unit_of_measure.lower() for u in _GB_UNITS)
+        and not any(pat in c.sku_name.lower() for pat in _EXCLUDE_PATTERNS)
+        and c.monthly_cost_estimate is not None
+        and c.monthly_cost_estimate > 0
+    ]
+    filtered = per_gb_only if per_gb_only else [
         c for c in candidates
         if not any(pat in c.sku_name.lower() for pat in _EXCLUDE_PATTERNS)
         and c.monthly_cost_estimate is not None
@@ -843,8 +1002,13 @@ async def _size_container_workload(
             monthly_cost_usd=round(monthly, 2),
             fit_score=round(packing_result.packing_efficiency_pct / 100.0, 4),
             rationale=(
-                f"Bin-packed {len(container_workloads)} container workload(s) "
-                f"onto {packing_result.total_nodes} × {best_node.sku_name} nodes. "
+                f"{'Knative/KEDA' if component.resolved_category == ServiceCategory.SERVERLESS_COMPUTE else 'Bin-packed'} "
+                f"{len(container_workloads)} workload(s) "
+                f"onto {packing_result.total_nodes} × {best_node.sku_name} nodes "
+                f"({'EKS+Knative' if provider.value == 'aws' else 'AKS+Knative' if provider.value == 'azure' else 'GKE+Knative'}"
+                f" scale-to-zero" if component.resolved_category == ServiceCategory.SERVERLESS_COMPUTE
+                else f"{'EKS' if provider.value == 'aws' else 'AKS' if provider.value == 'azure' else 'GKE'}"
+                f"). "
                 f"Packing efficiency: {packing_result.packing_efficiency_pct:.1f}%. "
                 f"Est. ${monthly:.2f}/mo."
             ),
@@ -917,6 +1081,154 @@ async def _size_generic_workload(
             f"Selected {best.sku_name} as cheapest option for "
             f"{component.resolved_category.value} workload "
             f"'{component.workload_name}'. Est. ${monthly:.2f}/mo."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Serverless workload sizing (Lambda + DynamoDB pattern)
+# ---------------------------------------------------------------------------
+
+#: Lambda compute price per GB-second (USD).
+_LAMBDA_PRICE_PER_GB_SEC: float = 0.0000166667
+#: Lambda request price per invocation (USD).
+_LAMBDA_PRICE_PER_REQUEST: float = 0.0000002
+#: Azure Functions consumption price per million executions (USD).
+_AZURE_FUNC_PRICE_PER_MILLION_EXEC: float = 0.20
+#: Azure Functions compute price per GB-second (USD).
+_AZURE_FUNC_PRICE_PER_GB_SEC: float = 0.000016
+#: Cloud Run request price per million requests (USD).
+_CLOUDRUN_PRICE_PER_MILLION_REQ: float = 0.40
+#: Cloud Run compute price per vCPU-second (USD).
+_CLOUDRUN_PRICE_PER_VCPU_SEC: float = 0.00002400
+#: Cloud Run memory price per GB-second (USD).
+_CLOUDRUN_PRICE_PER_GB_SEC: float = 0.00000250
+#: Seconds in a 30-day month.
+_SECONDS_PER_MONTH: int = 2_592_000
+
+
+def _estimate_serverless_monthly_cost(
+    provider: CloudProvider,
+    invocations_per_month: float,
+    avg_duration_ms: float,
+    memory_mb: float,
+) -> float:
+    """Estimate monthly cost for a serverless (Lambda-style) workload.
+
+    Uses provider-specific per-invocation + compute pricing with no
+    live API call — these rates are relatively stable.
+
+    Args:
+        provider: Target cloud provider.
+        invocations_per_month: Expected function invocations per month.
+        avg_duration_ms: Average function execution time in milliseconds.
+        memory_mb: Memory allocated to the function in MB.
+
+    Returns:
+        Estimated monthly cost in USD.
+    """
+    mem_gb = memory_mb / 1024.0
+    duration_sec = avg_duration_ms / 1000.0
+
+    if provider == CloudProvider.AWS:
+        # Lambda: request fee + GB-second compute fee
+        request_cost = invocations_per_month * _LAMBDA_PRICE_PER_REQUEST
+        gb_sec = invocations_per_month * duration_sec * mem_gb
+        compute_cost = gb_sec * _LAMBDA_PRICE_PER_GB_SEC
+        # First 1M requests/mo and 400K GB-sec/mo are free — subtract free tier
+        request_cost = max(0.0, request_cost - 1_000_000 * _LAMBDA_PRICE_PER_REQUEST)
+        compute_cost = max(0.0, compute_cost - 400_000 * _LAMBDA_PRICE_PER_GB_SEC)
+        return round(request_cost + compute_cost, 2)
+
+    if provider == CloudProvider.AZURE:
+        # Azure Functions consumption plan
+        millions_exec = invocations_per_month / 1_000_000
+        exec_cost = max(0.0, millions_exec - 1.0) * _AZURE_FUNC_PRICE_PER_MILLION_EXEC
+        gb_sec = invocations_per_month * duration_sec * mem_gb
+        compute_cost = max(0.0, gb_sec - 400_000) * _AZURE_FUNC_PRICE_PER_GB_SEC
+        return round(exec_cost + compute_cost, 2)
+
+    if provider == CloudProvider.GCP:
+        # Cloud Run: per-request + vCPU-second + GB-second fees
+        vcpus = max(1.0, memory_mb / 512.0)  # typical 0.5 vCPU per 512 MB
+        millions_req = invocations_per_month / 1_000_000
+        req_cost = max(0.0, millions_req - 2.0) * _CLOUDRUN_PRICE_PER_MILLION_REQ
+        vcpu_sec = invocations_per_month * duration_sec * vcpus
+        mem_gb_sec = invocations_per_month * duration_sec * mem_gb
+        compute_cost = (
+            max(0.0, vcpu_sec - 180_000) * _CLOUDRUN_PRICE_PER_VCPU_SEC
+            + max(0.0, mem_gb_sec - 360_000) * _CLOUDRUN_PRICE_PER_GB_SEC
+        )
+        return round(req_cost + compute_cost, 2)
+
+    # Fallback: zero (unknown provider)
+    return 0.0
+
+
+@observe()
+async def _size_serverless_workload(
+    component: ComponentProfile,
+    original_workload: WorkloadRequirement,
+    provider: CloudProvider,
+) -> SizedWorkloadResult:
+    """Estimate cost for a SERVERLESS workload using consumption pricing.
+
+    Computes Lambda / Azure Functions / Cloud Run monthly cost from the
+    workload's ``invocations_per_month``, ``avg_duration_ms``, and
+    ``memory_mb`` resource fields.  No live API call is made — these
+    rates are stable enough for estimation purposes.
+
+    Args:
+        component: Profiler's component analysis.
+        original_workload: Original workload requirement with resource fields.
+        provider: Target cloud provider.
+
+    Returns:
+        SizedWorkloadResult with usage-based cost estimate.
+    """
+    log = logger.bind(
+        agent="sizer",
+        step="size_serverless",
+        workload=component.workload_name,
+        provider=provider.value,
+    )
+    log.info("serverless_sizing_started")
+
+    res = original_workload.resources
+    invocations = float(res.invocations_per_month or 10_000_000)
+    avg_duration = float(res.avg_duration_ms or 200.0)
+    memory_mb = float(res.memory_mb or 512.0)
+
+    monthly = _estimate_serverless_monthly_cost(
+        provider, invocations, avg_duration, memory_mb,
+    )
+
+    log.info(
+        "serverless_sizing_completed",
+        invocations=invocations,
+        avg_duration_ms=avg_duration,
+        memory_mb=memory_mb,
+        monthly_cost=monthly,
+    )
+
+    provider_stack = {
+        "aws": "Lambda + DynamoDB + API Gateway",
+        "azure": "Azure Functions + Cosmos DB + APIM",
+        "gcp": "Cloud Run + Firestore + API Gateway",
+    }.get(provider.value, "Serverless Functions")
+
+    return SizedWorkloadResult(
+        workload_name=component.workload_name,
+        provider=provider,
+        selected_sku=None,
+        alternative_skus=[],
+        monthly_cost_usd=monthly,
+        fit_score=0.85,
+        rationale=(
+            f"Serverless pricing estimate ({provider_stack}): "
+            f"{invocations:,.0f} invocations/mo × {avg_duration:.0f}ms avg "
+            f"@ {memory_mb:.0f}MB → ${monthly:.2f}/mo. "
+            f"Scales to zero; no idle costs."
         ),
     )
 
@@ -1366,8 +1678,7 @@ async def run_sizer_node(
                 if component.resolved_category == ServiceCategory.DATABASE:
                     hourly = [
                         c for c in candidates
-                        if c.unit_of_measure in ("1 Hour", "1 hour")
-                        and c.unit_price > 0
+                        if c.is_hourly and c.unit_price > 0
                     ]
                     if hourly:
                         candidates = hourly
@@ -1392,6 +1703,82 @@ async def run_sizer_node(
                         required_vcpus=component.estimated_vcpus,
                         remaining=len(candidates),
                     )
+                    # ── Azure: exclude add-on / feature SKUs ──
+                    # Azure PostgreSQL pricing includes add-on meters like
+                    # "Auto Tune", "Extended Support", and "IOPS Scaling"
+                    # alongside actual compute instance rows.  These are
+                    # priced per-vCore at very low rates and look like the
+                    # cheapest option but are not compute instances.
+                    # We keep only rows whose product_name ends with "Compute"
+                    # or explicitly identifies a compute tier.
+                    if provider == CloudProvider.AZURE:
+                        _AZURE_DB_ADDON_KEYWORDS = (
+                            "autonomous", "auto tune", "extended support",
+                            "backup", "iops", "tuning service", "throughput",
+                        )
+                        compute_only = [
+                            c for c in candidates
+                            if "compute" in c.product_name.lower()
+                            and not any(
+                                kw in c.product_name.lower()
+                                for kw in _AZURE_DB_ADDON_KEYWORDS
+                            )
+                        ]
+                        if compute_only:
+                            candidates = compute_only
+                            comp_log.info(
+                                "azure_db_filtered_to_compute_skus",
+                                remaining=len(candidates),
+                            )
+
+                        # ── Azure: exclude Burstable tier for production/critical ──
+                        # "Burstable Compute" is the Azure equivalent of the "Basic"
+                        # tier — it is designed for dev/test, not production workloads.
+                        # For business-critical / mission-critical tiers, force
+                        # General Purpose or Business Critical (Flexible Server).
+                        is_production_critical = workload_profile.tier in (
+                            WorkloadTier.BUSINESS_CRITICAL,
+                            WorkloadTier.MISSION_CRITICAL,
+                        )
+                        if is_production_critical:
+                            non_burstable = [
+                                c for c in candidates
+                                if "burstable" not in (c.sku_name + " " + c.product_name).lower()
+                                and "basic" not in (c.sku_name + " " + c.product_name).lower()
+                            ]
+                            if non_burstable:
+                                candidates = non_burstable
+                                comp_log.info(
+                                    "azure_db_filtered_burstable_excluded",
+                                    remaining=len(candidates),
+                                    reason="production_critical_tier",
+                                )
+
+                    # ── GCP: exclude IP address reservation rows ──
+                    # Cloud SQL pricing includes a static-IP reservation row
+                    # (~$0.01/hr = $7.30/mo) that looks like a cheap database
+                    # SKU but is only a network fee, not a compute instance.
+                    # Filter these out so the cheapest-picker selects a real
+                    # Cloud SQL instance SKU instead.
+                    if provider == CloudProvider.GCP:
+                        _GCP_IP_PATTERNS = (
+                            "ip address", "ipaddress", "ip-address",
+                            "static ip", "network ip",
+                        )
+                        non_ip = [
+                            c for c in candidates
+                            if not any(
+                                pat in (c.product_name + " " + c.sku_name).lower()
+                                for pat in _GCP_IP_PATTERNS
+                            )
+                        ]
+                        if non_ip:
+                            candidates = non_ip
+                            comp_log.info(
+                                "gcp_db_filtered_ip_reservation_rows",
+                                remaining=len(non_ip),
+                            )
+
 
                 # ── Filter STORAGE to standard-tier rows only ──
                 # S3 / Blob / GCS return archival, Glacier early-delete,
@@ -1404,6 +1791,69 @@ async def run_sizer_node(
                     )
 
                 if not candidates:
+                    # Apply fixed-cost fallback for Redis/Memcached when SKU lookup fails
+                    # (Azure Cache for Redis and GCP Memorystore are not always returned
+                    # by the pricing API for all regions).
+                    if (
+                        component.resolved_category == ServiceCategory.DATABASE
+                        and _is_redis_workload(original_wl)
+                    ):
+                        fee = _REDIS_CACHE_COST_MONTHLY.get(provider.value, 55.0)
+                        comp_log.info(
+                            "redis_fixed_cost_fallback",
+                            fee=fee,
+                            reason="no_candidates_from_pricing_api",
+                        )
+                        all_results.append(
+                            SizedWorkloadResult(
+                                workload_name=component.workload_name,
+                                provider=provider,
+                                selected_sku=None,
+                                alternative_skus=[],
+                                monthly_cost_usd=fee,
+                                fit_score=0.8,
+                                rationale=(
+                                    f"Fixed-cost estimate for managed Redis/Memcached "
+                                    f"on {provider.value}: ${fee:.2f}/mo (pricing API "
+                                    f"returned no SKUs for region {region})."
+                                ),
+                            )
+                        )
+                        continue
+
+                    # Apply fixed-cost fallback for PostgreSQL/relational databases on AWS.
+                    # The AWS Bulk Pricing API does not index RDS SKUs for all regions,
+                    # causing zero candidates for PostgreSQL workloads.  Report a realistic
+                    # baseline (Multi-AZ db.t3.medium) rather than $0.
+                    if (
+                        component.resolved_category == ServiceCategory.DATABASE
+                        and _is_postgres_workload(original_wl)
+                        and provider == CloudProvider.AWS
+                    ):
+                        fee = _RDS_COST_MONTHLY.get(provider.value, 185.0)
+                        comp_log.info(
+                            "rds_fixed_cost_fallback",
+                            fee=fee,
+                            reason="no_rds_candidates_from_pricing_api",
+                        )
+                        all_results.append(
+                            SizedWorkloadResult(
+                                workload_name=component.workload_name,
+                                provider=provider,
+                                selected_sku=None,
+                                alternative_skus=[],
+                                monthly_cost_usd=fee,
+                                fit_score=0.7,
+                                rationale=(
+                                    f"Fixed-cost estimate for managed PostgreSQL (RDS) "
+                                    f"on AWS: ${fee:.2f}/mo — Multi-AZ db.t3.medium "
+                                    f"baseline (pricing API returned no RDS SKUs for "
+                                    f"region {region})."
+                                ),
+                            )
+                        )
+                        continue
+
                     comp_log.warning("no_candidates_found")
                     all_results.append(
                         SizedWorkloadResult(
@@ -1424,8 +1874,35 @@ async def run_sizer_node(
 
                 # ── Route to appropriate sizing strategy ──────
                 if component.resolved_category in _SCORED_CATEGORIES:
+                    # ── Cap vCPUs at 4× requested to prevent massively oversized SKUs ──
+                    # The scoring engine ranks by cost + fit, but if the candidate pool
+                    # contains only very large instances (e.g. c8a.8xlarge = 32 vCPU for
+                    # a 6-vCPU workload), the least-bad oversized instance wins and inflates
+                    # cost 5×.  Pre-filter to a reasonable ceiling so a genuinely well-fitting
+                    # instance in the 8–16 vCPU range (if available) is preferred.
+                    req_vcpu = component.estimated_vcpus or 0
+                    if req_vcpu > 0:
+                        max_vcpu = max(8, int(req_vcpu * 4))
+                        vcpu_capped = [
+                            c for c in candidates
+                            if extract_vcpus(c) <= max_vcpu or extract_vcpus(c) == 0
+                        ]
+                        if vcpu_capped:
+                            candidates = vcpu_capped
+                            comp_log.info(
+                                "compute_candidates_vcpu_capped",
+                                req_vcpu=req_vcpu,
+                                max_vcpu=max_vcpu,
+                                remaining=len(vcpu_capped),
+                            )
                     result = await _size_compute_workload(
                         component, original_wl, candidates, provider,
+                    )
+                    all_results.append(result)
+
+                elif component.resolved_category == ServiceCategory.SERVERLESS:
+                    result = await _size_serverless_workload(
+                        component, original_wl, provider,
                     )
                     all_results.append(result)
 
@@ -1459,19 +1936,28 @@ async def run_sizer_node(
                     # The generic sizer returns ``unit_price × 1`` for
                     # GB-month priced items.  We need to scale by the
                     # actual storage volume from the workload requirement.
+                    # Guard: only apply scaling when the selected SKU is
+                    # truly per-GB capacity pricing (unit_of_measure contains
+                    # "gb" or "gib").  Per-IOPS, per-disk, and per-request
+                    # SKUs must not be multiplied by storage_gb.
+                    _sku = result.selected_sku
+                    _is_per_gb = _sku is not None and any(
+                        u in _sku.unit_of_measure.lower() for u in ("gb", "gib")
+                    )
                     if (
                         component.resolved_category == ServiceCategory.STORAGE
-                        and result.selected_sku is not None
-                        and result.selected_sku.is_monthly
-                        and result.selected_sku.unit_price > 0
+                        and _sku is not None
+                        and _is_per_gb
+                        and (_sku.is_monthly or _sku.is_hourly)
+                        and _sku.unit_price > 0
                     ):
                         storage_gb = original_wl.resources.storage_gb or 100.0
-                        per_gb = result.selected_sku.unit_price
+                        per_gb = _sku.unit_price if _sku.is_monthly else round(_sku.unit_price * 730, 6)
                         monthly = round(per_gb * storage_gb, 2)
                         result = result.model_copy(update={
                             "monthly_cost_usd": monthly,
                             "rationale": (
-                                f"Selected {result.selected_sku.sku_name} at "
+                                f"Selected {_sku.sku_name} at "
                                 f"${per_gb:.4f}/GB-Month. "
                                 f"Est. ${monthly:.2f}/mo for "
                                 f"{storage_gb:.0f} GB storage."
