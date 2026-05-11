@@ -413,7 +413,6 @@ async def run_validator_node(
         }
 
         return {
-            **state,
             "validation_report": validation_report,
             "architecture_alternatives": architecture_alternatives,
             "current_agent": "validator",
@@ -440,7 +439,6 @@ async def run_validator_node(
             architecture_alternatives_count=len(architecture_alternatives),
         )
         return {
-            **state,
             "validation_report": validation_report or {"error": "Validator failed"},
             "architecture_alternatives": architecture_alternatives,
             "current_agent": "validator",

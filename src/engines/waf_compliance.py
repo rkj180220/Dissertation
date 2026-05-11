@@ -303,6 +303,119 @@ def _check_sustainability(
     return checks
 
 
+def _check_database_ha(
+    request: WorkloadRequest,
+) -> list[ComplianceCheckResult]:
+    """Reliability: Database High Availability for production workloads.
+
+    For business-critical and mission-critical tiers, all database workloads
+    must have HA enabled (multi-AZ / failover replicas).
+    """
+    checks: list[ComplianceCheckResult] = []
+    production_tiers = {WorkloadTier.BUSINESS_CRITICAL, WorkloadTier.MISSION_CRITICAL}
+
+    if request.tier not in production_tiers:
+        return checks
+
+    db_workloads = [
+        w for w in request.workloads
+        if w.suggested_category == ServiceCategory.DATABASE
+    ]
+
+    for db in db_workloads:
+        ha_enabled = db.resources.high_availability
+        passed = ha_enabled
+        checks.append(
+            ComplianceCheckResult(
+                pillar="Reliability",
+                check_name=f"Database HA — {db.name}",
+                passed=passed,
+                severity="high" if not passed else "low",
+                finding=(
+                    f"HA {'enabled' if ha_enabled else 'NOT configured'} "
+                    f"for {request.tier.value} tier database"
+                ),
+                recommendation=(
+                    "Enable high_availability=True and configure at least one "
+                    "read replica for mission/business-critical databases"
+                    if not passed
+                    else "Database HA configuration meets reliability requirements"
+                ),
+            )
+        )
+
+    return checks
+
+
+def _check_budget_ceiling(
+    request: WorkloadRequest,
+) -> list[ComplianceCheckResult]:
+    """Cost Optimization: Verify a budget ceiling is specified.
+
+    A defined budget ceiling enables FinOps analysis to flag over-budget
+    designs.  Missing budget is a Cost Optimization gap.
+    """
+    budget_set = request.budget_monthly_usd is not None and request.budget_monthly_usd > 0
+    return [
+        ComplianceCheckResult(
+            pillar="Cost Optimization",
+            check_name="Budget Ceiling Defined",
+            passed=budget_set,
+            severity="medium" if not budget_set else "low",
+            finding=(
+                f"Budget ceiling: ${request.budget_monthly_usd:,.0f}/mo"
+                if budget_set
+                else "No monthly budget ceiling specified"
+            ),
+            recommendation=(
+                "Specify budget_monthly_usd to enable FinOps budget-breach alerts"
+                if not budget_set
+                else "Budget ceiling enables cost guardrails"
+            ),
+        )
+    ]
+
+
+def _check_compliance_coverage(
+    request: WorkloadRequest,
+) -> list[ComplianceCheckResult]:
+    """Security: Compliance framework tags on workloads.
+
+    When compliance frameworks are required (e.g. StateRAMP, HIPAA),
+    all workloads should carry the corresponding compliance_tags so that
+    controls can be mapped per component.
+    """
+    checks: list[ComplianceCheckResult] = []
+    if not request.compliance_frameworks:
+        return checks
+
+    frameworks_lower = {f.lower() for f in request.compliance_frameworks}
+
+    for wl in request.workloads:
+        wl_tags_lower = {t.lower() for t in wl.compliance_tags}
+        # Check if any framework appears in the workload's compliance tags
+        tagged = bool(frameworks_lower & wl_tags_lower) or bool(wl_tags_lower)
+        checks.append(
+            ComplianceCheckResult(
+                pillar="Security",
+                check_name=f"Compliance Tagging — {wl.name}",
+                passed=tagged,
+                severity="medium" if not tagged else "low",
+                finding=(
+                    f"Tags: {', '.join(wl.compliance_tags) or 'none'}"
+                ),
+                recommendation=(
+                    f"Add compliance tags ({', '.join(request.compliance_frameworks)}) "
+                    f"to workload '{wl.name}' so controls can be mapped per component"
+                    if not tagged
+                    else "Compliance tags are present on this workload"
+                ),
+            )
+        )
+
+    return checks
+
+
 # ─── Public API ─────────────────────────────────────────────
 
 
@@ -327,8 +440,11 @@ def evaluate_compliance(
     # --- Run all pillar checks ---
     all_checks.extend(_check_reliability_ha(request, bin_packing_results))
     all_checks.extend(_check_reliability_replicas(request))
+    all_checks.extend(_check_database_ha(request))
     all_checks.extend(_check_security_encryption(request))
+    all_checks.extend(_check_compliance_coverage(request))
     all_checks.extend(_check_cost_optimization(request, bin_packing_results))
+    all_checks.extend(_check_budget_ceiling(request))
     all_checks.extend(_check_performance_efficiency(request))
     all_checks.extend(_check_operational_excellence(request))
     all_checks.extend(_check_sustainability(request, bin_packing_results))

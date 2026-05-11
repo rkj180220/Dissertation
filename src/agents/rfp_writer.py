@@ -558,9 +558,83 @@ _PROVIDER_CERTIFICATIONS: dict[str, list[tuple[str, str]]] = {
 }
 
 
+
+
+def _build_architecture_alternatives_section(
+    architecture_alternatives: list[dict],
+) -> str:
+    """P15i — Build an Architecture Alternatives section from validator results.
+
+    Args:
+        architecture_alternatives: Ranked options from ``validation_report["architecture_validation"]["ranked"]``.
+
+    Returns:
+        Markdown section string, or empty string if no alternatives.
+    """
+    if not architecture_alternatives:
+        return ""
+
+    lines = ["## Architecture Alternatives\n"]
+    lines.append(
+        "The following options were evaluated during architecture scoring. "
+        "Options are ranked by weighted score (reliability × 0.30, cost × 0.25, "
+        "scale × 0.25, compliance × 0.10, latency × 0.10).\n"
+    )
+    lines.append(
+        "| # | Option | Score | Est. Monthly Cost | Rationale |\n"
+        "|---|--------|-------|------------------|-----------|"
+    )
+    for i, opt in enumerate(architecture_alternatives[:4], 1):
+        option = opt.get("option", "unknown").replace("_", " ").title()
+        score = f"{opt.get('score', 0.0):.3f}"
+        cost = f"${opt.get('monthly_cost_estimate', 0.0):,.0f}"
+        rationale = opt.get("rationale", "N/A")[:120]
+        lines.append(f"| {i} | {option} | {score} | {cost} | {rationale} |")
+
+    lines.append("\n")
+    recommended = architecture_alternatives[0].get("option", "unknown").replace("_", " ").title() if architecture_alternatives else "N/A"
+    lines.append(
+        f"> **Selected**: {recommended} — highest weighted score across all evaluation criteria.\n"
+    )
+    return "\n".join(lines)
+
+
+def _build_pricing_caveats_note(
+    validation_report: dict,
+) -> str:
+    """P15i — Build a Pricing Data Caveats note if errors exist in pricing validation.
+
+    Args:
+        validation_report: Full ``validation_report`` dict from Validator agent.
+
+    Returns:
+        Markdown warning block, or empty string if no errors.
+    """
+    pricing_val = validation_report.get("pricing_validation", {})
+    findings = pricing_val.get("findings", [])
+    errors = [f for f in findings if isinstance(f, dict) and f.get("severity") == "error"]
+
+    if not errors:
+        return ""
+
+    lines = [
+        "> ⚠️ **Pricing Data Caveats**\n>",
+        "> The following data integrity issues were detected during pricing validation.",
+        "> Cost figures in this document may be impacted. Re-run after resolving.\n>",
+    ]
+    for err in errors[:5]:
+        wl = err.get("workload_name", "?")
+        check = err.get("check_type", "?")
+        desc = err.get("description", "")[:100]
+        lines.append(f"> - **{wl}** ({check}): {desc}")
+    lines.append("\n")
+    return "\n".join(lines)
+
+
 def _build_toc_section(
     include_traceability: bool = False,
     include_mobile: bool = False,
+    include_stateramp_gap: bool = False,
 ) -> str:
     base = (
         "## Table of Contents\n\n"
@@ -584,12 +658,16 @@ def _build_toc_section(
     extras = ""
     if include_traceability:
         extras += "17. [Requirements Traceability Matrix](#traceability)\n"
+    if include_stateramp_gap:
+        num = 18 if include_traceability else 17
+        extras += f"{num}. [Appendix A — StateRAMP Moderate: Compliance Gap Analysis](#stateramp-gap)\n"
     return base + extras
 
 
 def _build_requirements_traceability_section(
     workload_request: WorkloadRequest,
     workload_profile: WorkloadProfile,
+    has_stateramp_gap: bool = False,
 ) -> str:
     """Gap 10b — Requirements traceability matrix mapping compliance/functional needs to solution."""
     from src.models.cloud_resource import ServiceCategory
@@ -645,9 +723,14 @@ def _build_requirements_traceability_section(
         for fw in frameworks:
             fw_lower = fw.lower().replace(" ", "-")
             desc = _COMPLIANCE_DESCRIPTIONS.get(fw_lower, (fw, "Controls to be defined during ATO process"))
+            is_stateramp = fw_lower in ("stateramp", "stateramp-moderate", "stateramp-high")
+            if has_stateramp_gap and is_stateramp:
+                status = "Partial ⚠️ — See Appendix A (gap analysis)"
+            else:
+                status = "Acknowledged ✅"
             lines.append(
                 f"| C-{cid:02d} | {desc[0]} | {desc[1]} | "
-                f"Cloud provider baseline + customer controls | Acknowledged ✅ |"
+                f"Cloud provider baseline + customer controls | {status} |"
             )
             cid += 1
 
@@ -762,9 +845,17 @@ def _build_managed_services_section(
     return "\n".join(lines) + "\n"
 
 
-def _build_mobile_subsection(workload_request: WorkloadRequest) -> str:
+def _build_mobile_subsection(workload_request: WorkloadRequest, recommended_provider: str | None = None) -> str:
     """Gap 10d — Mobile application architecture subsection (inserted into architecture section)."""
-    provider = workload_request.target_providers[0].value if workload_request.target_providers else "aws"
+    # Use recommended provider when available; otherwise fall back to the first
+    # requested provider.  This prevents showing AWS-specific services (AppSync,
+    # DynamoDB, SNS) in documents where GCP or Azure was recommended.
+    if recommended_provider:
+        provider = recommended_provider.lower()
+    elif workload_request.target_providers:
+        provider = workload_request.target_providers[0].value
+    else:
+        provider = "aws"
     prov_services = _MANAGED_SERVICES.get(provider, {})
     mobile_service = prov_services.get("MOBILE", "AWS AppSync + DynamoDB + SNS")
 
@@ -800,6 +891,7 @@ def _build_architecture_section(
     workload_profile: WorkloadProfile,
     workload_request: WorkloadRequest,
     sized_results: list[SizedWorkloadResult],
+    recommended_provider: str | None = None,
 ) -> str:
     """Build the reference architecture section with ASCII topology.
 
@@ -807,6 +899,7 @@ def _build_architecture_section(
         workload_profile: Profiler output.
         workload_request: Original request.
         sized_results: All sizing results.
+        recommended_provider: FinOps-recommended provider name (e.g. "azure").
 
     Returns:
         Markdown section string.
@@ -825,7 +918,13 @@ def _build_architecture_section(
     has_networking = ServiceCategory.NETWORKING in categories
     has_ai_ml = ServiceCategory.AI_ML in categories
 
-    preferred_provider = workload_request.target_providers[0].value.upper() if workload_request.target_providers else "CLOUD"
+    # Use the FinOps-recommended provider; fall back to first target_provider
+    if recommended_provider:
+        preferred_provider = recommended_provider.upper()
+    elif workload_request.target_providers:
+        preferred_provider = workload_request.target_providers[0].value.upper()
+    else:
+        preferred_provider = "CLOUD"
 
     # ASCII architecture diagram
     lines.append("### Architecture Overview\n")
@@ -945,7 +1044,7 @@ def _build_architecture_section(
 
     # Gap 10d — mobile architecture subsection
     if _is_mobile_scenario(workload_request):
-        lines.append(_build_mobile_subsection(workload_request))
+        lines.append(_build_mobile_subsection(workload_request, recommended_provider))
 
     return "\n".join(lines) + "\n"
 
@@ -1038,7 +1137,27 @@ def _build_tech_specs_section(
                     break  # Show first provider's attrs only
 
         if comp.rationale:
-            lines.append(f"> **Sizing Rationale**: {comp.rationale[:300]}\n")
+            # Defensively parse JSON rationale — the profiler LLM may return raw JSON
+            # when the response has a preamble that prevents clean json.loads()
+            rationale_text = comp.rationale
+            try:
+                parsed = json.loads(rationale_text)
+                extracted = parsed.get("rationale", rationale_text)
+                adjustments = parsed.get("adjustments", "")
+                if adjustments and adjustments.strip().lower() not in ("none", ""):
+                    rationale_text = f"{extracted} Adjustments: {adjustments}"
+                else:
+                    rationale_text = extracted
+            except (json.JSONDecodeError, TypeError):
+                pass
+            # Truncate to a sentence boundary for clean display
+            if len(rationale_text) > 400:
+                truncated = rationale_text[:400]
+                last_period = truncated.rfind(". ")
+                rationale_text = (
+                    truncated[:last_period + 1] if last_period > 80 else truncated + "..."
+                )
+            lines.append(f"> **Sizing Rationale**: {rationale_text}\n")
 
     # Aggregated summary
     lines.append("### Component Summary\n")
@@ -2037,6 +2156,342 @@ async def _generate_executive_summary(
 
 
 # ---------------------------------------------------------------------------
+# P16c — StateRAMP Moderate Compliance Gap Analysis
+# ---------------------------------------------------------------------------
+
+#: The 17 NIST 800-53 Rev 5 control families that form the StateRAMP Moderate baseline.
+#: Each entry has a human name, keywords to search for in the RFP (heuristic fallback),
+#: and a short description used in the LLM prompt.
+_STATERAMP_MODERATE_FAMILIES: dict[str, dict] = {
+    "AC": {
+        "name": "Access Control",
+        "keywords": ["rbac", "role-based", "least privilege", "mfa", "multi-factor", "access control",
+                     "session timeout", "remote access", "privileged access"],
+        "description": "Role-based access, least privilege, MFA, session management, remote access controls",
+    },
+    "AT": {
+        "name": "Awareness and Training",
+        "keywords": ["security training", "awareness training", "security awareness", "training programme"],
+        "description": "Annual security awareness training; role-specific training for privileged users",
+    },
+    "AU": {
+        "name": "Audit and Accountability",
+        "keywords": ["audit log", "audit trail", "tamper-evident", "log retention", "logging",
+                     "centralized logging", "siem"],
+        "description": "Tamper-evident audit logs, 90-day minimum retention, log review processes",
+    },
+    "CA": {
+        "name": "Assessment, Authorization, and Monitoring",
+        "keywords": ["3pao", "ato", "authorization to operate", "security assessment", "ssp",
+                     "system security plan", "continuous monitoring", "conmon"],
+        "description": "3PAO assessment, SSP, ATO grant, continuous monitoring program",
+    },
+    "CM": {
+        "name": "Configuration Management",
+        "keywords": ["configuration management", "hardening", "cis benchmark", "patch management",
+                     "baseline configuration", "change management", "iac", "terraform"],
+        "description": "Baseline configurations, CIS hardening, patch management, change control",
+    },
+    "CP": {
+        "name": "Contingency Planning",
+        "keywords": ["disaster recovery", "contingency", "rpo", "rto", "backup", "business continuity",
+                     "failover", "recovery point", "recovery time"],
+        "description": "DR plan, backup procedures, RPO/RTO targets, BCP testing",
+    },
+    "IA": {
+        "name": "Identification and Authentication",
+        "keywords": ["mfa", "multi-factor", "piv", "cac", "identity", "authentication",
+                     "password policy", "privileged identity", "zero trust"],
+        "description": "MFA for all privileged access, PIV/CAC support, password complexity",
+    },
+    "IR": {
+        "name": "Incident Response",
+        "keywords": ["incident response", "incident", "ir plan", "detection", "us-cert",
+                     "breach notification", "soc", "security operations"],
+        "description": "IR plan, detection SLAs, 1-hour notification for critical incidents",
+    },
+    "MA": {
+        "name": "Maintenance",
+        "keywords": ["maintenance", "patching", "patch", "vulnerability remediation",
+                     "software update", "firmware"],
+        "description": "Controlled maintenance procedures, remote maintenance controls, patch SLAs",
+    },
+    "MP": {
+        "name": "Media Protection",
+        "keywords": ["media protection", "data destruction", "sanitization", "wipe",
+                     "removable media", "data disposal"],
+        "description": "Media access controls, data sanitization on disposal, removable media restrictions",
+    },
+    "PE": {
+        "name": "Physical and Environmental Protection",
+        "keywords": ["physical security", "data centre", "datacenter", "physical access",
+                     "environmental controls", "tier iii", "tier iv"],
+        "description": "Data centre physical security, environmental controls (CSP-managed for cloud)",
+    },
+    "PL": {
+        "name": "Planning",
+        "keywords": ["security plan", "ssp", "system security plan", "rules of behaviour",
+                     "privacy plan"],
+        "description": "System Security Plan (SSP), security planning, rules of behaviour document",
+    },
+    "PM": {
+        "name": "Program Management",
+        "keywords": ["risk management", "program management", "security programme", "governance",
+                     "ciso", "security officer"],
+        "description": "Enterprise risk management program, security governance structure",
+    },
+    "RA": {
+        "name": "Risk Assessment",
+        "keywords": ["risk assessment", "vulnerability assessment", "threat modelling",
+                     "vulnerability scan", "penetration test", "cvss"],
+        "description": "Periodic risk assessments, vulnerability scans, penetration testing",
+    },
+    "SA": {
+        "name": "System and Services Acquisition",
+        "keywords": ["third-party", "vendor", "supply chain", "software assurance",
+                     "ssdlc", "secure sdlc", "procurement", "dependency"],
+        "description": "Secure SDLC, third-party risk management, supply chain security",
+    },
+    "SC": {
+        "name": "System and Communications Protection",
+        "keywords": ["tls", "fips", "encryption", "mtls", "service mesh",
+                     "network segmentation", "vpc", "firewall", "fips 140"],
+        "description": "FIPS 140-2 encryption, TLS 1.2+, network segmentation, service mesh",
+    },
+    "SI": {
+        "name": "System and Information Integrity",
+        "keywords": ["vulnerability scan", "edr", "anti-virus", "antivirus", "ids", "ips",
+                     "intrusion detection", "malware", "integrity monitoring", "sca"],
+        "description": "AV/EDR, vulnerability scanning, patch SLAs (30-day critical), integrity monitoring",
+    },
+}
+
+_STATERAMP_GAP_ANALYSIS_PROMPT = """\
+You are a StateRAMP Moderate compliance analyst reviewing a cloud procurement RFP.
+
+Your task: for each of the 17 NIST 800-53 Rev 5 control families in the StateRAMP Moderate
+baseline, determine whether the RFP adequately addresses it.
+
+Return ONLY a valid JSON object with this exact schema (no markdown fences, no commentary):
+{
+  "AC": {"status": "ADDRESSED|PARTIALLY_ADDRESSED|GAP", "note": "brief finding ≤40 words"},
+  "AT": {"status": "...", "note": "..."},
+  ... (all 17 families)
+}
+
+Status definitions:
+- ADDRESSED: RFP explicitly covers the control family with sufficient detail for an SSP.
+- PARTIALLY_ADDRESSED: Some controls mentioned but gaps exist (e.g., MFA stated but no PIV/CAC).
+- GAP: No meaningful coverage; vendor must add this before 3PAO assessment.
+
+Be concise. If a control is CSP-managed (e.g., PE — physical security of the data centre),
+mark it ADDRESSED with note "CSP-managed; inherited from provider's ATO."
+"""
+
+
+@observe()
+async def _generate_stateramp_gap_analysis(
+    llm: BaseChatModel,
+    rfp_document: str,
+    workload_request: WorkloadRequest,
+    compliance_report: ComplianceReport,
+) -> str:
+    """Post-generation LLM pass: StateRAMP Moderate control-family gap analysis.
+
+    Feeds a structured summary of the RFP into the LLM and asks it to rate
+    each of the 17 NIST 800-53 control families as ADDRESSED / PARTIALLY_ADDRESSED / GAP.
+    The result is rendered as a Markdown appendix section.
+
+    Args:
+        llm: Model-agnostic LLM instance.
+        rfp_document: The fully assembled RFP Markdown document.
+        workload_request: Original user request (for compliance framework context).
+        compliance_report: WAF compliance results.
+
+    Returns:
+        Markdown string for the StateRAMP Gap Analysis appendix section.
+    """
+    log = logger.bind(agent="rfp_writer", step="stateramp_gap_analysis")
+    log.info("stateramp_gap_analysis_started",
+             project=workload_request.project_name)
+
+    # Build a compact summary payload — feed key sections rather than full doc
+    # to stay within context limits for any provider.
+    rfp_excerpt = rfp_document[:6000] if len(rfp_document) > 6000 else rfp_document
+
+    # Also include WAF check results as structured context
+    waf_results = [
+        {"check": c.check_name, "passed": c.passed, "detail": c.recommendation or ""}
+        for c in (compliance_report.checks or [])
+    ]
+
+    payload = json.dumps({
+        "project": workload_request.project_name,
+        "environment": workload_request.environment.value,
+        "compliance_frameworks": workload_request.compliance_frameworks,
+        "waf_checks": waf_results,
+        "rfp_excerpt": rfp_excerpt,
+        "control_families": {
+            code: {"name": v["name"], "description": v["description"]}
+            for code, v in _STATERAMP_MODERATE_FAMILIES.items()
+        },
+    }, indent=2)
+
+    messages = [
+        SystemMessage(content=_STATERAMP_GAP_ANALYSIS_PROMPT),
+        HumanMessage(content=f"Analyse this RFP for StateRAMP Moderate coverage:\n\n{payload}"),
+    ]
+
+    try:
+        response = await llm.ainvoke(messages)
+        raw = response.content if hasattr(response, "content") else str(response)
+
+        # Strip markdown fences if LLM wrapped the JSON
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+
+        gap_data: dict[str, dict] = json.loads(raw)
+        log.info("stateramp_gap_analysis_llm_completed",
+                 families=len(gap_data))
+        return _render_gap_analysis_section(gap_data, source="llm")
+
+    except Exception:
+        log.warning("stateramp_gap_analysis_llm_failed",
+                    exc_info=True,
+                    fallback="heuristic")
+        gap_data = _heuristic_gap_analysis(rfp_document)
+        return _render_gap_analysis_section(gap_data, source="heuristic")
+
+
+def _heuristic_gap_analysis(rfp_document: str) -> dict[str, dict]:
+    """Keyword-based fallback gap analysis when the LLM call fails.
+
+    Args:
+        rfp_document: Full assembled RFP text.
+
+    Returns:
+        Dict mapping family code → {status, note}.
+    """
+    rfp_lower = rfp_document.lower()
+    result: dict[str, dict] = {}
+
+    for code, meta in _STATERAMP_MODERATE_FAMILIES.items():
+        hits = sum(1 for kw in meta["keywords"] if kw in rfp_lower)
+        if hits >= 3:
+            status = "ADDRESSED"
+            note = f"{hits} relevant controls found in RFP text."
+        elif hits >= 1:
+            status = "PARTIALLY_ADDRESSED"
+            note = f"Only {hits} keyword(s) found; review for completeness."
+        else:
+            status = "GAP"
+            note = "No coverage detected; must be added before 3PAO assessment."
+        result[code] = {"status": status, "note": note}
+
+    return result
+
+
+def _render_gap_analysis_section(
+    gap_data: dict[str, dict],
+    source: str = "llm",
+) -> str:
+    """Render the gap analysis dict as a Markdown appendix section.
+
+    Args:
+        gap_data: Dict from ``_generate_stateramp_gap_analysis`` or
+            ``_heuristic_gap_analysis`` (family code → {status, note}).
+        source: ``"llm"`` or ``"heuristic"`` — shown in footer note.
+
+    Returns:
+        Markdown string for the appendix.
+    """
+    _STATUS_ICON = {
+        "ADDRESSED": "✅",
+        "PARTIALLY_ADDRESSED": "⚠️",
+        "GAP": "❌",
+    }
+
+    lines = [
+        "## Appendix A — StateRAMP Moderate: Compliance Gap Analysis\n",
+        "> This appendix presents a control-family level gap analysis against the "
+        "**StateRAMP Moderate** baseline (NIST SP 800-53 Rev 5, 325 controls across "
+        "17 families). Findings are intended to guide the vendor's System Security "
+        "Plan (SSP) development and 3PAO assessment preparation.\n",
+    ]
+
+    # Summary counts
+    addressed = sum(1 for v in gap_data.values() if v.get("status") == "ADDRESSED")
+    partial = sum(1 for v in gap_data.values() if v.get("status") == "PARTIALLY_ADDRESSED")
+    gaps = sum(1 for v in gap_data.values() if v.get("status") == "GAP")
+    total = addressed + partial + gaps
+
+    lines.append(
+        f"**Coverage Summary**: {addressed}/{total} families ADDRESSED · "
+        f"{partial} PARTIALLY ADDRESSED · {gaps} GAP\n"
+    )
+
+    # Main table
+    lines.append(
+        "| Family | Name | Status | Finding |\n"
+        "|--------|------|--------|---------|\n"
+    )
+    for code, meta in _STATERAMP_MODERATE_FAMILIES.items():
+        entry = gap_data.get(code, {"status": "GAP", "note": "Not analysed."})
+        status = entry.get("status", "GAP")
+        note = entry.get("note", "").replace("|", "∣")  # escape pipe chars in table
+        icon = _STATUS_ICON.get(status, "❓")
+        lines.append(
+            f"| **{code}** | {meta['name']} | {icon} {status.replace('_', ' ')} | {note} |"
+        )
+
+    lines.append("")
+
+    # Gap remediation guidance
+    gap_families = [
+        (code, gap_data[code])
+        for code in _STATERAMP_MODERATE_FAMILIES
+        if code in gap_data and gap_data[code].get("status") in ("GAP", "PARTIALLY_ADDRESSED")
+    ]
+    if gap_families:
+        lines.append("### Remediation Priorities\n")
+        lines.append(
+            "The following control families require additional documentation or "
+            "implementation before 3PAO assessment:\n"
+        )
+        for code, entry in gap_families:
+            family_meta = _STATERAMP_MODERATE_FAMILIES[code]
+            status = entry.get("status", "GAP")
+            icon = _STATUS_ICON.get(status, "❓")
+            lines.append(f"**{code} — {family_meta['name']}** {icon}")
+            lines.append(f"- *Required*: {family_meta['description']}")
+            lines.append(f"- *Finding*: {entry.get('note', '')}")
+            lines.append("")
+    else:
+        lines.append(
+            "> ✅ All 17 control families are addressed. "
+            "The RFP is ready to progress to 3PAO security assessment.\n"
+        )
+
+    source_note = (
+        "AI-assisted gap analysis (LLM review of RFP content)"
+        if source == "llm"
+        else "Heuristic gap analysis (keyword matching — LLM unavailable)"
+    )
+    lines.append(
+        f"\n*Analysis method: {source_note}. "
+        "This is a preliminary assessment and does not constitute a formal 3PAO evaluation. "
+        "Engage a StateRAMP-authorised Third-Party Assessment Organization (3PAO) for "
+        "the official Security Assessment Report (SAR).*\n"
+    )
+
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Main node function
 # ---------------------------------------------------------------------------
 
@@ -2122,17 +2577,32 @@ async def run_rfp_writer_node(
         # ── Pull TCO projections from state KPIs ──────────────
         kpis: dict[str, Any] = state.get("kpis") or {}
 
+        # ── P15i: Read validation report for alternatives/caveats
+        validation_report: dict[str, Any] = state.get("validation_report") or {}
+        arch_alternatives: list[dict] = state.get("architecture_alternatives") or []
+        # Prefer validator's ranked list over raw state field
+        arch_val = validation_report.get("architecture_validation", {})
+        if arch_val.get("ranked"):
+            arch_alternatives = arch_val["ranked"]
+
         # ── Scenario flags ────────────────────────────────────
         include_traceability = bool(workload_request.compliance_frameworks)
         include_mobile = _is_mobile_scenario(workload_request)
+        frameworks_lower = [f.lower() for f in (workload_request.compliance_frameworks or [])]
+        has_stateramp = any("stateramp" in f for f in frameworks_lower)
+        include_stateramp_gap = has_stateramp
 
         # ── Assemble the RFP document ─────────────────────────
         sections = [
             _build_header_section(workload_request),
-            _build_toc_section(include_traceability=include_traceability, include_mobile=include_mobile),
+            _build_toc_section(
+                include_traceability=include_traceability,
+                include_mobile=include_mobile,
+                include_stateramp_gap=include_stateramp_gap,
+            ),
             f"## 1. Executive Summary\n\n{executive_summary}\n",
             _build_workload_summary_section(workload_profile, workload_request),
-            _build_architecture_section(workload_profile, workload_request, sized_results),
+            _build_architecture_section(workload_profile, workload_request, sized_results, state.get("recommended_provider")),
             _build_tech_specs_section(workload_profile, sized_results, workload_request),
             _build_managed_services_section(workload_profile, workload_request, sized_results),
             _build_sku_selection_section(sized_results),
@@ -2148,10 +2618,33 @@ async def run_rfp_writer_node(
             _build_compliance_section(compliance_report),
         ]
 
+        # P15i: insert Architecture Alternatives section if available
+        arch_alt_section = _build_architecture_alternatives_section(arch_alternatives)
+        if arch_alt_section:
+            sections.append(arch_alt_section)
+
+        # P15i: insert Pricing Caveats note after cost sections if errors exist
+        pricing_caveats = _build_pricing_caveats_note(validation_report)
+        if pricing_caveats:
+            sections.append(pricing_caveats)
+
         if include_traceability:
             sections.append(
-                _build_requirements_traceability_section(workload_request, workload_profile)
+                _build_requirements_traceability_section(
+                    workload_request, workload_profile,
+                    has_stateramp_gap=include_stateramp_gap,
+                )
             )
+
+        # P16c: post-generation StateRAMP Moderate compliance gap analysis appendix
+        if include_stateramp_gap:
+            log.info("stateramp_gap_analysis_requested")
+            gap_section = await _generate_stateramp_gap_analysis(
+                llm, "\n".join(sections), workload_request, compliance_report
+            )
+            sections.append(gap_section)
+            log.info("stateramp_gap_analysis_appended",
+                     gap_section_length=len(gap_section))
 
         rfp_document = "\n---\n\n".join(sections)
 
@@ -2166,8 +2659,9 @@ async def run_rfp_writer_node(
             f"**RFP Document Generated** — "
             f"{len(rfp_document):,} characters, {len(sections)} sections.\n\n"
             f"**Compliance**: {compliance_report.compliance_score_pct:.0f}% "
-            f"({compliance_report.passed_checks}/{compliance_report.total_checks} passed)\n\n"
-            f"**Executive Summary**: {executive_summary[:200]}..."
+            f"({compliance_report.passed_checks}/{compliance_report.total_checks} passed)"
+            + (f"\n\n**StateRAMP Gap Analysis**: Appended (Appendix A)." if include_stateramp_gap else "")
+            + f"\n\n**Executive Summary**: {executive_summary[:200]}..."
         )
 
         summary_message = ChatMessage(
