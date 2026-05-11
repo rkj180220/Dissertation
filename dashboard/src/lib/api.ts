@@ -56,6 +56,22 @@ export async function checkReady(): Promise<ReadyResponse> {
   return res.json();
 }
 
+export async function submitFeedback(
+  requestId: string,
+  rating: number,
+  comment?: string,
+): Promise<void> {
+  const res = await fetch(`${API_BASE_URL}/feedback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ request_id: requestId, rating, comment }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Feedback submission failed (${res.status}): ${text}`);
+  }
+}
+
 // ── SSE streaming endpoint ───────────────────────
 
 export interface StreamCallbacks {

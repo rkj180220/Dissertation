@@ -13,7 +13,6 @@ export function ChatContainer() {
     phase,
     messages,
     agentProgress,
-    isStreaming,
     error,
     durationMs,
     sendMessage,

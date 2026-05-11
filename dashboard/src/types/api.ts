@@ -271,6 +271,20 @@ export interface OrchestrationRequest {
   request_id?: string;
 }
 
+export interface ArchitectureAlternative {
+  name: string;
+  label: string;
+  score: number;
+  monthly_cost_estimate: number;
+  rationale: string;
+  trade_offs: string;
+  reliability_score: number;
+  cost_score: number;
+  scale_score: number;
+  compliance_score: number;
+  latency_score: number;
+}
+
 export interface OrchestrationResponse {
   request_id: string;
   status: "completed" | "failed";
@@ -279,6 +293,7 @@ export interface OrchestrationResponse {
   recommended_provider: string | null;
   cost_comparison: CostComparison | null;
   compliance_report: ComplianceReport | null;
+  architecture_alternatives?: ArchitectureAlternative[];
   error: string | null;
   duration_ms: number | null;
 }
@@ -330,6 +345,7 @@ export interface SSEPipelineComplete {
     recommended_provider?: string;
     cost_comparison?: CostComparison;
     compliance_report?: ComplianceReport;
+    architecture_alternatives?: ArchitectureAlternative[];
   };
 }
 

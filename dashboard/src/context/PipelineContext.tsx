@@ -144,6 +144,8 @@ export function PipelineProvider({ children }: { children: ReactNode }) {
                       event.data.recommended_provider ?? null,
                     cost_comparison: event.data.cost_comparison ?? {},
                     compliance_report: event.data.compliance_report ?? {},
+                    architecture_alternatives:
+                      event.data.architecture_alternatives ?? [],
                     duration_ms: event.data.duration_ms,
                   } as OrchestrationResponse);
                   if (event.data.cost_comparison) {

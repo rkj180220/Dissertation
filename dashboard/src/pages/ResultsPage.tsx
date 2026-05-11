@@ -8,7 +8,13 @@ import { CostComparisonChart } from "@/components/results/CostComparisonChart";
 import { ProviderCard } from "@/components/results/ProviderCard";
 import { ComplianceReport } from "@/components/results/ComplianceReport";
 import { RfpDocument } from "@/components/results/RfpDocument";
-import type { CostComparison, ComplianceReport as ComplianceReportType } from "@/types/api";
+import { ArchitectureRadarChart } from "@/components/results/ArchitectureRadarChart";
+import { FeedbackWidget } from "@/components/results/FeedbackWidget";
+import type {
+  CostComparison,
+  ComplianceReport as ComplianceReportType,
+  ArchitectureAlternative,
+} from "@/types/api";
 
 export default function ResultsPage() {
   const { result, messages } = usePipeline();
@@ -24,6 +30,10 @@ export default function ResultsPage() {
 
   const complianceReport: ComplianceReportType | null =
     result?.compliance_report ?? null;
+
+  const architectureAlternatives: ArchitectureAlternative[] =
+    result?.architecture_alternatives ?? [];
+  const requestId = result?.request_id ?? "";
 
   const hasResults =
     messages.length > 0 && (rfpDocument || executiveSummary || costComparison);
@@ -44,8 +54,9 @@ export default function ResultsPage() {
 
   return (
     <Tabs defaultValue="overview" className="space-y-6">
-      <TabsList className="grid w-full grid-cols-4">
+      <TabsList className="grid w-full grid-cols-5">
         <TabsTrigger value="overview">Overview</TabsTrigger>
+        <TabsTrigger value="architecture">Architecture</TabsTrigger>
         <TabsTrigger value="costs">Cost Analysis</TabsTrigger>
         <TabsTrigger value="compliance">Compliance</TabsTrigger>
         <TabsTrigger value="rfp">RFP Document</TabsTrigger>
@@ -74,6 +85,27 @@ export default function ResultsPage() {
         )}
       </TabsContent>
 
+      {/* Architecture Tab — P16e radar chart */}
+      <TabsContent value="architecture" className="space-y-4">
+        <div>
+          <h2 className="text-lg font-semibold tracking-tight">
+            Architecture Comparison
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            WAF pillar scores across the four candidate patterns.
+            Higher is better for all axes (cost axis = cost efficiency).
+          </p>
+        </div>
+        <ArchitectureRadarChart
+          alternatives={architectureAlternatives}
+          recommendedName={
+            result?.recommended_provider
+              ? undefined
+              : architectureAlternatives[0]?.name
+          }
+        />
+      </TabsContent>
+
       {/* Cost Analysis Tab */}
       <TabsContent value="costs" className="space-y-6">
         {costComparison ? (
@@ -100,7 +132,7 @@ export default function ResultsPage() {
       </TabsContent>
 
       {/* RFP Document Tab */}
-      <TabsContent value="rfp">
+      <TabsContent value="rfp" className="space-y-4">
         {rfpDocument ? (
           <RfpDocument document={rfpDocument} />
         ) : (
@@ -108,6 +140,7 @@ export default function ResultsPage() {
             No RFP document generated yet.
           </p>
         )}
+        {requestId && <FeedbackWidget requestId={requestId} />}
       </TabsContent>
     </Tabs>
   );
