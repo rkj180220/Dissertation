@@ -58,6 +58,7 @@ state = await run_profiler_node(state, llm)
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -711,6 +712,22 @@ async def _llm_enrich_profile(
             )
             return rationale
         except (json.JSONDecodeError, TypeError):
+            # LLM added preamble before JSON — try extracting the JSON block
+            match = re.search(r'\{.*\}', content, re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group())
+                    rationale = parsed.get("rationale", content)
+                    adjustments = parsed.get("adjustments", "none")
+                    if adjustments and adjustments.lower() != "none":
+                        rationale = f"{rationale} Adjustments: {adjustments}"
+                    log.debug(
+                        "llm_enrich_completed_via_regex",
+                        rationale_length=len(rationale),
+                    )
+                    return rationale
+                except (json.JSONDecodeError, TypeError):
+                    pass
             # LLM didn't return valid JSON — use raw content
             log.debug("llm_response_not_json", content_length=len(content))
             return content[:500]
@@ -817,6 +834,267 @@ async def _generate_profiler_notes(
         )
 
 
+
+# ---------------------------------------------------------------------------
+# P15c — LLM-assisted microservice decomposition
+# ---------------------------------------------------------------------------
+
+_DECOMPOSE_SYSTEM_PROMPT = """\
+You are a cloud architecture expert. Given a description of a containerised \
+workload, decompose it into individual named microservices (5–8 services).
+
+Return a JSON array where each element has:
+- "name": string (e.g. "api-gateway", "notification-service")
+- "description": string (one sentence)
+- "vcpus": int (0.25–4, typical per-instance not total)
+- "memory_gb": float (0.5–8, per-instance)
+- "count": int (replica count, 1–5)
+- "scaling_pattern": one of "steady", "variable", "burst", "spiky"
+
+Do NOT include databases or storage here — only application-tier microservices.
+Focus on services that would run as separate Kubernetes Deployments.
+Return only the JSON array, no other text.
+"""
+
+_STREAMING_KEYWORDS = frozenset({
+    "kinesis", "kafka", "eventbridge", "event bridge", "stream", "streaming",
+    "real-time", "realtime", "firehose", "data stream", "event stream",
+})
+_QUEUE_KEYWORDS = frozenset({
+    "sqs", "message queue", "queue", "pubsub", "pub/sub", "servicebus",
+    "service bus", "rabbitmq", "async", "worker", "background job",
+})
+_ANALYTICS_KEYWORDS = frozenset({
+    "redshift", "bigquery", "synapse", "analytics", "data warehouse",
+    "reporting", "dashboard", "bi ", "business intelligence", "dbt",
+})
+
+
+@observe()
+async def _llm_decompose_container_workload(
+    llm: BaseChatModel,
+    workload: WorkloadRequirement,
+) -> list[WorkloadRequirement]:
+    """Use LLM to decompose one CONTAINER workload into 5–8 named microservices.
+
+    If the LLM call fails or returns invalid JSON the original workload
+    is returned unchanged (one-element list).
+
+    Args:
+        llm: LLM model (BaseChatModel interface).
+        workload: The original CONTAINER workload requirement.
+
+    Returns:
+        List of ``WorkloadRequirement`` objects (one per decomposed service),
+        or the original workload in a single-element list on failure.
+    """
+    log = logger.bind(agent="profiler", step="decompose_container", workload=workload.name)
+    log.info("container_decomposition_started")
+
+    context = (
+        f"Workload name: {workload.name}\n"
+        f"Description: {workload.description}\n"
+        f"Notes: {workload.notes}\n"
+        f"Scaling: {workload.scaling_pattern.value}\n"
+        f"Concurrent users: {workload.concurrent_users or 'unknown'}\n"
+        f"Throughput: {workload.throughput_rps or 'unknown'} RPS\n"
+    )
+
+    try:
+        response = await llm.ainvoke(
+            [
+                SystemMessage(content=_DECOMPOSE_SYSTEM_PROMPT),
+                HumanMessage(content=context),
+            ]
+        )
+        raw = response.content if hasattr(response, "content") else str(response)
+        # Strip markdown fences if present
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = "\n".join(cleaned.split("\n")[1:])
+        if cleaned.endswith("```"):
+            cleaned = cleaned[: cleaned.rfind("```")]
+
+        services: list[dict[str, Any]] = json.loads(cleaned)
+        if not isinstance(services, list) or len(services) == 0:
+            raise ValueError("LLM returned empty or non-list JSON")
+
+        results: list[WorkloadRequirement] = []
+        for svc in services[:8]:  # cap at 8 microservices
+            name = str(svc.get("name", f"{workload.name}-service")).lower().replace(" ", "-")
+            vcpus = max(1, int(svc.get("vcpus", 2)))
+            mem_gb = max(0.5, float(svc.get("memory_gb", 2.0)))
+            count = max(1, int(svc.get("count", 2)))
+            scaling_raw = str(svc.get("scaling_pattern", workload.scaling_pattern.value))
+            try:
+                scaling = ScalingPattern(scaling_raw)
+            except ValueError:
+                scaling = workload.scaling_pattern
+
+            results.append(
+                WorkloadRequirement(
+                    name=name,
+                    description=str(svc.get("description", "")),
+                    suggested_category=ServiceCategory.CONTAINER,
+                    scaling_pattern=scaling,
+                    count=count,
+                    resources=ResourceSpec(vcpus=vcpus, memory_gb=mem_gb),
+                    compliance_tags=list(workload.compliance_tags),
+                    latency_p99_ms=workload.latency_p99_ms,
+                    throughput_rps=workload.throughput_rps,
+                    uptime_sla=workload.uptime_sla,
+                )
+            )
+
+        log.info("container_decomposition_completed", service_count=len(results))
+        return results
+
+    except Exception:
+        log.warning(
+            "container_decomposition_failed",
+            exc_info=True,
+            workload=workload.name,
+        )
+        return [workload]
+
+
+def _detect_extra_workloads(
+    workload_request: WorkloadRequest,
+    existing_names: set[str],
+) -> list[WorkloadRequirement]:
+    """P15g — Detect streaming, queue, and analytics workloads from input text.
+
+    Scans ``raw_user_input`` and existing workload descriptions/notes for
+    Kinesis/SQS/Redshift-style keywords and synthesises additional
+    ``WorkloadRequirement`` objects that the user implied but did not explicitly
+    specify as separate components.
+
+    Args:
+        workload_request: The top-level request (provides raw_user_input).
+        existing_names: Already-present workload names (to avoid duplicates).
+
+    Returns:
+        List of additional ``WorkloadRequirement`` objects (may be empty).
+    """
+    text = " ".join(
+        [workload_request.raw_user_input]
+        + [f"{wl.description} {wl.notes}" for wl in workload_request.workloads]
+    ).lower()
+
+    extra: list[WorkloadRequirement] = []
+    base_tags = list(
+        {tag for wl in workload_request.workloads for tag in wl.compliance_tags}
+    )
+
+    if any(kw in text for kw in _STREAMING_KEYWORDS):
+        name = "data-streaming-pipeline"
+        if name not in existing_names:
+            extra.append(
+                WorkloadRequirement(
+                    name=name,
+                    description=(
+                        "Real-time event streaming pipeline (Kinesis/Kafka/EventBridge). "
+                        "Ingests sensor or event data and delivers to downstream consumers."
+                    ),
+                    suggested_category=ServiceCategory.ANALYTICS,
+                    scaling_pattern=ScalingPattern.UNPREDICTABLE,
+                    count=1,
+                    resources=ResourceSpec(vcpus=2, memory_gb=4.0),
+                    compliance_tags=base_tags,
+                    notes="Detected from streaming keywords in user input (P15g).",
+                )
+            )
+
+    if any(kw in text for kw in _QUEUE_KEYWORDS):
+        name = "message-queue"
+        if name not in existing_names:
+            extra.append(
+                WorkloadRequirement(
+                    name=name,
+                    description=(
+                        "Asynchronous message queue (SQS/Service Bus/Pub-Sub). "
+                        "Decouples producers from consumers for async processing."
+                    ),
+                    suggested_category=ServiceCategory.INTEGRATION,
+                    scaling_pattern=ScalingPattern.UNPREDICTABLE,
+                    count=1,
+                    resources=ResourceSpec(vcpus=1, memory_gb=2.0),
+                    compliance_tags=base_tags,
+                    notes="Detected from message-queue keywords in user input (P15g).",
+                )
+            )
+
+    if any(kw in text for kw in _ANALYTICS_KEYWORDS):
+        name = "analytics-data-warehouse"
+        if name not in existing_names:
+            extra.append(
+                WorkloadRequirement(
+                    name=name,
+                    description=(
+                        "Analytics / data warehouse layer (Redshift/BigQuery/Synapse). "
+                        "Supports reporting, dashboards, and KPI queries."
+                    ),
+                    suggested_category=ServiceCategory.ANALYTICS,
+                    scaling_pattern=ScalingPattern.STEADY,
+                    count=1,
+                    resources=ResourceSpec(vcpus=4, memory_gb=16.0, storage_gb=500.0),
+                    compliance_tags=base_tags,
+                    notes="Detected from analytics keywords in user input (P15g).",
+                )
+            )
+
+    return extra
+
+
+# ---------------------------------------------------------------------------
+# P16b — Knative relabeling helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_prior_architecture_winner(state: OrchestratorState) -> str | None:
+    """Return the architecture winner name from the most recent Validator run.
+
+    Used to detect when the pipeline has already converged on self-hosted
+    serverless so the Profiler can relabel CONTAINER workloads to
+    SERVERLESS_COMPUTE on subsequent amendment passes.
+
+    Args:
+        state: Current ``OrchestratorState``.
+
+    Returns:
+        Winner option name (e.g. ``"self_hosted_serverless"``), or ``None``
+        if no architecture alternatives have been computed yet.
+    """
+    alternatives = state.get("architecture_alternatives")
+    if alternatives:
+        return alternatives[0].get("name")
+    return None
+
+
+def _relabel_for_knative(profile: WorkloadProfile) -> WorkloadProfile:
+    """Relabel CONTAINER components to SERVERLESS_COMPUTE (Knative/KEDA).
+
+    Called when the target architecture is ``self_hosted_serverless``.
+    This causes the Sizer to bin-pack the workloads onto K8s nodes with
+    Knative-specific rationale and labelling instead of plain EKS/AKS/GKE
+    container rationale.
+
+    Args:
+        profile: Original ``WorkloadProfile`` from the profiling loop.
+
+    Returns:
+        New ``WorkloadProfile`` with CONTAINER components relabeled to
+        ``SERVERLESS_COMPUTE``.  All other components are unchanged.
+    """
+    relabeled_components = [
+        c.model_copy(update={"resolved_category": ServiceCategory.SERVERLESS_COMPUTE})
+        if c.resolved_category == ServiceCategory.CONTAINER
+        else c
+        for c in profile.components
+    ]
+    return profile.model_copy(update={"components": relabeled_components})
+
+
 # ---------------------------------------------------------------------------
 # Main profiler node
 # ---------------------------------------------------------------------------
@@ -873,6 +1151,36 @@ async def run_profiler_node(
             target_providers=[p.value for p in workload_request.target_providers],
         )
 
+        # ── P15c: Decompose CONTAINER workloads into named microservices ──
+        # ── P15g: Detect implicit streaming/queue/analytics workloads ─────
+        expanded_workloads: list[WorkloadRequirement] = []
+        for wl in workload_request.workloads:
+            resolved_hint = _resolve_category(wl)
+            if (
+                resolved_hint == ServiceCategory.CONTAINER
+                and len(workload_request.workloads) <= 3  # only when few top-level workloads
+            ):
+                decomposed = await _llm_decompose_container_workload(llm, wl)
+                expanded_workloads.extend(decomposed)
+                log.info(
+                    "workload_decomposed",
+                    original=wl.name,
+                    services=[d.name for d in decomposed],
+                )
+            else:
+                expanded_workloads.append(wl)
+
+        # Add keyword-detected workloads (P15g)
+        existing_names = {wl.name for wl in expanded_workloads}
+        extra_workloads = _detect_extra_workloads(workload_request, existing_names)
+        if extra_workloads:
+            log.info(
+                "extra_workloads_detected",
+                count=len(extra_workloads),
+                names=[wl.name for wl in extra_workloads],
+            )
+            expanded_workloads.extend(extra_workloads)
+
         # ── Profile each workload component ───────────────────
         components: list[ComponentProfile] = []
         total_vcpus = 0
@@ -881,7 +1189,7 @@ async def run_profiler_node(
         total_gpu_count = 0
         any_gpu = False
 
-        for idx, workload in enumerate(workload_request.workloads):
+        for idx, workload in enumerate(expanded_workloads):
             wl_log = log.bind(
                 workload_name=workload.name,
                 workload_index=idx,
@@ -993,6 +1301,28 @@ async def run_profiler_node(
             requires_gpu=any_gpu,
         )
 
+        # ── P16b: Relabel CONTAINER → SERVERLESS_COMPUTE for Knative ──────
+        # Triggered when: (a) execution_plan explicitly requests self-hosted
+        # serverless architecture, or (b) a prior Validator run already picked
+        # self_hosted_serverless as the architecture winner.
+        preferred_arch = (state.get("execution_plan") or {}).get(
+            "preferred_architecture", ""
+        )
+        prior_winner = _get_prior_architecture_winner(state)
+        if preferred_arch == "self_hosted_serverless" or prior_winner == "self_hosted_serverless":
+            relabeled_count = sum(
+                1 for c in workload_profile.components
+                if c.resolved_category == ServiceCategory.CONTAINER
+            )
+            if relabeled_count > 0:
+                workload_profile = _relabel_for_knative(workload_profile)
+                log.info(
+                    "knative_relabeling_applied",
+                    relabeled_count=relabeled_count,
+                    reason="preferred_architecture" if preferred_arch else "prior_winner",
+                    prior_winner=prior_winner,
+                )
+
         # ── Build summary message ─────────────────────────────
         component_lines = "\n".join(
             f"  • {c.workload_name}: {c.resolved_category.value} — "
@@ -1025,6 +1355,19 @@ async def run_profiler_node(
         state["workload_profile"] = workload_profile
         state["messages"] = [summary_message]  # append-only reducer merges
         state["current_agent"] = "sizer"
+
+        # Propagate extra profiler-detected workloads back into workload_request
+        # so the sizer's workload_lookup can find them by name.
+        if extra_workloads:
+            updated_request = workload_request.model_copy(
+                update={"workloads": list(workload_request.workloads) + extra_workloads}
+            )
+            state["workload_request"] = updated_request
+            log.info(
+                "workload_request_updated_with_extra",
+                added_count=len(extra_workloads),
+                names=[wl.name for wl in extra_workloads],
+            )
 
         # Track execution
         elapsed = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
