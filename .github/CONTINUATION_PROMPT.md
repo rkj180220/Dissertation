@@ -1,6 +1,6 @@
 # Cloud Orchestrator IDSS — Continuation Prompt
 
-> **Last Updated**: 9 May 2026 (Router+Orchestrator Agent with ExecutionPlan; Pricing Comparison Validator engine P15k; Principal Architect Reasoning pattern §22g/§22h; P15 table updated; build order finalised.)
+> **Last Updated**: 11 May 2026 (P16a–P16f COMPLETE. All Dissertation Completeness Features done. Bug fix: `architecture_alternatives` always empty — fixed `ranked[0]['option']` → `ranked[0]['name']` KeyError in validator.py. 142 tests, 0 TS build errors.)
 
 ---
 
@@ -33,7 +33,7 @@ Please read `.github/copilot-instructions.md` first (tech stack rules, observabi
 - **Gemini 3.1 Pro Preview**: `gemini-3.1-pro-preview` requires Model Garden enablement per GCP project — not yet accessible in `dissertation-rj`. Use `gemini-2.5-pro` until enabled via GCP Console → Vertex AI → Model Garden.
 
 ### Data Models (`src/models/`)
-- `cloud_resource.py` — `CloudProvider` enum (aws/azure/gcp), `ServiceCategory` enum (**15 values** — P2 added `KUBERNETES` for managed control-plane fee, distinct from `CONTAINER` node costs). Legacy `ComputeSKU`/`StorageSKU` kept for backward compat with engines only.
+- `cloud_resource.py` — `CloudProvider` enum (aws/azure/gcp), `ServiceCategory` enum (**16 values** — P15b added `SERVERLESS` for Lambda+DynamoDB+APIGW architectural pattern, distinct from `SERVERLESS_FUNCTION` = single function billing). Legacy `ComputeSKU`/`StorageSKU` kept for backward compat with engines only.
 - `pricing.py` — `PricingTier` enum (8 values). `NormalizedPriceItem` with `monthly_cost_estimate` property (handles reservation upfront vs hourly).
 - `workload.py` — `EnvironmentType`, `WorkloadTier`, `ScalingPattern` enums. `ResourceSpec` (all 15 categories), `WorkloadRequirement` (**P2**: added `latency_p99_ms`, `throughput_rps`, `concurrent_users`, `uptime_sla`, `rpo_minutes`, `rto_minutes`, `data_growth_rate_pct`, `spot_eligible: bool = True`), `ComponentProfile`, `WorkloadProfile`, `WorkloadRequest`. Legacy VMWorkload/ContainerWorkload/StorageRequirement kept at bottom.
 - `conversation.py` — `MessageRole`, `ClarificationStatus`, `ClarificationPriority` enums. `ChatMessage`, `ClarificationQuestion`, `ConversationState` (with `should_continue_clarifying` property).
@@ -80,7 +80,7 @@ Please read `.github/copilot-instructions.md` first (tech stack rules, observabi
 - `@observe()` + structlog throughout
 - **Verified**: 23/23 checks passed, 142/142 tests pass ✅
 
-### Sizer Agent (`src/agents/sizer.py`) — ~1470 lines ✅ P13 fixes applied
+### Sizer Agent (`src/agents/sizer.py`) — ~1800 lines ✅ Pricing accuracy fixes applied
 - Category-aware SKU selection: scored (COMPUTE, AI_ML), binpacked (CONTAINER with VM node SKUs), cheapest-price (all others)
 - **Container node pool fix**: queries EC2/VMs/Compute Engine for node pools (not EKS/AKS/GKE service pricing)
 - **Database engine propagation**: `_DATABASE_ENGINE_MAP` routes PostgreSQL/MySQL/etc. + **redis/elasticache → AmazonElastiCache** (Bug 9c fix)
@@ -89,14 +89,18 @@ Please read `.github/copilot-instructions.md` first (tech stack rules, observabi
 - **SQL license token filter** (Bug 12a fix ✅): `_SQL_LICENSE_TOKENS` checks `meter_name` to exclude SQL Standard/Enterprise/Web rows
 - **linux_only silent fallback safety** (Bug 13b fix ✅): when `linux_only` filter produces empty list, `candidates` is set to `[]` — never silently reverts to garbage rows
 - **GPU exclusion for non-GPU workloads** (Bug 13c fix ✅): `_GPU_PREFIXES` block (`g3–g7`, `p2–p5`, `trn`, `dl1`) excludes GPU instances when `not component.requires_gpu`
-- **Storage quantity scaling** (Bug 11c fix): post-processing for STORAGE: `monthly = unit_price × storage_gb`
+- **Storage quantity scaling** (Bug 11c fix): post-processing for STORAGE: `monthly = unit_price × storage_gb` (guarded to per-GB units only — see pricing accuracy fixes below)
 - **GIR exclusion** (Bug 12b fix ✅): `"-gir-"` and `"gir-bytehrs"` added to `_EXCLUDE_PATTERNS`
 - **ZIA exclusion** (Bug 13d fix ✅): `"-zia-"` and `"zia-bytehrs"` added to `_EXCLUDE_PATTERNS` — S3 One Zone-Infrequent Access SKU uses acronym "ZIA"
 - **Fixed-cost workloads**: K8s cluster management fee ($73/mo), load balancer ($18-22/mo), **CDN ($60-85/mo fixed estimate)**
 - **Container vCPU ratio guard** (Bug 9a fix): `max_node_vcpus = max(8, total_needed_vcpus × 4)`; preferred families (m5/m6i/c5/c6i) sorted first
-- **DATABASE hourly filter** (Bug 9b fix): RDS/ElastiCache candidates filtered to `unit_of_measure in ("1 Hour", "1 hour")`
-- **STORAGE standard-tier filter** (Bug 9d fix): `_filter_storage_candidates()` excludes EarlyDelete/Glacier/GIR/Nearline/INT-AIA/ZIA rows
+- **DATABASE hourly filter** (Bug 9b fix → improved): RDS/ElastiCache candidates filtered using `c.is_hourly` (flex match handles Azure "1/Hour" unit format, not just "1 Hour")
+- **STORAGE standard-tier filter** (Bug 9d fix): `_filter_storage_candidates()` excludes EarlyDelete/Glacier/GIR/Nearline/INT-AIA/ZIA rows; **now also pre-filters to per-GB capacity rows** (unit_of_measure contains "GB"/"GiB") before provider-tier preference — eliminates per-IOPS and per-disk items from candidate selection
 - **CDN detection** (Bug 9e fix): `_is_cdn_workload()` routes `notes="cdn"` or "cdn" in name to fixed-cost CDN path
+- **Azure PostgreSQL "Auto Tune" exclusion** (new ✅): after `_filter_database_candidates`, Azure compute-instance rows are isolated by requiring `product_name` to contain "Compute" and excluding add-on keywords ("autonomous", "auto tune", "extended support", "backup", "iops", "tuning service", "throughput") — fixes $8.76/mo → correct ~$300/mo for GP instance
+- **GCP Redis service name fix** (new ✅): `_DATABASE_ENGINE_MAP` corrected: `("gcp", "redis")` → `("Cloud Memorystore for Redis", None)`, `("gcp", "memcached")` → `("Cloud Memorystore for Memcached", None)`
+- **Cross-provider region mapping** (new ✅): `_AWS_TO_AZURE_REGION` + `_AWS_TO_GCP_REGION` tables added; `_get_region_for_provider()` auto-translates AWS preferred_region (e.g. us-west-2) to geographically equivalent Azure (westus2) and GCP (us-west1) regions when provider-specific region is still the model default
+- **Storage scaling per-GB guard** (new ✅): storage cost scaling only applied when `unit_of_measure` contains "GB"/"GiB"; fixes $0.03 → correct ~$540/mo for 10TB Azure blob storage
 - Ancillary costs: NAT gateway + data transfer estimates per provider
 - **Verified**: 142/142 tests pass ✅
 
@@ -130,11 +134,27 @@ Please read `.github/copilot-instructions.md` first (tech stack rules, observabi
 - `bin_packing.py` — FFD + BFD. Now uses `NormalizedPriceItem` (node SKU) + `WorkloadRequirement` (container workloads via `resources.cpu_request_millicores`/`memory_request_mb`/`replicas`). Cost via `monthly_cost_estimate`.
 - `scoring.py` — Weighted multi-criteria scorer. Now uses `NormalizedPriceItem` + `WorkloadRequirement`. Extracts specs via attribute helpers.
 - `waf_compliance.py` — WAF pillar checks. Now filters `request.workloads` by `ServiceCategory` instead of deprecated fields.
+- `architecture_selector.py` — **P15a ✅** 4-option scorer (managed-serverless, self-hosted-serverless, containers, hybrid). 3 signal groups, binary-search crossover. `derive_weights_from_workload()` for P15j dynamic weights.
+- `pricing_validator.py` — **P15k ✅** 7-check pricing integrity validator. `PricingValidationFinding` + `PricingValidationResult` Pydantic models. Pure algorithmic.
 - **Verified**: 60/60 checks passed ✅
 
+### New Agents (`src/agents/`) — P15d + P15e
+- `router.py` — **P15d ✅** Router+Orchestrator Agent. LLM intent classifier + `ExecutionPlan` producer. 5 intents. Principal Architect Reasoning (§22g). Writes `execution_plan`, `routing_decision`, `pipeline_mode`, `turn_number` to state.
+- `validator.py` — **P15e ✅** Architecture quality gate. 5 checks: [0] Pricing data integrity, [1] Architecture correctness (with P15j dynamic weights), [2] Sizing adequacy, [3] Budget fit, [4] WAF compliance. Principal Architect Reasoning. Writes `validation_report` + `architecture_alternatives`.
+
+### Session Store (`src/services/session_store.py`) — P15f ✅
+- SQLite-backed session registry (`data/sessions.db`) via aiosqlite. `SessionInfo` Pydantic model.
+- `create_session()`, `get_session()`, `update_session()`, `list_sessions()`, `cleanup_expired_sessions()` (7-day TTL).
+- `make_checkpointer()` → `MemorySaver` (upgrade path to SqliteSaver when dep available).
+
+### Profiler Updates — P15c + P15g ✅
+- `_llm_decompose_container_workload()` — LLM decomposes CONTAINER workload into 5–8 named microservices (JSON response, capped at 8).
+- `_detect_extra_workloads()` — keyword detection for streaming (Kinesis/Kafka/EventBridge), message queues (SQS/PubSub/RabbitMQ), analytics (Redshift/BigQuery/Synapse). Injects new `WorkloadRequirement` objects.
+- Both run as pre-processing steps in `run_profiler_node` before the main profiling loop.
+
 ### LangGraph Orchestrator (`src/orchestrator/`)
-- `state.py` — `OrchestratorState` TypedDict, `AgentExecution`, `SizedWorkloadResult`, `create_initial_state()` ✅
-- `graph.py` — **247 lines.** `StateGraph` with 5 nodes, conditional Clarifier loop. `build_graph(llm, pricing_service)` returns compiled graph. `@observe()` + structlog. **P15h will expand to 7 nodes** (+ Router at START, + Validator before rfp_writer) with `SqliteSaver` checkpointer. **Imports verified ✅**
+- `state.py` — `OrchestratorState` TypedDict, `AgentExecution`, `SizedWorkloadResult`, `ExecutionPlan` TypedDict (P15h), `create_initial_state()` with 7 new fields (session_id, turn_number, execution_plan, routing_decision, pipeline_mode, validation_report, architecture_alternatives) ✅
+- `graph.py` — **~305 lines.** `StateGraph` with 6 nodes (+ router when `include_router=True`). `build_graph(llm, pricing_service, include_router=False)`. Validator node before rfp_writer. Conditional router edges (`_route_after_router()`). `@observe()` + structlog. ✅
 
 ### API Layer (`src/api/`)
 - `dependencies.py` — **114 lines.** ASGI `lifespan()`: loads settings, wires observability, creates LLM, registers providers, initialises PricingService, compiles graph. Dependency providers for routes. **Imports verified ✅**
@@ -145,13 +165,13 @@ Please read `.github/copilot-instructions.md` first (tech stack rules, observabi
 
 ### Dashboard (`dashboard/`) ✅
 - React + Vite v8 + TypeScript + Tailwind v3 + shadcn/ui (New York, slate)
-- `src/types/api.ts` — TS interfaces matching all backend Pydantic models
+- `src/types/api.ts` — TS interfaces matching all backend Pydantic models; includes `ArchitectureAlternative` (11 fields: name, label, score, 5 pillar scores, monthly_cost_estimate, rationale, trade_offs, recommended)
 - `src/lib/api.ts` — API client with `orchestrate()`, `streamOrchestrate()` (SSE via `@microsoft/fetch-event-source`), `checkHealth()`, `checkReady()`
-- `src/context/PipelineContext.tsx` — React Context: messages, agent progress, result, streaming state
+- `src/context/PipelineContext.tsx` — React Context: messages, agent progress, result, streaming state; `architecture_alternatives` passed through from SSE pipeline_complete
 - `src/hooks/useHealth.ts` — Polls `GET /ready` every 30s
 - Chat UI: `ChatMessage`, `ChatInput`, `AgentProgress` (5-step stepper), `ChatContainer`
-- Results: `ExecutiveSummary`, `CostComparisonTable`, `CostComparisonChart` (Recharts), `ProviderCard`, `ComplianceReport`, `RfpDocument`
-- Pages: `/chat` (ChatPage), `/results` (tabbed: Overview, Costs, Compliance, RFP), 404
+- Results: `ExecutiveSummary`, `CostComparisonTable`, `CostComparisonChart` (Recharts), `ProviderCard`, `ComplianceReport`, `RfpDocument`, **`ArchitectureRadarChart`** (P16e — Recharts RadarChart 4 options × 5 WAF axes, score table, rationale cards), **`FeedbackWidget`** (P16f — 1-5 star rating, optional comment, logs to LangFuse via `POST /feedback`)
+- Pages: `/chat` (ChatPage), `/results` (tabbed: **Overview, Architecture, Cost Analysis, Compliance, RFP Document** — 5 tabs), 404
 - `npm run build` — **0 errors** ✅
 
 ---
@@ -170,63 +190,31 @@ All priorities through P14 are complete. Full per-fix breakdowns are in `PROJECT
 | P10 — RFP content gaps | Gov framing, traceability matrix, greenfield phases, WCAG/StateRAMP tables |
 | P11–P13 — Sizer bugs cont. | DB $0, EC2 SQL license, storage quantity, GIR/ZIA tiers, cache poisoning fixed |
 | P14 — DB undersizing | Memory/vCPU filter added; `db.r6i.large` ($182/mo) replaces `db.t3.micro` ($13) |
+| P15 — Agentic enhancements | SERVERLESS sizer path, architecture_selector, pricing_validator, profiler decomposition+streaming detection, Router agent, Validator agent, session store, graph+state updates, RFP alternatives section, dynamic WAF weights — 11 items, 142 tests ✅ |
 
 
 ## What Needs to Be Fixed/Built Next ❌
 
-> **Run #6 complete (P13 ✅). P14 fixed (DB undersizing). Run #7 needed to verify P14. P15 = 10 items (adds self-hosted serverless + dynamic weights). P16 = dissertation-completeness features.**
+> **P15 COMPLETE ✅ — All 11 items done. 142 tests passing. Move to P16.**
 
-### Priority 15 — NOT STARTED ❌ (Next Major Phase — 10 items)
-
-Full design in PROJECT_SPEC §21 (gap analysis) and §22 (Router/Validator/Session/Architecture design):
-
-| ID | Feature | Component(s) | Description | Priority |
-|----|---------|-------------|-------------|----------|
-| **P15a** | Architecture alternatives engine | `src/engines/architecture_selector.py` (NEW) | Score **4 options**: managed-serverless (Lambda), **self-hosted-serverless (Knative/KEDA)**, containers (EKS), hybrid. **Unbiased**: managed Lambda wins at low avg RPS (< ~300 RPS crossover); Knative wins at sustained high RPS. Uses REAL pricing for cost scores — 3 signal groups: traffic pattern (burst ratio + cost crossover), workload characteristics (latency, stateful), compliance. | 🔴 Critical |
-| **P15b** | Serverless pricing path | `src/models/cloud_resource.py` + `src/agents/sizer.py` | Add `SERVERLESS` to `ServiceCategory`; add Lambda/DynamoDB pricing path; add Knative self-hosted path (reuses K8s node pricing) | 🔴 Critical |
-| **P15c** | Profiler microservice decomposition | `src/agents/profiler.py` | Decompose `enriched_input` into 5-8 individual microservices so bin-packing works with multiple inputs | 🔴 Critical |
-| **P15d** | **Router+Orchestrator Agent** | `src/agents/router.py` (NEW) | LLM intent classifier **AND execution planner**. Produces `ExecutionPlan`: agents to run, scope (full/delta), affected component names, RFP sections to amend. Downstream agents read `execution_plan` — they never make routing decisions themselves. Uses Principal Architect Reasoning (§22g). | 🔴 Critical |
-| **P15e** | **Validator Agent** | `src/agents/validator.py` (NEW) | 5-check quality gate: [0] Pricing integrity (calls `pricing_validator.py`), [1] Architecture correctness (architecture_selector), [2] Sizing adequacy, [3] Budget fit, [4] WAF compliance. Auto-runs after FinOps; on-demand via Router. | 🔴 Critical |
-| **P15f** | **Session persistence** | `src/services/session_store.py` (NEW) + `graph.py` | LangGraph `SqliteSaver` checkpointing. Thread ID = `session_id`. State persists across requests. | 🔴 Critical |
-| **P15g** | Streaming/queue/analytics | `src/agents/profiler.py` | Detect Kinesis, SQS, Redshift from `enriched_input` keywords | 🟠 High |
-| **P15h** | Graph + API refactor | `graph.py` + `state.py` + `orchestration.py` | Add router+orchestrator node, validator node, conditional edges, checkpointing. `ExecutionPlan` + `session_id` in state. `session_id` in API request/response. | 🔴 Critical |
-| **P15i** | RFP Architecture Alternatives | `src/agents/rfp_writer.py` | All 4 options with WAF scores + REAL costs from `validation_report`. Pricing caveats subsection if `error_count > 0`. | 🔴 Critical |
-| **P15j** | Dynamic WAF weights | `src/engines/architecture_selector.py` | Clarifier detects user priority → adjusts scoring weights at runtime. | 🟠 High |
-| **P15k** | **Pricing Comparison Validator** | `src/engines/pricing_validator.py` (NEW) | 7-check apples-to-apples validator (size adequacy, tier consistency, price anomaly, staleness, category match, provider parity, memory:vCPU ratio). Pure algorithmic — no LLM. Prevents wrong vendor selection from bad SKU matches. See §22h. | 🔴 Critical |
-
-**Build order**: P15b → P15a → P15k → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j
-
-### Priority 16 — Dissertation Completeness Features (After P15)
+### Priority 16 — Dissertation Completeness Features (Next)
 
 | ID | Feature | Description | Priority |
 |----|---------|-------------|----------|
-| **P16a** | Real-cost architecture comparison | Price all 4 architectures using actual sizer output — Lambda per-invocation math + Knative K8s node pricing + container always-on. (Note: partially covered by P15a + P15k — P16a ensures the pricing flow is wired end-to-end in Validator.) | 🔴 Critical |
-| **P16b** | Self-hosted serverless workload type | After architecture_selector picks self-hosted-serverless, profiler relabels CONTAINER workloads as SERVERLESS_COMPUTE (Knative). Sizer queries K8s nodes at pod density, not Lambda pricing. | 🔴 Critical |
-| **P16c** | RFP compliance verification | Post-generation LLM pass against StateRAMP Moderate control list. Outputs Compliance Gap Analysis appendix in RFP. | 🟠 High |
-| **P16d** | Multi-scenario benchmark script | Run Cal Fire + healthcare + e-commerce through full pipeline. Compare vs. reference architectures. Dissertation evaluation chapter data. | 🟠 High |
-| **P16e** | Architecture radar chart (dashboard) | React component: 4 options x 5 WAF axes as spider chart. Makes the comparison visual and tangible. | 🟡 Medium |
-| **P16f** | User feedback capture | 1-5 star rating after RFP generated, logged to LangFuse. Dissertation accuracy reporting. | 🟡 Medium |
+| **P16a** | Real-cost architecture comparison | `_extract_costs_from_sized_results()` in `architecture_selector.py` sums actual `SizedWorkloadResult.monthly_cost_usd` per provider, grouped by category (SERVERLESS vs always-on). Container cost = sum of all non-serverless AWS results. Knative = 90% of container cost. Lambda = actual SERVERLESS-category results (falls back to heuristic). Bug fix: containers `scale_score` now capped at 1.0 when `burst_ratio < 5`. 142/142 tests pass. | ✅ Done |
+| **P16b** | Self-hosted serverless workload type | `SERVERLESS_COMPUTE` added to `_BINPACKED_CATEGORIES` + `_SERVICE_NAME_MAP` in sizer (EKS/AKS/GKE nodes). `_relabel_for_knative()` helper in profiler relabels CONTAINER → SERVERLESS_COMPUTE when `execution_plan.preferred_architecture == "self_hosted_serverless"` OR when prior architecture winner is `self_hosted_serverless`. `ExecutionPlan` TypedDict gains `preferred_architecture` field. Sizer rationale says "Knative/KEDA on EKS/AKS/GKE" for SERVERLESS_COMPUTE workloads. 142/142 tests pass. | ✅ Done |
+| **P16c** | RFP compliance verification | Post-generation LLM pass against StateRAMP Moderate control list (17 NIST 800-53 Rev 5 families). `_generate_stateramp_gap_analysis()` async LLM function + `_heuristic_gap_analysis()` keyword fallback + `_render_gap_analysis_section()` renderer. `_STATERAMP_MODERATE_FAMILIES` constant with 17 entries. TOC updated with section 18 when has_stateramp. Appendix A appended after traceability matrix in `run_rfp_writer_node`. 142/142 tests pass. | ✅ Done |
+| **P16d** | Multi-scenario benchmark script | `scripts/benchmark_scenarios.py` — 3 scenarios (Cal Fire/Government, Healthcare SaaS, E-Commerce). Bypasses Clarifier by injecting pre-built WorkloadRequest. `_merge_state()` helper applies LangGraph append semantics for list fields when calling agents directly. `--dry-run` mocks both LLM AND pricing APIs. Writes `data/benchmark_results.json` + `data/benchmark_report.md`. Dry-run: 3/3 ✅ (WAF 67-100%, RFPs 36-39KB, all 5 agents pass). 142/142 tests pass. | ✅ Done |
+| **P16e** | Architecture radar chart (dashboard) | React component: 4 options x 5 WAF axes as spider chart. Makes the comparison visual and tangible. `ArchitectureRadarChart.tsx` + `ArchitectureAlternative` TS interface. Validator emits per-pillar scores (reliability/cost/scale/compliance/latency). Results page has 5 tabs (Architecture tab added). SSE pipeline_complete + OrchestrationResponse carry architecture_alternatives. npm build: 0 errors ✅ | ✅ Done |
+| **P16f** | User feedback capture | 1-5 star rating widget (`FeedbackWidget.tsx`) on Results page RFP tab. `POST /api/v1/feedback` FastAPI route logs a LangFuse score event (name=`user_satisfaction`, value=rating). Inline SVG stars (no extra deps). Optional comment textarea. 142 tests, 0 TS errors ✅ | ✅ Done |
 
 ### Next Immediate Task
 
-**Run #7 first (to verify P14), then start P15b:**
+**All P16 items are complete ✅**
 
-**Run #7:**
-1. Refresh AWS credentials (`aws sso login` or re-issue from AWS console)
-2. **Do NOT delete `data/sku_cache.db`** — it has good P13-era data
-3. Restart API: `uv run uvicorn src.main:app --port 8001`
-4. Run Cal Fire clarify session → `/orchestrate`
-5. Verify: PostgreSQL = `db.r6i.large` (~$182/mo), Cache = current-gen >9.6 GiB, NOT `cache.t1.micro`
-6. Expected total: ~$916/mo
-7. Save to `docs/test-rfp-7.md`
-
-**Then P15b (serverless model):**
-- Add `SERVERLESS = "serverless"` to `ServiceCategory` in `cloud_resource.py`
-- Add Lambda + DynamoDB pricing path in `sizer.py` (new `_size_serverless_workload()` method)
-- Lambda: price = requests/mo × avg_duration_ms × memory_gb × $0.0000166667/GB-sec
-- DynamoDB: price = (read_units × $0.25/RCU + write_units × $1.25/WCU) per million
-- **Also add Knative/self-hosted path**: reuse existing K8s/CONTAINER node pricing; pod_density factor (e.g. 8 pods/node) divides node cost across workloads
-- CRITICAL: architecture_selector will call BOTH paths — one for Lambda cost estimate, one for Knative cost estimate
+The system is feature-complete for dissertation submission. What remains is optional polish:
+- P17 (optional): End-to-end live demo run with real LLM — record/screenshot results for the dissertation appendix.
+- P17 (optional): Write the dissertation final report in `docs/FINAL_REPORT_CONTENT.md` — the scaffolding already exists.
 
 
 
@@ -266,6 +254,22 @@ cd dashboard && npm run build
 ---
 
 ## Notes for Future Me
+
+### Pricing Accuracy Bugs Fixed (7 May 2026)
+5 root-cause fixes in `src/agents/sizer.py`:
+1. **Azure PostgreSQL "Auto Tune"**: Azure DB pricing includes add-on meters ("Auto Tune" at $0.012/hr = $8.76/mo) that look like the cheapest compute option but are not. Post-`_filter_database_candidates` Azure-specific filter now keeps only `product_name` containing "Compute" and excludes add-on keywords.
+2. **GCP Redis service name**: `_DATABASE_ENGINE_MAP` had `"Cloud Memorystore"` (wrong) → corrected to `"Cloud Memorystore for Redis"` / `"Cloud Memorystore for Memcached"`.
+3. **DATABASE hourly filter**: Was `unit_of_measure in ("1 Hour", "1 hour")` — missed Azure's `"1/Hour"` format. Changed to `c.is_hourly` (string-contains check handles all variants).
+4. **Storage per-GB guard** (two parts): (a) `_filter_storage_candidates` now pre-filters to items where unit contains "GB"/"GiB" before applying tier preferences — eliminates per-IOPS, per-disk, per-request SKUs. (b) Storage scaling code now checks `any(u in unit.lower() for u in ("gb","gib"))` before multiplying by `storage_gb`.
+5. **Cross-provider region mapping**: Added `_AWS_TO_AZURE_REGION` + `_AWS_TO_GCP_REGION` dicts. `_get_region_for_provider()` auto-maps AWS preferred_region to correct Azure/GCP region when provider-specific entry is still the model default.
+- Pricing cache cleared (`data/sku_cache.db`) — will re-fetch with corrected regions/filters on next run.
+
+### P15 Complete — Key Lessons (25 May 2026)
+- **`langgraph-checkpoint-sqlite` not installed**: `langgraph.checkpoint.sqlite` module does not exist. `SessionStore.make_checkpointer()` returns `MemorySaver` instead. For real cross-request session persistence, add `langgraph-checkpoint-sqlite` to `pyproject.toml` and update `make_checkpointer()` to return `SqliteSaver`.
+- **`include_router=False` default in `build_graph()`**: Router is opt-in to avoid breaking existing pipeline. Turn-1 sessions go START → clarifier → profiler → sizer → finops → validator → rfp_writer. Multi-turn sessions need `build_graph(..., include_router=True)`.
+- **`ExecutionPlan` is TypedDict not Pydantic**: Cannot use `.model_dump()` — use direct dict access `plan["intent"]`. Matches LangGraph state pattern.
+- **Dynamic WAF weights (P15j)**: Additive deltas from `_PRIORITY_BOOSTS`, clamped to [0.01, 0.70] then normalised to 1.0. Multiple keyword signals stack. `derive_weights_from_workload()` only logs when signals are actually detected.
+- **State list invariant**: `agent_executions` is `Annotated[list, operator.add]` — always append, never replace. `create_initial_state()` now seeds 7 agent names: `{"clarifier", "profiler", "sizer", "finops", "rfp_writer", "validator", "router"}`.
 
 ### P15 Design (9 May 2026 — final pre-implementation)
 - **Router+Orchestrator Agent** (`src/agents/router.py`): LLM intent classifier **and execution planner** in one step. Produces `ExecutionPlan` (not just a route label): intent, `agents_to_run`, `scope_components` (specific component names), `rfp_amendment_sections`, `amendment_delta`, `confidence`. Downstream agents read `execution_plan` to understand exactly what to reprocess. Entry conditional: if `state.get("rfp_document")` → router+orchestrator, else → clarifier. Uses Principal Architect Reasoning (§22g). Full design in PROJECT_SPEC §22b.

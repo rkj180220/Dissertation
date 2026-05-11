@@ -3,7 +3,7 @@
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
 > **Additional Examiner**: Santhosh Kirubakaran
-> **Last Updated**: 9 May 2026 (Router+Orchestrator with ExecutionPlan §22b; Pricing Comparison Validator P15k §22h; Principal Architect Reasoning §22g; 5-check Validator Agent §22c; P15 build order: P15b→P15a→P15k→P15c→P15g→P15d→P15e→P15f→P15h→P15i→P15j.)
+> **Last Updated**: 11 May 2026 (P16a+P16b+P16c COMPLETE. Real-cost architecture comparison + Knative relabeling + StateRAMP Moderate gap analysis appendix (17-family LLM pass + heuristic fallback). Bug fix: `architecture_alternatives` always empty due to `ranked[0]['option']` KeyError in validator.py. 142 tests passing.)
 > **LLM**: Gemini 2.5 Pro (`gemini-2.5-pro`) via Google Cloud Vertex AI (`dissertation-rj`, `us-central1`) using ADC
 
 ---
@@ -188,7 +188,7 @@ Exports all of the above (90+ symbols). Both new models and deprecated legacy mo
 |------|--------|-------------|
 | `pricing_cache.py` | ✅ | Async SQLite cache via `aiosqlite`. `price_items` table (UNIQUE on `provider+sku_id+region+tier`), `fetch_log` TTL tracking. WAL mode. `upsert()`, `query()`, `evict_stale()`, `stats()`. `@observe()` + structlog. |
 | `pricing_service.py` | ✅ | Cache-transparent facade. Per-tier TTLs: spot=6 h, on-demand=24 h, reserved=168 h. Graceful degradation (stale cache on API failure). `compare_across_providers()` for FinOps agent. `force_refresh`, `evict_stale()`, `clear_cache()`, `cache_stats()`. |
-| `session_store.py` | ❌ | **P15f — NOT YET BUILT.** LangGraph `SqliteSaver` checkpointer wrapper. `data/sessions.db` — stores full `OrchestratorState` as JSON keyed by `thread_id = session_id`. Session TTL 7 days. Enables cross-request state continuity for Router Agent and amendment mode. |
+| `session_store.py` | ✅ | **P15f — BUILT.** LangGraph `MemorySaver` checkpointer + aiosqlite session registry. `data/sessions.db` stores session metadata (session_id, project_name, turn_count, last_active). Session TTL 7 days with `cleanup_expired_sessions()`. `make_checkpointer()` returns `MemorySaver` (upgrade path to SqliteSaver when dep available). |
 | `__init__.py` | ✅ | Re-exports `PricingCache`, `PricingService`. |
 
 **Verified**: 25 checks passed — cache miss → live fetch → store → hit → speedup (~970×) → evict → clear.
@@ -229,8 +229,8 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 | `sizer.py` | ✅ | **~1250 lines.** Category-aware SKU selection: scored (COMPUTE/AI_ML), bin-packed (CONTAINER), cheapest (others). Container vCPU guard, DATABASE hourly filter, ElastiCache routing, CDN fixed estimate, K8s/LB fixed costs. `run_sizer_node`. |
 | `finops.py` | ✅ | **~900 lines.** RI/spot pricing queries with industry-standard fallbacks. TCO 1yr/3yr/5yr. Savings opportunities. `run_finops_node`. |
 | `rfp_writer.py` | ✅ | **~2100 lines.** ~25,000-char enterprise Markdown RFP. Gov/greenfield/mobile detection. Managed services table, requirements traceability (F-xx/C-xx/NFR-xx), WCAG 2.2 AA + StateRAMP tables, 16-section ToC. `run_rfp_writer_node`. |
-| `router.py` | ❌ | **P15d — NOT YET BUILT.** LLM **Router+Orchestrator Agent**. Reads new user input + full state. Classifies intent AND produces `ExecutionPlan` (agents to run, scope_components, rfp_amendment_sections, amendment_delta). Entry point for Turn ≥ 2. Uses Principal Architect Reasoning (§22g). See §22b. |
-| `validator.py` | ❌ | **P15e — NOT YET BUILT.** Architecture quality gate. **5 checks**: [0] Pricing data integrity (calls `pricing_validator.py`), [1] architecture_selector score, [2] sizing adequacy, [3] budget fit, [4] WAF compliance. Uses Principal Architect Reasoning. Writes `validation_report` + `architecture_alternatives` to state. See §22c. |
+| `router.py` | ✅ | **P15d — BUILT.** LLM **Router+Orchestrator Agent**. Reads new user input + full state. Classifies intent AND produces `ExecutionPlan` (agents to run, scope_components, rfp_amendment_sections, amendment_delta). Entry point for Turn ≥ 2. Uses Principal Architect Reasoning (§22g). See §22b. |
+| `validator.py` | ✅ | **P15e — BUILT.** Architecture quality gate. **5 checks**: [0] Pricing data integrity (calls `pricing_validator.py`), [1] architecture_selector score with dynamic weights (P15j), [2] sizing adequacy, [3] budget fit, [4] WAF compliance. Uses Principal Architect Reasoning. Writes `validation_report` + `architecture_alternatives` to state. See §22c. |
 | `__init__.py` | ✅ | Exists (empty re-export shell). |
 
 ---
@@ -246,8 +246,8 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 | `bin_packing.py` | ✅ | **313 lines.** FFD + BFD algorithms. `NormalizedPriceItem` node SKUs + `WorkloadRequirement` container workloads. **Validated: 60/60 checks.** |
 | `scoring.py` | ✅ | **182 lines.** Weighted multi-criteria scorer (cost 40%, CPU fit 25%, memory fit 25%, generation 10%). **Validated: 60/60 checks.** |
 | `waf_compliance.py` | ✅ | **303 lines.** Rule-based WAF pillar checks. Filters by `ServiceCategory`. **Validated: 60/60 checks.** |
-| `architecture_selector.py` | ❌ | **P15a — NOT YET BUILT.** Unbiased 4-option scorer (managed-serverless, self-hosted-serverless, containers, hybrid). 3 signal groups: traffic pattern (cost crossover), workload characteristics, compliance. Real pricing from PricingService. Returns ranked `ArchitectureRecommendation`. Used by Validator Agent. See §22f. |
-| `pricing_validator.py` | ❌ | **P15k — NOT YET BUILT.** 7-check apples-to-apples pricing comparison validator. Pure algorithmic — no LLM. Catches size mismatches, wrong SKU families, price anomalies before FinOps picks a vendor. Returns `PricingValidationResult`. See §22h. |
+| `architecture_selector.py` | ✅ | **P15a — BUILT.** Unbiased 4-option scorer (managed-serverless, self-hosted-serverless, containers, hybrid). 3 signal groups: traffic pattern (cost crossover), workload characteristics, compliance. P15j dynamic weights via `derive_weights_from_workload()`. Returns ranked `ArchitectureRecommendation`. Used by Validator Agent. See §22f. |
+| `pricing_validator.py` | ✅ | **P15k — BUILT.** 7-check apples-to-apples pricing comparison validator. Pure algorithmic — no LLM. Catches size mismatches, wrong SKU families, price anomalies before FinOps picks a vendor. Returns `PricingValidationResult`. See §22h. |
 
 ---
 
@@ -937,17 +937,17 @@ Reference: `docs/Presidio_Response_Cal Fire_Draft 10.7.25 (2) (1).html` (parsed 
 
 | ID | Component | Description | Priority | Status |
 |----|-----------|-------------|----------|--------|
-| **P15a** | `src/engines/` | New `architecture_selector.py`: score **4 options** (managed-serverless, self-hosted-serverless, containers, hybrid) using real sizer pricing + WAF scoring. Self-hosted serverless = K8s+Knative/KEDA with K8s node cost model (not per-invocation). Cost score uses actual monthly estimates from pricing API, not heuristics. | 🔴 Critical | ❌ Not started |
+| **P15a** | `src/engines/` | New `architecture_selector.py`: score **4 options** (managed-serverless, self-hosted-serverless, containers, hybrid) using real sizer pricing + WAF scoring. Self-hosted serverless = K8s+Knative/KEDA with K8s node cost model (not per-invocation). Cost score uses actual monthly estimates from pricing API, not heuristics. | 🔴 Critical | ✅ Done |
 | **P15b** | `src/models/cloud_resource.py` + `sizer.py` | Add `SERVERLESS` to `ServiceCategory`; add Lambda/DynamoDB pricing path to sizer; add Knative/KEDA self-hosted path (re-uses K8s node pricing from CONTAINER path) | 🔴 Critical | ❌ Not started |
 | **P15c** | `src/agents/profiler.py` | Decompose enriched_input into 5-8 individual microservices (CONTAINER workloads) so bin-packing works with multiple inputs | 🔴 Critical | ❌ Not started |
-| **P15d** | `src/agents/router.py` (NEW) | **Router+Orchestrator Agent**: LLM intent classifier AND execution planner. Reads state + new input. Emits `ExecutionPlan`: intent type, agents to run, scope (full vs delta), affected components by name, RFP sections to amend. Downstream agents read `execution_plan` to understand their scope. See §22b. | 🔴 Critical | ❌ Not started |
-| **P15e** | `src/agents/validator.py` (NEW) | **Validator Agent** (5 checks): [0] Pricing data integrity via `pricing_validator.py` (apples-to-apples SKU comparison check), [1] Architecture correctness (architecture_selector), [2] Sizing adequacy, [3] Budget fit, [4] WAF compliance. Auto-runs after FinOps. On-demand via Router. See §22c. | 🔴 Critical | ❌ Not started |
-| **P15f** | `src/services/session_store.py` (NEW) | Session persistence: LangGraph `SqliteSaver` checkpointing (`data/sessions.db`). Thread ID = session_id. Cross-request state continuity. | 🔴 Critical | ❌ Not started |
+| **P15d** | `src/agents/router.py` (NEW) | **Router+Orchestrator Agent**: LLM intent classifier AND execution planner. Reads state + new input. Emits `ExecutionPlan`: intent type, agents to run, scope (full vs delta), affected components by name, RFP sections to amend. Downstream agents read `execution_plan` to understand their scope. See §22b. | 🔴 Critical | ✅ Done |
+| **P15e** | `src/agents/validator.py` (NEW) | **Validator Agent** (5 checks): [0] Pricing data integrity via `pricing_validator.py` (apples-to-apples SKU comparison check), [1] Architecture correctness (architecture_selector), [2] Sizing adequacy, [3] Budget fit, [4] WAF compliance. Auto-runs after FinOps. On-demand via Router. See §22c. | 🔴 Critical | ✅ Done |
+| **P15f** | `src/services/session_store.py` (NEW) | Session persistence: LangGraph `MemorySaver` checkpointing + aiosqlite session registry. Thread ID = session_id. Cross-request state continuity. | 🔴 Critical | ✅ Done |
 | **P15g** | `src/agents/profiler.py` | Add streaming (Kinesis), message queue (SQS), analytics (Redshift) workload detection from enriched_input keywords | 🟠 High | ❌ Not started |
 | **P15h** | `graph.py` + `orchestration.py` + `state.py` | Update graph (router+orchestrator node at START, validator node before rfp_writer, conditional edges, LangGraph checkpointing). Add `session_id` + `execution_plan` to state. Add `session_id` to API request/response. | 🔴 Critical | ❌ Not started |
 | **P15i** | `src/agents/rfp_writer.py` | Add "Architecture Alternatives Analysis" section (all 4 options) with WAF scores + REAL costs from Validator output. Add "Pricing Data Caveats" note if pricing_validation has errors. | 🔴 Critical | ❌ Not started |
-| **P15j** | `src/engines/architecture_selector.py` | Dynamic WAF weight profiles: Clarifier detects user priority ("cost is #1") → adjusts scoring weights (cost_weight=0.40, reliability=0.20, etc.) at runtime | 🟠 High | ❌ Not started |
-| **P15k** | `src/engines/pricing_validator.py` (NEW) | **Pricing Comparison Validator**: 7-check engine ensuring cross-provider SKU comparisons are valid before FinOps picks a vendor. Checks: size adequacy, tier consistency, price anomaly (>5× variance), SKU staleness, category match, provider parity (all providers represented), memory:vCPU ratio. See §22h. | 🔴 Critical | ❌ Not started |
+| **P15j** | `src/engines/architecture_selector.py` | Dynamic WAF weight profiles: Clarifier detects user priority ("cost is #1") → adjusts scoring weights (cost_weight=0.40, reliability=0.20, etc.) at runtime | 🟠 High | ✅ Done |
+| **P15k** | `src/engines/pricing_validator.py` (NEW) | **Pricing Comparison Validator**: 7-check engine ensuring cross-provider SKU comparisons are valid before FinOps picks a vendor. Checks: size adequacy, tier consistency, price anomaly (>5× variance), SKU staleness, category match, provider parity (all providers represented), memory:vCPU ratio. See §22h. | 🔴 Critical | ✅ Done |
 
 **Build order for P15**: P15b → P15a → P15k → P15c → P15g → P15d → P15e → P15f → P15h → P15i → P15j
 
