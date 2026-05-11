@@ -24,11 +24,13 @@ Flow::
 
     State fields written per agent:
     ─────────────────────────────────────────────────────────────────────────────
-    Clarifier  → messages, conversation, workload_request
-    Profiler   → workload_profile, messages
-    Sizer      → sized_results, messages
-    FinOps     → cost_comparison, messages
-    RFP Writer → rfp_document, messages
+    Clarifier       → messages, conversation, workload_request
+    Profiler        → workload_profile, messages
+    Sizer           → sized_results, messages
+    FinOps          → cost_comparison, messages
+    Validator       → validation_report, architecture_alternatives, messages
+    RFP Writer      → rfp_document, messages
+    Router+Orch     → execution_plan, routing_decision, pipeline_mode, turn_number
 """
 
 from __future__ import annotations
@@ -44,6 +46,49 @@ from src.models.cloud_resource import CloudProvider
 from src.models.conversation import ChatMessage, ConversationState
 from src.models.pricing import NormalizedPriceItem
 from src.models.workload import WorkloadProfile, WorkloadRequest
+
+
+# ---------------------------------------------------------------------------
+# Execution plan model (Router+Orchestrator — P15d)
+# ---------------------------------------------------------------------------
+
+
+class ExecutionPlan(TypedDict, total=False):
+    """Concrete execution plan produced by the Router+Orchestrator agent.
+
+    Written to ``OrchestratorState`` on every turn ≥ 2.  Downstream agents
+    read this to understand their scope (full pipeline vs. delta-only).
+    """
+
+    intent: str
+    """Route type: ``new_request`` | ``amendment`` | ``validate`` | ``answer`` | ``clarify``."""
+
+    pipeline_mode: str
+    """Execution mode: ``full`` | ``amendment`` | ``validation`` | ``query``."""
+
+    agents_to_run: list[str]
+    """Names of agents that must run, e.g. ``["profiler", "sizer", "finops", "rfp_writer"]``."""
+
+    scope: str
+    """``full`` or ``delta_only``.  Delta-only agents re-process only ``scope_components``."""
+
+    scope_components: list[str]
+    """Component names to re-process when ``scope == "delta_only"``."""
+
+    rfp_amendment_sections: list[str]
+    """RFP section identifiers to regenerate, e.g. ``["§4", "§7"]``."""
+
+    amendment_delta: str
+    """One-sentence description of what changed."""
+
+    confidence: str
+    """Router's confidence in the classification: ``high`` | ``medium`` | ``low``."""
+
+    turn_number: int
+    """Turn index within the session (increments per user message)."""
+
+    preferred_architecture: str
+    """Target architecture for delta/amendment runs: ``self_hosted_serverless`` | ``managed_serverless`` | ``containers`` | ``hybrid``. Empty string on full runs."""
 
 
 # ---------------------------------------------------------------------------
@@ -74,9 +119,17 @@ class AgentExecution(BaseModel):
 
     @property
     def elapsed_ms(self) -> float | None:
-        """Calculate duration from timestamps if not explicitly set."""
+        """Calculate duration from timestamps if not explicitly set.
+
+        Returns wall-clock ms when running (started_at only), final duration
+        when completed (both timestamps set), or falls back to duration_ms.
+        """
         if self.started_at and self.completed_at:
             delta = self.completed_at - self.started_at
+            return delta.total_seconds() * 1000
+        if self.started_at:
+            from datetime import datetime, timezone
+            delta = datetime.now(timezone.utc) - self.started_at
             return delta.total_seconds() * 1000
         return self.duration_ms
 
@@ -191,6 +244,30 @@ class OrchestratorState(TypedDict, total=False):
     kpis: dict[str, Any]
     """Measurable KPIs accumulated during the run."""
 
+    # ── Session management (P15h) ─────────────────────────────
+    session_id: str | None
+    """Persistent session UUID — populated for turn ≥ 2 (multi-turn conversations)."""
+
+    turn_number: int
+    """Turn index within the session; 0 for fresh requests, ≥ 1 for amendments."""
+
+    # ── Router+Orchestrator outputs (P15d / P15h) ─────────────
+    execution_plan: ExecutionPlan
+    """Written by Router+Orchestrator; tells each downstream agent what to run."""
+
+    routing_decision: str
+    """Mirrors ``execution_plan.intent`` for quick conditional-edge access."""
+
+    pipeline_mode: str
+    """Mirrors ``execution_plan.pipeline_mode``."""
+
+    # ── Validator outputs (P15e / P15h) ───────────────────────
+    validation_report: dict[str, Any]
+    """5-check quality-gate report (Validator agent output)."""
+
+    architecture_alternatives: list[dict[str, Any]]
+    """Ranked architecture options from the Validator / architecture_selector."""
+
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -242,7 +319,7 @@ def create_initial_state(
         compliance_report={},
         agent_executions={
             name: AgentExecution(agent_name=name)
-            for name in ("clarifier", "profiler", "sizer", "finops", "rfp_writer")
+            for name in ("clarifier", "profiler", "sizer", "finops", "validator", "rfp_writer", "router")
         },
         current_agent="clarifier",
         error=None,
@@ -253,4 +330,21 @@ def create_initial_state(
             "cache_hits": 0,
             "cache_misses": 0,
         },
+        session_id=None,
+        turn_number=0,
+        execution_plan=ExecutionPlan(
+            intent="new_request",
+            pipeline_mode="full",
+            agents_to_run=["clarifier", "profiler", "sizer", "finops", "validator", "rfp_writer"],
+            scope="full",
+            scope_components=[],
+            rfp_amendment_sections=[],
+            amendment_delta="N/A",
+            confidence="high",
+            turn_number=0,
+        ),
+        routing_decision="new_request",
+        pipeline_mode="full",
+        validation_report={},
+        architecture_alternatives=[],
     )

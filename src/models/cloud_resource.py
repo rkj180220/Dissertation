@@ -56,8 +56,18 @@ class ServiceCategory(str, Enum):
     Used exclusively for the per-cluster management fee line item.
     """
 
+    SERVERLESS = "serverless"
+    """Full managed-serverless architecture pattern.
+
+    Covers Lambda + DynamoDB + API Gateway + CloudFront (AWS),
+    Azure Functions + Cosmos DB + APIM, or Cloud Run + Firestore + API GW.
+    Used by the architecture_selector engine and serverless sizing path.
+    Distinct from SERVERLESS_FUNCTION (single function) and
+    SERVERLESS_COMPUTE (managed platform / App Service).
+    """
+
     SERVERLESS_FUNCTION = "serverless_function"
-    """Azure Functions, AWS Lambda, Cloud Functions."""
+    """Azure Functions, AWS Lambda, Cloud Functions (single-function billing)."""
 
     DATABASE = "database"
     """SQL Database, RDS, Cloud SQL, Cosmos DB, DynamoDB."""
