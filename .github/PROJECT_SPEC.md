@@ -3,7 +3,7 @@
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
 > **Additional Examiner**: Santhosh Kirubakaran
-> **Last Updated**: 11 May 2026 (P16a+P16b+P16c COMPLETE. Real-cost architecture comparison + Knative relabeling + StateRAMP Moderate gap analysis appendix (17-family LLM pass + heuristic fallback). Bug fix: `architecture_alternatives` always empty due to `ranked[0]['option']` KeyError in validator.py. 142 tests passing.)
+> **Last Updated**: 11 May 2026 (P16a–P16f ALL COMPLETE. B1–B8 RFP output bugs ALL FIXED. NEW-1–NEW-5 post-fire-test bugs ALL FIXED: AWS PostgreSQL RDS fallback, compute vCPU cap (c8a oversize fix), GCP IP-reservation DB filter, SLA RPS heuristic fix, mobile subsection recommended-provider. 142 tests passing.)
 > **LLM**: Gemini 2.5 Pro (`gemini-2.5-pro`) via Google Cloud Vertex AI (`dissertation-rj`, `us-central1`) using ADC
 
 ---
@@ -224,11 +224,11 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 
 | File | Status | What it does / will do |
 |------|--------|----------------------|
-| `clarifier.py` | ✅ | **~1370 lines.** Multi-turn LLM clarifier (Claude/Gemini via factory). `llm_clarify_turn()`, `build_enriched_input_from_structured()`. 19 structured fields incl. 6 WAF pillar summaries. Helpers: scale/SLA propagation, compliance parsing, CDN+geospatial detection, region propagation, AI/ML guard. `run_clarifier_node`. |
+| `clarifier.py` | ✅ | **~1370 lines.** Multi-turn LLM clarifier (Claude/Gemini via factory). `llm_clarify_turn()`, `build_enriched_input_from_structured()`. 19 structured fields incl. 6 WAF pillar summaries. Helpers: scale/SLA propagation, compliance parsing, CDN+geospatial detection, region propagation, AI/ML guard. `run_clarifier_node`. **NEW-4**: RPS heuristic changed from `peak_users × 10` to `max(500, peak_users // 2)` capped at 500K. |
 | `profiler.py` | ✅ | **~730 lines.** `WorkloadRequest → WorkloadProfile`. Priority-ordered category resolution, `_guard_ai_ml()`, container-aware resource estimation, cluster mgmt fee. **P15c** will add multi-workload decomposition (5–8 named microservices). `run_profiler_node`. |
-| `sizer.py` | ✅ | **~1250 lines.** Category-aware SKU selection: scored (COMPUTE/AI_ML), bin-packed (CONTAINER), cheapest (others). Container vCPU guard, DATABASE hourly filter, ElastiCache routing, CDN fixed estimate, K8s/LB fixed costs. `run_sizer_node`. |
+| `sizer.py` | ✅ | **~2050 lines.** Category-aware SKU selection: scored (COMPUTE/AI_ML), bin-packed (CONTAINER), cheapest (others). Container vCPU guard, DATABASE hourly filter, ElastiCache routing, CDN fixed estimate, K8s/LB fixed costs. `run_sizer_node`. **NEW-1**: `_is_postgres_workload()` + `_RDS_COST_MONTHLY` fallback for AWS RDS ($185/mo). **NEW-2**: vCPU cap before `_size_compute_workload` (`max_vcpu = max(8, req_vcpu*4)` — fixes c8a.8xlarge oversize). **NEW-3**: GCP IP-reservation rows filtered from DB candidates. |
 | `finops.py` | ✅ | **~900 lines.** RI/spot pricing queries with industry-standard fallbacks. TCO 1yr/3yr/5yr. Savings opportunities. `run_finops_node`. |
-| `rfp_writer.py` | ✅ | **~2100 lines.** ~25,000-char enterprise Markdown RFP. Gov/greenfield/mobile detection. Managed services table, requirements traceability (F-xx/C-xx/NFR-xx), WCAG 2.2 AA + StateRAMP tables, 16-section ToC. `run_rfp_writer_node`. |
+| `rfp_writer.py` | ✅ | **~2741 lines.** ~25,000-char enterprise Markdown RFP. Gov/greenfield/mobile detection. Managed services table, requirements traceability (F-xx/C-xx/NFR-xx), WCAG 2.2 AA + StateRAMP tables, 16-section ToC. `run_rfp_writer_node`. B2 fixed: `_build_architecture_section()` uses `recommended_provider` from state. B3 fixed: sentence-boundary rationale truncation. B8 fixed: RTM shows "Partial ⚠️" for StateRAMP when gap analysis is active. **NEW-5**: `_build_mobile_subsection()` takes `recommended_provider` param; no longer hardcodes AWS services when GCP/Azure recommended. |
 | `router.py` | ✅ | **P15d — BUILT.** LLM **Router+Orchestrator Agent**. Reads new user input + full state. Classifies intent AND produces `ExecutionPlan` (agents to run, scope_components, rfp_amendment_sections, amendment_delta). Entry point for Turn ≥ 2. Uses Principal Architect Reasoning (§22g). See §22b. |
 | `validator.py` | ✅ | **P15e — BUILT.** Architecture quality gate. **5 checks**: [0] Pricing data integrity (calls `pricing_validator.py`), [1] architecture_selector score with dynamic weights (P15j), [2] sizing adequacy, [3] budget fit, [4] WAF compliance. Uses Principal Architect Reasoning. Writes `validation_report` + `architecture_alternatives` to state. See §22c. |
 | `__init__.py` | ✅ | Exists (empty re-export shell). |
@@ -245,7 +245,7 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 | `vm_specs.py` | ✅ | Azure ARM SKU name parser (`parse_azure_vm_specs()`) + GCP machine type synthesiser (`compose_gcp_vm_instances()`, 31 predefined types). |
 | `bin_packing.py` | ✅ | **313 lines.** FFD + BFD algorithms. `NormalizedPriceItem` node SKUs + `WorkloadRequirement` container workloads. **Validated: 60/60 checks.** |
 | `scoring.py` | ✅ | **182 lines.** Weighted multi-criteria scorer (cost 40%, CPU fit 25%, memory fit 25%, generation 10%). **Validated: 60/60 checks.** |
-| `waf_compliance.py` | ✅ | **303 lines.** Rule-based WAF pillar checks. Filters by `ServiceCategory`. **Validated: 60/60 checks.** |
+| `waf_compliance.py` | ✅ | **471 lines.** Rule-based WAF pillar checks. Filters by `ServiceCategory`. Standalone checks (no bin_packing required): `_check_database_ha()` (production DB HA), `_check_budget_ceiling()`, `_check_compliance_coverage()` (framework tag coverage). **Validated: 60/60 checks.** |
 | `architecture_selector.py` | ✅ | **P15a — BUILT.** Unbiased 4-option scorer (managed-serverless, self-hosted-serverless, containers, hybrid). 3 signal groups: traffic pattern (cost crossover), workload characteristics, compliance. P15j dynamic weights via `derive_weights_from_workload()`. Returns ranked `ArchitectureRecommendation`. Used by Validator Agent. See §22f. |
 | `pricing_validator.py` | ✅ | **P15k — BUILT.** 7-check apples-to-apples pricing comparison validator. Pure algorithmic — no LLM. Catches size mismatches, wrong SKU families, price anomalies before FinOps picks a vendor. Returns `PricingValidationResult`. See §22h. |
 
@@ -1505,3 +1505,57 @@ class PricingValidationResult(BaseModel):
 - Does NOT re-run the  validates what is already there and flags issuesSizer 
 - If `is_valid=False`: Validator logs `log.warning("pricing_comparison_invalid", error_count= never silentN, ...)` 
   Pricing Data Caveats" subsection in cost sectionadds "
+
+
+
+---
+
+23. B8 + NEW-NEW-5 RFP Bug Fixes (11 May 2026)101B1## 
+
+### 23a. B8 Fixes (10 May 2026)B1
+
+All 8 RFP output quality bugs identified during the P16 fire scenario test run were fixed:
+
+| ID | Component | Bug | Fix | File |
+|----|-----------|-----|-----|------|
+| **B1** | SKU table rows | Duplicated rows (42 to 84) | Removed `**state` spread from both `validator.py`  only return changed keys (LangGraph reducer was appending twice) | `validator.py` |returns 
+| **B2** | Architecture diagram | Hardcodes "Cloud Target: AWS" regardless of recommendation | `_build_architecture_section()` now reads `state["recommended_provider"]` | `rfp_writer.py` |
+| **B3** | Sizing rationale | JSON truncated mid-sentence | Regex fallback extraction in `profiler.py`; sentence-boundary truncation in `rfp_writer.py` | `profiler.py`, `rfp_writer.py` |
+| **B4** | Azure Redis | $0.00 | `_is_redis_workload()` + `_REDIS_CACHE_COST_MONTHLY` dict fallback (Azure ~$55/mo) | `sizer.py` |
+| **B5** | Azure PostgreSQL | Selects "Basic"/"Burstable" tier for mission_critical | Burstable/basic excluded when tier in BUSINESS_CRITICAL or MISSION_CRITICAL | `sizer.py` |
+| **B6** | Extra workloads | data-streaming, message-queue missing SKU tables | `profiler.py` updates `state["workload_request"]` so sizer finds extra workloads | `profiler.py` |
+| **B7** | WAF compliance | Only 5 trivial checks (all pass trivially) | Added `_check_database_ha()`, `_check_budget_ceiling()`, `_check_compliance_coverage()` standalone checks | `waf_compliance.py` |
+| **B8** | RTM | "Acknowledged" when StateRAMP gap has 4 failed families | RTM now shows " See Appendix A" when `has_stateramp_gap=True` | `rfp_writer.py` |Partial 
+
+**Test result**: 142/142 tests pass after all B1-B8 fixes.
+
+### 23b. NEW-1 through NEW-5 Fixes (11 May 2026)
+
+Discovered during California Wildfire Fire-1 test run (3-provider: AWS/Azure/GCP, 2M peak users, StateRAMP Moderate):
+
+| ID | Component | Bug | Fix | File |
+|----|-----------|-----|-----|------|
+| **NEW-1** | AWS PostgreSQL | $0.00 (AWS Pricing API returns no RDS SKUs for some regions without exact API params) | Added `_is_postgres_workload()` helper + `_RDS_COST_MONTHLY` fallback dict (~$185/mo for AWS) in no-candidates block | `sizer.py` |
+| **NEW-2** | AWS Virtual Machines | `c8a.8xlarge` (32 vCPU, $1,258/mo) selected for 6-vCPU workload — 5x overprice | Added vCPU cap before `_size_compute_workload`: `max_vcpu = max(8, req_vcpu * 4)` | `sizer.py` |
+| **NEW-3** | GCP PostgreSQL | $7.30 = IP address reservation fee, not DB compute | GCP database candidates filtered: remove rows with "ip address"/"static ip" in product_name or sku_name | `sizer.py` |
+| **NEW-4** | SLA section | Peak Throughput shows unrealistic RPS (2M users x 10 = 20M RPS) | Changed clarifier heuristic: `peak_users * 10` to `max(500, min(peak_users // 2, 500_000))` capped at 500K | `clarifier.py` |
+| **NEW-5** | Mobile architecture | Subsection hardcodes AWS service names regardless of recommended provider | `_build_mobile_subsection()` now takes `recommended_provider` param; resolves recommended, then first-target, then "aws" | `rfp_writer.py` |
+
+**Test result**: 142/142 tests pass after all NEW-1 through NEW-5 fixes.
+
+### 23c. Live Verification Run (11 May 2026, Fire1-Bugfix-Verify)
+
+Full pipeline run with 12-workload Fire-1 scenario (50k to 2M concurrent users, 3-provider best-price):
+
+| Fix | Before | After | Status |
+|-----|--------|-------|--------|
+| NEW-1 AWS PostgreSQL | $0.00 | db.m6in.large $188.34/mo | CONFIRMED |
+| NEW-2 AWS VM sizing | c8a.8xlarge $1,258/mo | c7a.large $74.93/mo | CONFIRMED |
+| NEW-3 GCP PostgreSQL | $7.30 (IP reservation) | $24.82/mo (real Cloud SQL) | CONFIRMED |
+| NEW-4 SLA RPS | 20,000,000 RPS | 500,000 RPS | CONFIRMED |
+| NEW-5 Mobile services | hardcoded AWS | uses recommended_provider | Code verified |
+
+**AWS total cost**: $2,286/mo to $940/mo (59% reduction; now realistic)
+**GCP total**: $1,041/mo | **Azure total**: $184.80/mo (Azure compute API gaps noted)
+
+**Potential NEW-6**: Several AWS compute workloads (API Server, VMs, streaming-pipeline) all landing on c7a.large (2 vCPU) for 4-6 vCPU requirements — vCPU cap or candidate pool issue to investigate.

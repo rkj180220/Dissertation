@@ -1,6 +1,6 @@
 # Cloud Orchestrator IDSS — Continuation Prompt
 
-> **Last Updated**: 11 May 2026 (P16a–P16f COMPLETE. All Dissertation Completeness Features done. Bug fix: `architecture_alternatives` always empty — fixed `ranked[0]['option']` → `ranked[0]['name']` KeyError in validator.py. 142 tests, 0 TS build errors.)
+> **Last Updated**: 11 May 2026 (P16a–P16f COMPLETE. All Dissertation Completeness Features done. B1–B8 RFP output bugs ALL FIXED. NEW-1 through NEW-5 post-fire-test bugs FIXED. 142 tests, 0 TS build errors.)
 
 ---
 
@@ -192,6 +192,31 @@ All priorities through P14 are complete. Full per-fix breakdowns are in `PROJECT
 | P14 — DB undersizing | Memory/vCPU filter added; `db.r6i.large` ($182/mo) replaces `db.t3.micro` ($13) |
 | P15 — Agentic enhancements | SERVERLESS sizer path, architecture_selector, pricing_validator, profiler decomposition+streaming detection, Router agent, Validator agent, session store, graph+state updates, RFP alternatives section, dynamic WAF weights — 11 items, 142 tests ✅ |
 
+
+## ~~Known RFP Output Bugs~~ Fixed (11 May 2026 — Cal Fire Test Run → Resolved)
+
+All 8 bugs found during the Cal Fire live test have been fixed:
+
+| ID | Bug | Status |
+|----|-----|--------|
+| **B1** | SKU table rows duplicated | ✅ Fixed — removed `**state` spread from `validator.py` returns |
+| **B2** | Architecture diagram hardcodes "Cloud Target: AWS" | ✅ Fixed — `_build_architecture_section()` uses `state["recommended_provider"]` |
+| **B3** | Sizing rationale JSON truncated mid-sentence | ✅ Fixed — regex extraction in `profiler.py`; sentence-boundary truncation in `rfp_writer.py` |
+| **B4** | Azure Redis Cache: $0.00 | ✅ Fixed — `_is_redis_workload()` + `_REDIS_CACHE_COST_MONTHLY` fallback in `sizer.py` |
+| **B5** | Azure PostgreSQL selects "Basic" tier for mission_critical | ✅ Fixed — burstable/basic tier excluded when `tier ∈ {BUSINESS_CRITICAL, MISSION_CRITICAL}` |
+| **B6** | Extra components (data-streaming, message-queue) missing SKU tables | ✅ Fixed — `profiler.py` updates `state["workload_request"]` so sizer finds extra workloads |
+| **B7** | WAF compliance only 5 trivial checks | ✅ Fixed — added `_check_database_ha()`, `_check_budget_ceiling()`, `_check_compliance_coverage()` to `waf_compliance.py` |
+| **B8** | RTM says "Acknowledged ✅" even when StateRAMP gap shows 4 ❌ families | ✅ Fixed — RTM now shows "Partial ⚠️ — See Appendix A" when `has_stateramp_gap=True` |
+
+### Post-Fire-Test Bugs (NEW-1 through NEW-5) — ALL FIXED ✅
+
+| ID | Bug | Status |
+|----|-----|--------|
+| **NEW-1** | AWS PostgreSQL: $0.00 (no RDS SKU candidates) | ✅ Fixed — `_is_postgres_workload()` + `_RDS_COST_MONTHLY` fallback in `sizer.py` (AWS-only, ~$185/mo) |
+| **NEW-2** | AWS VM oversized SKU (c8a.8xlarge for 6-vCPU workload, 5× cost) | ✅ Fixed — vCPU cap filter before `_size_compute_workload`: `max_vcpu = max(8, req_vcpu * 4)` |
+| **NEW-3** | GCP PostgreSQL: $7.30 = IP address reservation fee, not DB compute | ✅ Fixed — GCP database candidates filtered to remove "IP address"/"static ip" SKUs |
+| **NEW-4** | SLA section: Peak Throughput shows unrealistic RPS (×10 multiplier) | ✅ Fixed — clarifier RPS heuristic changed from `peak_users × 10` to `max(500, peak_users // 2)`, capped at 500K |
+| **NEW-5** | Mobile architecture subsection hardcodes AWS services | ✅ Fixed — `_build_mobile_subsection()` now takes `recommended_provider` param; call site passes it |
 
 ## What Needs to Be Fixed/Built Next ❌
 
