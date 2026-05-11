@@ -173,15 +173,13 @@ def t_providers_azure_methods():
     assert "list_regions" in methods
 
 def t_providers_aws_mappings():
-    from src.providers.aws_provider import AWSPricingProvider
-    p = AWSPricingProvider()
-    assert len(p._SERVICE_CATEGORY_MAP) >= 45
-    assert len(p._REGION_MAP) >= 26
+    from src.providers.aws_provider import _SERVICE_CODE_MAP, _REGION_TO_LOCATION
+    assert len(_SERVICE_CODE_MAP) >= 45
+    assert len(_REGION_TO_LOCATION) >= 26
 
 def t_providers_gcp_mappings():
-    from src.providers.gcp_provider import GCPPricingProvider
-    p = GCPPricingProvider()
-    assert len(p._SERVICE_CATEGORY_MAP) >= 38
+    from src.providers.gcp_provider import _SERVICE_DISPLAY_NAME_MAP
+    assert len(_SERVICE_DISPLAY_NAME_MAP) >= 38
 
 check("providers — all 3 adapters inherit BaseCloudProvider", t_providers_import)
 check("providers.azure — search_prices/get_sku_prices/list_regions present", t_providers_azure_methods)
@@ -222,7 +220,7 @@ def t_orchestrator_state():
     assert s["project_name"] == "TestProject"
     assert isinstance(s["messages"], list)
     assert isinstance(s["agent_executions"], dict)
-    assert s["conversation"]["requirements_complete"] is False
+    assert s["conversation"].requirements_complete is False
 
 def t_orchestrator_init():
     from src.orchestrator import (
@@ -254,11 +252,12 @@ def t_clarifier_imports():
         run_clarifier_node,
         _parse_environment, _parse_tier, _parse_providers,
         _parse_budget, _parse_compliance, _extract_workloads_from_text,
-        _generate_clarification_questions, _apply_clarification_to_request,
-        REQUIRED_QUESTIONS, RECOMMENDED_QUESTIONS,
+        llm_clarify_turn, build_enriched_input_from_structured,
+        _parse_explicit_values,
     )
-    assert len(REQUIRED_QUESTIONS) == 4
-    assert len(RECOMMENDED_QUESTIONS) == 4
+    assert callable(run_clarifier_node)
+    assert callable(llm_clarify_turn)
+    assert callable(build_enriched_input_from_structured)
 
 def t_clarifier_parse_environment():
     from src.agents.clarifier import _parse_environment
@@ -329,8 +328,8 @@ def t_engines_scoring():
     assert abs(w.cost + w.cpu_fit + w.memory_fit + w.generation - 1.0) < 0.001
 
 def t_engines_waf():
-    from src.engines.waf_compliance import run_waf_checks
-    assert callable(run_waf_checks)
+    from src.engines.waf_compliance import evaluate_compliance
+    assert callable(evaluate_compliance)
 
 check("engines.bin_packing — pack_workloads + PackingAlgorithm (FFD/BFD)", t_engines_bin_packing)
 check("engines.scoring — score_skus + ScoringWeights (sum=1.0)", t_engines_scoring)

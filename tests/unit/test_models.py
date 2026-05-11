@@ -18,8 +18,8 @@ from src.models.workload import ResourceSpec, WorkloadRequirement, WorkloadTier
 
 
 class TestServiceCategory:
-    def test_has_15_values(self) -> None:
-        assert len(ServiceCategory) == 15
+    def test_has_16_values(self) -> None:
+        assert len(ServiceCategory) == 16
 
     def test_kubernetes_value(self) -> None:
         assert ServiceCategory.KUBERNETES.value == "kubernetes"

@@ -224,10 +224,10 @@ class TestInitialState:
         for key in required_keys:
             assert key in state, f"Missing state key: {key}"
 
-    def test_initial_state_has_five_agent_executions(self) -> None:
+    def test_initial_state_has_seven_agent_executions(self) -> None:
         state = create_initial_state(request_id="x", project_name="y", raw_user_input="z")
-        assert len(state["agent_executions"]) == 5
-        expected = {"clarifier", "profiler", "sizer", "finops", "rfp_writer"}
+        assert len(state["agent_executions"]) == 7
+        expected = {"clarifier", "profiler", "sizer", "finops", "rfp_writer", "validator", "router"}
         assert set(state["agent_executions"].keys()) == expected
 
     def test_initial_state_message_contains_user_input(self) -> None:
