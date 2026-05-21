@@ -67,12 +67,12 @@ from langfuse import observe
 
 from src.engines import extract_memory_gb, extract_vcpus
 from src.engines.bin_packing import PackingAlgorithm, pack_workloads
-from src.engines.scoring import ScoredSKU, score_skus
+from src.engines.scoring import ScoredSKU, _detect_processor_architecture, score_skus
 from src.engines.vm_specs import compose_gcp_vm_instances
 from src.models.cloud_resource import CloudProvider, ServiceCategory
 from src.models.conversation import ChatMessage, MessageRole
 from src.models.pricing import NormalizedPriceItem, PricingTier
-from src.models.recommendation import BinPackingResult
+from src.models.recommendation import BinPackingResult, ProcessorArchitectureEntry
 from src.models.workload import (
     ComponentProfile,
     WorkloadProfile,
@@ -1316,9 +1316,114 @@ async def _generate_sizer_summary(
         return " ".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Main node function
-# ---------------------------------------------------------------------------
+def _build_architecture_insights(
+    all_results: list,
+    workload_request,
+) -> list[dict]:
+    """Build P17 processor architecture insights from sizer results.
+
+    For each COMPUTE / AI_ML result that has a selected SKU, calls
+    ``_detect_processor_architecture()`` to classify the SKU vs workload
+    fit and produces a ``ProcessorArchitectureEntry`` record.
+
+    Args:
+        all_results: List of SizedWorkloadResult objects from the sizer.
+        workload_request: The original WorkloadRequest for workload lookup.
+
+    Returns:
+        List of serialised ProcessorArchitectureEntry dicts.
+    """
+    from src.models.cloud_resource import ServiceCategory
+
+    _ARCH_CATEGORIES = {ServiceCategory.COMPUTE, ServiceCategory.AI_ML}
+    _SMT_KEYWORDS = ("parallel", "multi-thread", "multithread", "concurrent", "batch")
+    _GRAV_KEYWORDS = ("web", "api", "http", "rest", "crypto", "cache", "cdn", "gateway")
+
+    workload_map = {
+        w.name: w
+        for w in (workload_request.workloads if workload_request else [])
+    }
+
+    insights: list[dict] = []
+    for result in all_results:
+        sku = result.selected_sku
+        if sku is None:
+            continue
+
+        # Derive the workload requirement
+        wl = workload_map.get(result.workload_name)
+
+        # Only produce insights for COMPUTE/AI_ML categories
+        category = getattr(wl, "suggested_category", None) if wl else None
+        if wl and category not in _ARCH_CATEGORIES:
+            continue
+
+        # Use _detect_processor_architecture for scoring
+        if wl:
+            arch_type, arch_score = _detect_processor_architecture(wl, sku.sku_name)
+        else:
+            family = sku.sku_name.split(".")[0].lower() if "." in sku.sku_name else sku.sku_name.lower()
+            from src.engines.scoring import _GRAVITON_PREFIXES
+            arch_type = "graviton" if family in _GRAVITON_PREFIXES else "x86"
+            arch_score = 0.85
+
+        sku_family = sku.sku_name.split(".")[0].lower() if "." in sku.sku_name else sku.sku_name.lower()
+
+        # Determine SMT suitability
+        text = f"{result.workload_name} {getattr(wl, 'notes', '') or ''}".lower()
+        concurrent = (wl.resources.concurrent_users or 0) if wl else 0
+        smt_suitable = any(kw in text for kw in _SMT_KEYWORDS) or concurrent > 500
+        graviton_suitable = any(kw in text for kw in _GRAV_KEYWORDS)
+
+        # smt_match: x86 when SMT-required, graviton when Graviton-suitable
+        if smt_suitable:
+            smt_match = arch_type == "x86"
+        elif graviton_suitable:
+            smt_match = arch_type == "graviton"
+        else:
+            smt_match = True  # neutral — both are fine
+
+        # Breaking latency risk — only meaningful for x86 (SMT) at high load
+        if arch_type == "x86" and smt_suitable:
+            breaking_latency_risk = "HIGH"
+        elif arch_type == "x86" and concurrent > 200:
+            breaking_latency_risk = "MEDIUM"
+        else:
+            breaking_latency_risk = "LOW"
+
+        # Build rationale
+        if arch_type == "graviton" and graviton_suitable:
+            rationale = (
+                f"Graviton ({sku.sku_name}) — optimal for {result.workload_name}: "
+                "40% better single-threaded performance, 20% lower cost, 60% less energy."
+            )
+        elif arch_type == "x86" and smt_suitable:
+            rationale = (
+                f"x86 ({sku.sku_name}) — appropriate for {result.workload_name}: "
+                "SMT required for multi-threaded workloads. "
+                f"Monitor CPU load; breaking latency risk at >60% utilisation is {breaking_latency_risk}."
+            )
+        else:
+            rationale = (
+                f"Architecture {arch_type} ({sku.sku_name}) selected for {result.workload_name}. "
+                "No strong threading signal detected; Graviton preferred for cost/energy savings."
+            )
+
+        entry = ProcessorArchitectureEntry(
+            workload_name=result.workload_name,
+            provider=result.provider.value,
+            sku_family=sku_family,
+            arch_type=arch_type,
+            smt_suitable=smt_suitable,
+            smt_match=smt_match,
+            breaking_latency_risk=breaking_latency_risk,
+            cost_monthly_usd=result.monthly_cost_usd,
+            architecture_score=round(arch_score, 4),
+            rationale=rationale,
+        )
+        insights.append(entry.model_dump())
+
+    return insights
 
 
 async def run_sizer_node(
@@ -1667,6 +1772,35 @@ async def run_sizer_node(
                             if no_gpu:
                                 candidates = no_gpu
 
+                        # Exclude storage-optimised instance families for general
+                        # COMPUTE workloads on AWS.  d*, i*, h*, hs* and f1
+                        # families are NVMe / HDD dense — extremely expensive and
+                        # only suitable for workloads that explicitly need local
+                        # NVMe throughput (databases, data-lake ingest, etc.).
+                        # Selecting d3en.6xlarge for a 6-vCPU API server inflates
+                        # the bill by ~10× compared to an equivalent r6i or m6i.
+                        if provider == CloudProvider.AWS:
+                            _STORAGE_DENSE_PREFIXES = (
+                                "d2.", "d3.", "d3en.",
+                                "i2.", "i3.", "i3en.", "i4i.", "i4g.",
+                                "h1.", "hs1.",
+                                "f1.",
+                            )
+                            no_storage_dense = [
+                                c for c in candidates
+                                if not any(
+                                    c.sku_name.lower().startswith(pfx)
+                                    for pfx in _STORAGE_DENSE_PREFIXES
+                                )
+                            ]
+                            if no_storage_dense:
+                                candidates = no_storage_dense
+                                comp_log.info(
+                                    "aws_storage_dense_instances_excluded",
+                                    remaining=len(no_storage_dense),
+                                    reason="not_storage_intensive_workload",
+                                )
+
                         comp_log.info(
                             "candidates_filtered_to_vms",
                             remaining=len(candidates),
@@ -1676,16 +1810,19 @@ async def run_sizer_node(
                 # RDS / ElastiCache pricing includes storage, IOPS, and backup
                 # meters alongside instance-hour rows.  We need instance rows.
                 if component.resolved_category == ServiceCategory.DATABASE:
-                    hourly = [
+                    # Always update candidates to hourly-only rows.
+                    # If no hourly rows exist (only storage/IOPS meters returned),
+                    # candidates becomes [] → triggers the PostgreSQL/Redis fallback
+                    # below, preventing non-hourly rows from producing a $0 result
+                    # that FinOps misinterprets as incomplete pricing.
+                    candidates = [
                         c for c in candidates
                         if c.is_hourly and c.unit_price > 0
                     ]
-                    if hourly:
-                        candidates = hourly
-                        comp_log.info(
-                            "database_candidates_filtered_to_hourly",
-                            remaining=len(hourly),
-                        )
+                    comp_log.info(
+                        "database_candidates_filtered_to_hourly",
+                        remaining=len(candidates),
+                    )
 
                     # ── Filter DATABASE to current-gen, resource-adequate SKUs ──
                     # The cheapest hourly row (e.g. db.t3.micro at $0.018/hr)
@@ -1753,6 +1890,31 @@ async def run_sizer_node(
                                     remaining=len(candidates),
                                     reason="production_critical_tier",
                                 )
+
+                    # ── AWS ElastiCache: exclude Extended Support meters ──
+                    # AWS ElastiCache pricing includes "ExtendedSupportYr1_Yr2" and
+                    # "ExtendedSupportYr3" meters for running Redis past its EOL.
+                    # These are additional fee rows (not compute instances) but appear
+                    # as hourly rows and inflate the selected cost by ~2×.
+                    # Only exclude them for cache/redis workloads; keep for DB proper.
+                    if provider == CloudProvider.AWS and _is_redis_workload(original_wl):
+                        _ELASTICACHE_EXTENDED_KEYWORDS = (
+                            "extendedsupport", "extended-support", "extended support",
+                            "yr1_yr2", "yr3", "eol",
+                        )
+                        standard_only = [
+                            c for c in candidates
+                            if not any(
+                                kw in (c.sku_name + " " + c.product_name).lower()
+                                for kw in _ELASTICACHE_EXTENDED_KEYWORDS
+                            )
+                        ]
+                        if standard_only:
+                            candidates = standard_only
+                            comp_log.info(
+                                "aws_elasticache_extended_support_excluded",
+                                remaining=len(standard_only),
+                            )
 
                     # ── GCP: exclude IP address reservation rows ──
                     # Cloud SQL pricing includes a static-IP reservation row
@@ -2058,9 +2220,17 @@ async def run_sizer_node(
             duration_ms=round(duration_ms, 1),
         )
 
+        # ── P17: Build processor architecture insights ────────
+        arch_insights = _build_architecture_insights(
+            all_results,
+            state.get("workload_request"),
+        )
+        log.info("architecture_insights_built", count=len(arch_insights))
+
         # ── Return state update ───────────────────────────────
         return {
             "sized_results": all_results,
+            "processor_architecture_insights": arch_insights,
             "messages": [summary_message],
             "current_agent": "sizer",
             "agent_executions": {

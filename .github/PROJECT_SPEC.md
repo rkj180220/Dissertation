@@ -3,7 +3,7 @@
 > **Author**: Ramkumar J · BITS ID: 2024MT03027 · M.Tech Cloud Computing, BITS Pilani WILP
 > **Supervisor**: Rajkumar Sakthibalan (Presidio Solutions, Chennai)
 > **Additional Examiner**: Santhosh Kirubakaran
-> **Last Updated**: 11 May 2026 (P16a–P16f ALL COMPLETE. B1–B8 RFP output bugs ALL FIXED. NEW-1–NEW-5 post-fire-test bugs ALL FIXED. PROV-1–PROV-3 Cal Fire provider+workload+budget bugs ALL FIXED: provider now defaults to best_price_all when user has no preference, WORKLOAD_SUMMARY forces explicit component listing, $3.2M/year budget now parses correctly. 142 tests passing.)
+> **Last Updated**: 12 May 2026 (P16a–P16f ALL COMPLETE. B1–B8 RFP output bugs ALL FIXED. NEW-1–NEW-5 post-fire-test bugs ALL FIXED. PROV-1–PROV-3 Cal Fire provider+workload+budget bugs ALL FIXED. FIRE2-1–FIRE2-3 Test Prompt 2 critical bugs ALL FIXED. FIRE3-1–FIRE3-4 Third test-run bugs ALL FIXED. FIRE4-1 Fourth-run bug FIXED: FinOps incorrectly excluded AWS (cheapest at $1,090) from cheapest-complete comparison because the DATABASE hourly filter was conditional — non-hourly RDS rows survived when no hourly rows existed, causing PostgreSQL to produce cost=$0/fit=0 and triggering has_incomplete_pricing=True for AWS. Fixed by making the hourly filter unconditional (candidates = [hourly rows]) so an empty result triggers the $185 RDS fallback. 142 tests passing.)
 > **LLM**: Gemini 2.5 Pro (`gemini-2.5-pro`) via Google Cloud Vertex AI (`dissertation-rj`, `us-central1`) using ADC
 
 ---
@@ -244,8 +244,8 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 | `__init__.py` | ✅ | Shared attribute extraction helpers: `extract_vcpus()`, `extract_memory_gb()`, `extract_gpu_count()`, `extract_generation()`. Handles standardised keys + AWS-style fallbacks. |
 | `vm_specs.py` | ✅ | Azure ARM SKU name parser (`parse_azure_vm_specs()`) + GCP machine type synthesiser (`compose_gcp_vm_instances()`, 31 predefined types). |
 | `bin_packing.py` | ✅ | **313 lines.** FFD + BFD algorithms. `NormalizedPriceItem` node SKUs + `WorkloadRequirement` container workloads. **Validated: 60/60 checks.** |
-| `scoring.py` | ✅ | **182 lines.** Weighted multi-criteria scorer (cost 40%, CPU fit 25%, memory fit 25%, generation 10%). **Validated: 60/60 checks.** |
-| `waf_compliance.py` | ✅ | **471 lines.** Rule-based WAF pillar checks. Filters by `ServiceCategory`. Standalone checks (no bin_packing required): `_check_database_ha()` (production DB HA), `_check_budget_ceiling()`, `_check_compliance_coverage()` (framework tag coverage). **Validated: 60/60 checks.** |
+| `scoring.py` | ✅ | **182 lines.** Weighted multi-criteria scorer (~~cost 40%,~~ **cost 35%**, CPU fit 25%, memory fit 25%, generation 10%, **processor_architecture 5%** — P17). **Validated: 60/60 checks.** P17 adds `_detect_processor_architecture(workload, sku_name)`: returns `(arch_type, score)` where `arch_type` ∈ `{graviton, x86, unknown}`. Graviton families detected by SKU prefix: `c8g`, `m8g`, `r8g`, `t4g`, `x2g`. SMT-required signals: "parallel", "multi-thread", "concurrent", high `concurrent_users` (>500). Graviton-suitable signals: "web server", "api", "crypto", "cache". Score: Graviton-suitable + ARM SKU = 1.0; Graviton-suitable + x86 SKU = 0.7; SMT-required + x86 SKU = 1.0; SMT-required + ARM SKU = 0.5; neutral = 0.85. Only applied to `COMPUTE` and `AI_ML` categories. |
+| `waf_compliance.py` | ✅ | **471 lines.** Rule-based WAF pillar checks. Filters by `ServiceCategory`. Standalone checks (no bin_packing required): `_check_database_ha()` (production DB HA), `_check_budget_ceiling()`, `_check_compliance_coverage()` (framework tag coverage). **Validated: 60/60 checks.** P17: `_check_sustainability()` — Sustainability pillar now checks active ARM/Graviton adoption rate (≥1 COMPUTE workload routed to `c8g`/`m8g`/`r8g`/`t4g`/`x2g` SKU → score 5/5 = 100%); previously was 4/5 future-work placeholder. `evaluate_compliance()` now accepts `sized_results: list[Any] | None`. |
 | `architecture_selector.py` | ✅ | **P15a — BUILT.** Unbiased 4-option scorer (managed-serverless, self-hosted-serverless, containers, hybrid). 3 signal groups: traffic pattern (cost crossover), workload characteristics, compliance. P15j dynamic weights via `derive_weights_from_workload()`. Returns ranked `ArchitectureRecommendation`. Used by Validator Agent. See §22f. |
 | `pricing_validator.py` | ✅ | **P15k — BUILT.** 7-check apples-to-apples pricing comparison validator. Pure algorithmic — no LLM. Catches size mismatches, wrong SKU families, price anomalies before FinOps picks a vendor. Returns `PricingValidationResult`. See §22h. |
 
@@ -288,7 +288,7 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 | `test_clarifier.py` | 64 | ✅ All pass | All `_parse_*` pure functions (environment, tier, providers, budget, compliance, count) + `_extract_workloads_from_text()` |
 | `test_profiler.py` | 20 | ✅ All pass | `_resolve_category` (6 cases), `_guard_ai_ml` (5 cases), `_estimate_resources` (7 cases), `_heuristic_rationale` (2 cases) |
 | `test_finops.py` | 19 | ✅ All pass | `_compute_tco` (7 cases), `_CATEGORY_TO_COST_FIELD` (7 cases), `_SPOT_INELIGIBLE` (6 cases), `_group_results_by_provider` (2 cases), `_resolve_category_for_result` (3 cases) |
-| `test_engines.py` | 15 | ✅ All pass | Bin-packing: empty/skip/FFD/BFD/replicas. Scoring: empty/filter/rank/weights/fields |
+| `test_engines.py` | 15+16=31 | ✅ All pass | Bin-packing: empty/skip/FFD/BFD/replicas. Scoring: empty/filter/rank/weights/fields. **P17**: 16 new tests for `_detect_processor_architecture()` — all 5 scoring cases + weight validation |
 | `test_models.py` | 15 | ✅ All pass | ServiceCategory (5), WorkloadRequirement P2 SLA fields (5), AncillaryCost (3), ProviderCostBreakdown (2), NormalizedPriceItem (2) |
 
 **Integration test file**:
@@ -346,7 +346,8 @@ Last-writer-wins: `conversation`, `workload_request`, `workload_profile`, `cost_
 | `src/components/results/ComplianceReport.tsx` | WAF compliance score + checks grouped by pillar with severity badges |
 | `src/components/results/RfpDocument.tsx` | Markdown RFP viewer with Copy + Download buttons |
 | `src/pages/ChatPage.tsx` | `/chat` route — renders ChatContainer |
-| `src/pages/ResultsPage.tsx` | `/results` route — tabbed layout: Overview, Cost Analysis, Compliance, RFP Document |
+| `src/pages/ResultsPage.tsx` | `/results` route — tabbed layout: Overview, Cost Analysis, Compliance, RFP Document, **Architecture Insights (P17)** |
+| `src/components/results/ProcessorArchitecturePanel.tsx` | ✅ **P17 — BUILT.** Architecture Insights tab. Per-workload ARM/Graviton vs x86 badge, SMT match indicator (green/amber), breaking latency risk badge (LOW/MEDIUM/HIGH), cost column, arch score bar, rationale cards. Uses `ProcessorArchitectureEntry` type from `api.ts`. |
 | `src/pages/NotFoundPage.tsx` | 404 fallback |
 | `src/App.tsx` | React Router routes: `/` → redirect `/chat`, `/chat`, `/results`, `*` → 404 |
 | `src/main.tsx` | Entry point: BrowserRouter + PipelineProvider + App |
@@ -412,6 +413,61 @@ Items in recommended implementation order:
 | ~~13~~ | ~~`tests/conftest.py` — shared pytest fixtures~~ | ✅ 10 fixtures, NormalizedPriceItem factory correct |
 | ~~14~~ | ~~`tests/unit/` — unit tests for all agents + engines~~ | ✅ 129/129 tests pass |
 | ~~15~~ | ~~`tests/integration/` — end-to-end workflow tests~~ | ✅ 13/13 tests pass |
+
+### Phase 6 — P17: Processor Architecture Awareness (Graviton/SMT) ✅ COMPLETE
+
+> **Context**: AWS Graviton (ARM, e.g. c8g.large) delivers 40% better perf at 20% lower cost and 60% less energy vs x86 — but lacks SMT. x86 (e.g. c5.large) supports hyperthreading (2 logical threads/core). For single-threaded / web / crypto / cache workloads, Graviton wins; for multi-threaded / parallel / high-concurrent workloads, x86 with SMT wins. "Breaking latency" = point at which throughput can no longer be sustained without exponential latency increase (sharp cliff at ~60% CPU load with SMT; more stable without SMT). Concept validated via OpenSSL sha256 benchmark: c8g.large = 10M hashes/3s vs c5.large = 3M hashes/3s single-threaded.
+
+| # | Task | Files | Status |
+|---|------|-------|--------|
+| **P17a** | Add `_detect_processor_architecture()` to scoring engine | `src/engines/scoring.py` | ✅ |
+| **P17b** | Update scoring weights: cost 40%→35%, add processor_architecture 5% | `src/engines/scoring.py` | ✅ |
+| **P17c** | Update WAF Sustainability check to active Graviton adoption scoring | `src/engines/waf_compliance.py` | ✅ |
+| **P17d** | Build `ProcessorArchitecturePanel.tsx` dashboard component | `dashboard/src/components/results/ProcessorArchitecturePanel.tsx` | ✅ |
+| **P17e** | Add Architecture Insights tab to Results page | `dashboard/src/pages/ResultsPage.tsx` | ✅ |
+| **P17f** | Expose `processor_architecture_insights` field in API response | `src/models/recommendation.py`, `src/api/routes/orchestration.py`, `src/agents/sizer.py`, `src/orchestrator/state.py` | ✅ |
+| **P17g** | Add unit tests for `_detect_processor_architecture()` | `tests/unit/test_engines.py` | ✅ (16 new tests; suite 158/158) |
+
+#### P17 Implementation Details
+
+**`_detect_processor_architecture(component: ComponentProfile) -> tuple[str, float]`**
+```python
+# Returns (arch_type, score) where arch_type in {"graviton", "x86"}
+# Graviton families: c8g, m8g, r8g, t4g, x2g (detect in SKU name prefix)
+# SMT-required signals (prefer x86): "parallel", "multi-thread", "concurrent", concurrent_users > 500
+# Graviton-suitable signals (prefer ARM): "web server", "api", "crypto", "cache", "single-thread"
+# Scoring:
+#   Graviton-suitable workload + ARM SKU  → score 1.0
+#   Graviton-suitable workload + x86 SKU  → score 0.7
+#   SMT-required workload + x86 SKU      → score 1.0
+#   SMT-required workload + ARM SKU      → score 0.5
+#   No signal detected                   → score 0.85 (neutral, slight Graviton lean for cost)
+# Only applied to COMPUTE and AI_ML categories
+```
+
+**WAF Sustainability check (P17c)**
+- `_check_sustainability()` in `waf_compliance.py`: scan `sized_results` for any COMPUTE/AI_ML result whose `selected_sku` starts with a Graviton prefix (`c8g`, `m8g`, `r8g`, `t4g`, `x2g`)
+- If ≥1 Graviton SKU recommended → score 5/5 (100%) — "Graviton adoption active ✅"
+- If 0 Graviton SKUs → score 4/5 (80%) — "No ARM/Graviton instances recommended"
+- Overall WAF score: 90.9% (30/33) once this is active
+
+**Dashboard `ProcessorArchitecturePanel` (P17d)**
+```typescript
+interface ProcessorArchitectureEntry {
+  workload_name: string;
+  sku_family: string;           // e.g. "c8g", "c5"
+  arch_type: "arm" | "x86";
+  smt_suitable: boolean;        // workload benefits from SMT
+  smt_match: boolean;           // arch_type matches smt_suitable
+  breaking_latency_risk: "LOW" | "MEDIUM" | "HIGH";  // based on expected CPU load %
+  cost_selected: number;        // monthly cost of selected SKU
+  cost_alternative: number | null;  // cost of equivalent other-arch SKU (null if no comparison available)
+}
+```
+- Badge colours: ARM = purple/violet, x86 = blue
+- SMT indicator: green checkmark (match), amber warning (mismatch)
+- Breaking latency risk: LOW = green, MEDIUM = amber, HIGH = red
+- Cost delta column: show savings/premium vs alternative architecture
 
 ### Phase 5 — Quality Gaps (Identified 17 Apr 2026)
 
@@ -507,13 +563,13 @@ Was: ~4,690 characters. Now: ~25,000+ characters. Reference RFPs: 30-60 pages.
 | **No `session_id` / `user_id`** | Cannot correlate traces with request_id or user sessions | MEDIUM |
 | **Double nesting** | Graph node wrappers have `@observe()` AND inner `run_*_node` functions also have `@observe()` — confusing trace hierarchy | LOW |
 
-#### 5g. Frontend — Runtime Errors ❌ (FIXED: ProviderCard)
+#### 5g. Frontend — Runtime Errors ✅ ALL FIXED (11 May 2026)
 
 | Issue | Description | Severity | Status |
 |-------|-------------|----------|--------|
 | **ProviderCard crash** | `sku.monthly_cost_estimate` is a Python `@property` — not serialized by `model_dump()`. Frontend gets `undefined`, calls `toLocaleString()` on it → TypeError crash | HIGH | ✅ FIXED — added `skuMonthlyCost()` helper that falls back to `unit_price × 730` for hourly or `unit_price` for monthly |
-| **`monthly_cost_estimate` missing from API** | `NormalizedPriceItem.monthly_cost_estimate` is a `@property` that Pydantic v2 excludes from `model_dump(mode="json")`. Need to either add `@computed_field` decorator or serialize it explicitly in the API layer. | HIGH | Backend fix still needed |
-| **No error boundaries** | React tree has no error boundaries — any component crash kills the entire page | MEDIUM | Not yet fixed |
+| **`monthly_cost_estimate` missing from API** | `NormalizedPriceItem.monthly_cost_estimate` was a plain `@property` that Pydantic v2 excludes from `model_dump(mode="json")`. | HIGH | ✅ FIXED — converted to `@computed_field` + `@property` in `src/models/pricing.py`. Now included in all API JSON responses. TS type updated to `number \| null`. |
+| **No error boundaries** | React tree had no error boundaries — any component crash kills the entire page | MEDIUM | ✅ FIXED — `ErrorBoundary` class component in `dashboard/src/components/ErrorBoundary.tsx`. Wraps: global app root (main.tsx), each route (App.tsx), each result tab individually (ResultsPage.tsx). Inline SVG warning icon, "Try again" reset button. |
 
 ---
 
@@ -1596,3 +1652,57 @@ Pipeline incorrectly produced `single_aws` provider strategy and only 3 workload
 | **Status Fixed |** | 
 
 **Test result**: 142/142 tests pass after all PROV-1 through PROV-3 fixes.
+
+---
+
+## §24 — Test Prompt 2 Critical Bug Fixes (FIRE2-1 through FIRE2-3)
+
+These 3 bugs were identified during a live run of Test Prompt 2 (State Forest Agency - California wildfire incident platform). They only manifest in the `/orchestrate/stream` pipeline mode where `enriched_input` is injected as `raw_user_input` — not in the `/clarify` conversation flow.
+
+### FIRE2-1 — Tier Miscategorization: `non_critical` Set for 99.99% SLA Public-Safety Scenario
+
+**Files**: `src/agents/clarifier.py`
+
+**Root cause**: `_parse_explicit_values()` used `"non" in text and "critical" in text` — matched the LLM system prompt enum description string `"mission_critical / business_critical / non_critical — inferred from SLA + sector"` in the enriched_input, incorrectly setting `tier = NON_CRITICAL`.
+
+**Symptom**: A 99.99% SLA public safety emergency response platform was tiered as `non_critical`, causing sizer to pick small/burstable instances and FinOps to not flag the mismatch.
+
+**Fix**:
+- Replaced the broad string-contains check with three specific regex pattern lists: `_MISSION_PATTERNS` (explicit "mission critical", "safety of life"), `_NON_CRITICAL_PATTERNS` (uses `(?!\s*/)` negative lookahead to skip enum list contexts), `_MISSION_SECTOR_PATTERNS` ("public safety", "emergency response", "fire protection", "outages cost lives").
+- Added SLA-based tier escalation block in `_propagate_scale_and_sla()` (runs after the workload loop):
+  - SLA ≥ 99.99% → force `MISSION_CRITICAL` (regardless of current tier)
+  - SLA ≥ 99.9% + current tier is `NON_CRITICAL` → escalate to `BUSINESS_CRITICAL`
+
+**Verification**: `_parse_explicit_values()` tested with 4 scenarios — enum text in enriched_input no longer triggers non_critical, "public safety" keywords detected as mission_critical, explicit "non-critical dev workload" still sets non_critical correctly.
+
+### FIRE2-2 — GCP Artificially Cheapest Due to Incomplete Serverless Pricing (fit=0/$0)
+
+**Files**: `src/agents/finops.py`, `src/models/recommendation.py`
+
+**Root cause**: GCP serverless functions had `fit_score=0.0, monthly_cost_usd=0.0, selected_sku=None` (no matching SKU found). `_build_provider_breakdown()` included these in the provider total without flagging them, making GCP appear ~37% cheaper than AWS/Azure when in reality its serverless cost was unknown/missing.
+
+**Fix**:
+- Added `has_incomplete_pricing: bool = False` and `missing_components: list[str] = []` to `ProviderCostBreakdown` (Pydantic model in `recommendation.py`).
+- In `_build_provider_breakdown()`, after building the total, added detection loop: when `result.fit_score == 0.0 and result.monthly_cost_usd == 0.0 and result.selected_sku is None` AND the workload name does NOT start with a fixed-cost prefix (K8s fee, data transfer, LB, CDN), append to `missing_components`.
+- Updated cheapest provider selection logic: prefers `complete_breakdowns` (no missing components) for the cheapest provider recommendation; only falls back to all providers if none are complete.
+- Added rules 6 and 7 to `_FINOPS_SYSTEM_PROMPT`: LLM is instructed to flag incomplete pricing with a `⚠️` warning and to note user provider preference.
+- `log.info("cost_comparison_assembled")` now logs `incomplete_providers` for observability.
+
+### FIRE2-3 — User Provider Preference Not Captured or Passed to FinOps
+
+**Files**: `src/agents/clarifier.py`, `src/models/workload.py`, `src/agents/finops.py`
+
+**Root cause**:
+1. `_user_named_single_provider()` only matched `"we're on aws"` / `"we use aws"` — not `"we're thinking aws"`, `"considering aws"`, `"leaning towards aws"`.
+2. Even when detected, there was no field on `WorkloadRequest` to carry the soft preference downstream.
+3. `_generate_finops_summary()` had no parameter for user preference, so the LLM recommendation ignored the user's stated cloud preference.
+
+**Fix**:
+- Added `user_preferred_provider: CloudProvider | None = None` to `WorkloadRequest` (in `workload.py`, after `raw_user_input`).
+- Added "thinking/considering/leaning towards" regex patterns to the `single_patterns` list in `_user_named_single_provider()`.
+- Added `_PREF_PATTERNS` detection block in `_parse_explicit_values()`: detects soft preference phrases and sets `req.user_preferred_provider` (distinct from hard override `req.providers`/strategy).
+- Updated `_generate_finops_summary(user_preferred_provider: str | None = None)` signature.
+- Added `"user_preferred_provider": user_preferred_provider or "not stated"` to `user_content` JSON dict.
+- Wired from `run_finops_node()`: passes `workload_request.user_preferred_provider.value` (or `None`) when calling `_generate_finops_summary()`.
+
+**Test result**: 142/142 tests pass after all FIRE2-1 through FIRE2-3 fixes.

@@ -256,6 +256,9 @@ async def _build_provider_breakdown(
 
     selected_skus: list[NormalizedPriceItem] = []
 
+    # Track components with no valid SKU (fit_score=0 or monthly_cost=0 with no SKU)
+    missing_components: list[str] = []
+
     for r in results:
         category = _resolve_category_for_result(r, workload_components)
         cost_field = _CATEGORY_TO_COST_FIELD.get(category, "other_monthly_usd")
@@ -263,6 +266,18 @@ async def _build_provider_breakdown(
 
         if r.selected_sku is not None:
             selected_skus.append(r.selected_sku)
+        elif (
+            r.fit_score == 0.0
+            and r.monthly_cost_usd == 0.0
+            and not any(r.workload_name.startswith(pfx) for pfx in _FIXED_COST_PREFIXES)
+        ):
+            # Workload needed pricing but none was found — cost is understated
+            missing_components.append(r.workload_name)
+            log.warning(
+                "workload_no_sku_found",
+                workload=r.workload_name,
+                provider=provider.value,
+            )
 
     total_on_demand = sum(cost_buckets.values())
 
@@ -523,6 +538,8 @@ async def _build_provider_breakdown(
         spot_monthly_usd=spot_monthly_out,
         spot_savings_pct=spot_savings_pct,
         selected_skus=selected_skus,
+        has_incomplete_pricing=bool(missing_components),
+        missing_components=missing_components,
     )
 
     log.info(
@@ -553,6 +570,11 @@ cost comparison with TCO projections, provide a concise analysis that:
    - Spot/preemptible pricing for stateless workloads
 4. Summarises 3-year and 5-year Total Cost of Ownership (TCO) for the cheapest provider
 5. Notes any budget concerns or whether reserved instances resolve the budget gap
+6. If a provider has has_incomplete_pricing=true, explicitly flag that its cost is \
+   understated (one or more components could not be priced) and exclude it from \
+   the cheapest recommendation or clearly caveat it.
+7. If the user indicated a provider preference (user_preferred_provider is set), \
+   acknowledge it and explain the cost trade-off vs. the recommended provider.
 
 Respond in 5-7 sentences. Be specific about dollar amounts and percentages. \
 Use "estimate" or "~" when data is based on industry-standard rates rather than \
@@ -566,6 +588,7 @@ async def _generate_finops_summary(
     comparison: CostComparison,
     savings: list[dict[str, Any]],
     growth_pct: float = 15.0,
+    user_preferred_provider: str | None = None,
 ) -> str:
     """Use the LLM to generate a FinOps analysis summary with TCO projections.
 
@@ -574,6 +597,8 @@ async def _generate_finops_summary(
         comparison: The cost comparison result.
         savings: All identified savings opportunities.
         growth_pct: Annual cost growth rate assumption (default 15%).
+        user_preferred_provider: Provider the user said they prefer (e.g. "aws"),
+            surfaced in the narrative even if another provider is cheaper.
 
     Returns:
         LLM-generated analysis string.
@@ -600,6 +625,8 @@ async def _generate_finops_summary(
             "tco_1yr_usd": tco_1yr,
             "tco_3yr_usd_with_growth": tco_3yr,
             "tco_5yr_usd_with_growth": tco_5yr,
+            "has_incomplete_pricing": pb.has_incomplete_pricing,
+            "missing_components": pb.missing_components,
         })
 
     user_content = json.dumps({
@@ -607,6 +634,7 @@ async def _generate_finops_summary(
             comparison.cheapest_provider.value
             if comparison.cheapest_provider else "N/A"
         ),
+        "user_preferred_provider": user_preferred_provider or "not stated",
         "savings_vs_most_expensive_pct": comparison.savings_vs_most_expensive_pct,
         "budget_monthly_usd": comparison.budget_monthly_usd,
         "budget_exceeded": comparison.budget_exceeded,
@@ -752,15 +780,34 @@ async def run_finops_node(
             all_savings.extend(savings)
 
         # ── Determine cheapest provider ───────────────────────
+        # Exclude providers with incomplete pricing from the cheapest recommendation;
+        # they are still included in the comparison table but flagged with a warning.
         cheapest: ProviderCostBreakdown | None = None
         most_expensive: ProviderCostBreakdown | None = None
 
         if provider_breakdowns:
-            sorted_providers = sorted(
-                provider_breakdowns, key=lambda p: p.total_monthly_usd,
-            )
-            cheapest = sorted_providers[0]
-            most_expensive = sorted_providers[-1]
+            complete_breakdowns = [p for p in provider_breakdowns if not p.has_incomplete_pricing]
+            all_sorted = sorted(provider_breakdowns, key=lambda p: p.total_monthly_usd)
+            complete_sorted = sorted(complete_breakdowns, key=lambda p: p.total_monthly_usd)
+
+            # Prefer complete breakdowns for cheapest; fall back to all if none are complete
+            if complete_sorted:
+                cheapest = complete_sorted[0]
+                most_expensive = all_sorted[-1]
+                if len(provider_breakdowns) != len(complete_breakdowns):
+                    incomplete_names = [
+                        p.provider.value.upper()
+                        for p in provider_breakdowns
+                        if p.has_incomplete_pricing
+                    ]
+                    log.warning(
+                        "providers_excluded_from_recommendation",
+                        reason="incomplete_pricing",
+                        excluded=incomplete_names,
+                    )
+            else:
+                cheapest = all_sorted[0]
+                most_expensive = all_sorted[-1]
 
         savings_vs_expensive = 0.0
         if cheapest and most_expensive and most_expensive.total_monthly_usd > 0:
@@ -792,13 +839,24 @@ async def run_finops_node(
             savings_vs_expensive_pct=savings_vs_expensive,
             budget_exceeded=budget_exceeded,
             savings_opportunities=len(all_savings),
+            incomplete_providers=[
+                p.provider.value for p in provider_breakdowns if p.has_incomplete_pricing
+            ],
         )
 
         # ── Generate LLM summary ─────────────────────────────
         # Use growth_rate from workload request if provided, else 15% default
         growth_pct = getattr(workload_request, "growth_rate_pct", None) or 15.0
         finops_summary = await _generate_finops_summary(
-            llm, comparison, all_savings, growth_pct=growth_pct,
+            llm,
+            comparison,
+            all_savings,
+            growth_pct=growth_pct,
+            user_preferred_provider=(
+                workload_request.user_preferred_provider.value
+                if getattr(workload_request, "user_preferred_provider", None)
+                else None
+            ),
         )
 
         # ── Build TCO projections for KPI tracking ────────────

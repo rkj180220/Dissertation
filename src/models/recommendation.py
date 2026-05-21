@@ -131,6 +131,20 @@ class ProviderCostBreakdown(BaseModel):
         ),
     )
 
+    # --- Pricing completeness flags ---
+    has_incomplete_pricing: bool = Field(
+        default=False,
+        description=(
+            "True if one or more workload components could not be priced on this provider "
+            "(fit_score=0.0 / no SKU found). Cost total is understated — "
+            "exclude or caveat this provider in recommendations."
+        ),
+    )
+    missing_components: list[str] = Field(
+        default_factory=list,
+        description="Names of workload components that had no SKU match on this provider",
+    )
+
 
 class CostComparison(BaseModel):
     """Multi-provider cost comparison produced by the FinOps Agent."""
@@ -172,6 +186,50 @@ class ComplianceReport(BaseModel):
     total_checks: int = Field(default=0, ge=0)
     passed_checks: int = Field(default=0, ge=0)
     compliance_score_pct: float = Field(default=0.0, ge=0, le=100)
+
+
+# ─── Processor Architecture Insights (P17) ──────────────────
+
+
+class ProcessorArchitectureEntry(BaseModel):
+    """Architecture insight for a single sized workload component.
+
+    Summarises whether the selected SKU's processor architecture (ARM/x86)
+    matches the workload's threading requirements, and quantifies the cost
+    delta vs the alternative architecture.
+    """
+
+    workload_name: str = Field(
+        description="Workload component name (matches SizedWorkloadResult.workload_name)"
+    )
+    provider: str = Field(description="Cloud provider slug: 'aws' | 'azure' | 'gcp'")
+    sku_family: str = Field(description="SKU family prefix, e.g. 'c8g', 'c5'")
+    arch_type: str = Field(
+        description="Detected architecture: 'graviton' | 'x86' | 'unknown'"
+    )
+    smt_suitable: bool = Field(
+        description="True when the workload signals multi-threading / high concurrency"
+    )
+    smt_match: bool = Field(
+        description="True when arch_type matches the workload's SMT suitability "
+        "(x86 for SMT-required, graviton for Graviton-suitable)",
+    )
+    breaking_latency_risk: str = Field(
+        default="LOW",
+        description="LOW | MEDIUM | HIGH — risk of hitting breaking-latency cliff on x86 with SMT",
+    )
+    cost_monthly_usd: float = Field(
+        default=0.0, ge=0,
+        description="Monthly cost of the selected SKU in USD",
+    )
+    architecture_score: float = Field(
+        default=0.85, ge=0.0, le=1.0,
+        description="Processor architecture fit score from the scoring engine (0.0–1.0)",
+    )
+    rationale: str = Field(
+        default="",
+        description="Human-readable explanation of why this architecture was selected",
+    )
 
 
 # ─── Final Recommendation ──────────────────────────────────

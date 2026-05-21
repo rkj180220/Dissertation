@@ -102,6 +102,7 @@ class OrchestrationResponse(BaseModel):
     cost_comparison: dict[str, Any] = {}
     compliance_report: dict[str, Any] = {}
     architecture_alternatives: list[dict[str, Any]] = []
+    processor_architecture_insights: list[dict[str, Any]] = []
     error: str | None = None
     duration_ms: float | None = None
 
@@ -150,6 +151,7 @@ async def orchestrate(body: OrchestrationRequest, request: Request) -> Orchestra
             cost_comparison=result.get("cost_comparison", {}),
             compliance_report=result.get("compliance_report", {}),
             architecture_alternatives=result.get("architecture_alternatives", []),
+            processor_architecture_insights=result.get("processor_architecture_insights", []),
             duration_ms=elapsed,
         )
     except Exception as exc:
@@ -239,6 +241,7 @@ async def orchestrate_stream(
             cost_comparison = final_state.get("cost_comparison", {})
             compliance_report = final_state.get("compliance_report", {})
             architecture_alternatives = final_state.get("architecture_alternatives", [])
+            arch_insights = final_state.get("processor_architecture_insights", [])
 
             yield {
                 "event": "pipeline_complete",
@@ -252,6 +255,7 @@ async def orchestrate_stream(
                     "cost_comparison": cost_comparison,
                     "compliance_report": compliance_report,
                     "architecture_alternatives": architecture_alternatives,
+                    "processor_architecture_insights": arch_insights,
                 }, default=_json_default),
             }
 

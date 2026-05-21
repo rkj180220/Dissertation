@@ -15,7 +15,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from src.models.cloud_resource import CloudProvider, ServiceCategory
 
@@ -128,9 +128,14 @@ class NormalizedPriceItem(BaseModel):
         """True when the billing unit is per-month."""
         return "month" in self.unit_of_measure.lower()
 
+    @computed_field
     @property
     def monthly_cost_estimate(self) -> float | None:
         """Best-effort monthly cost estimate.
+
+        Decorated with ``@computed_field`` so it is included in
+        ``model_dump(mode="json")`` and therefore serialized correctly
+        in API responses.
 
         Returns:
             Estimated monthly cost in USD, or ``None`` if the billing unit

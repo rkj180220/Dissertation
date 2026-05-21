@@ -2046,6 +2046,7 @@ async def _generate_executive_summary(
     workload_profile: WorkloadProfile,
     cost_comparison: CostComparison,
     compliance_report: ComplianceReport,
+    recommended_provider: str | None = None,
 ) -> str:
     """Generate an executive summary using the LLM.
 
@@ -2055,6 +2056,10 @@ async def _generate_executive_summary(
         workload_profile: Profiler output.
         cost_comparison: FinOps comparison.
         compliance_report: WAF report.
+        recommended_provider: FinOps-recommended provider (e.g. "azure"). When
+            provided this overrides the cheapest_provider field in the prompt so
+            the LLM correctly names the formal recommendation rather than just
+            the lowest raw cost.
 
     Returns:
         Executive summary string.
@@ -2091,6 +2096,15 @@ async def _generate_executive_summary(
             for c in workload_profile.components[:8]
         ],
         "budget_monthly_usd": workload_request.budget_monthly_usd,
+        # recommended_provider is the formal FinOps selection (may differ from raw cheapest
+        # when pricing data completeness is factored in).  Use it as the primary signal.
+        "recommended_provider": (
+            recommended_provider.upper() if recommended_provider
+            else (
+                cost_comparison.cheapest_provider.value.upper()
+                if cost_comparison.cheapest_provider else "N/A"
+            )
+        ),
         "cheapest_provider": (
             cost_comparison.cheapest_provider.value
             if cost_comparison.cheapest_provider else "N/A"
@@ -2557,7 +2571,10 @@ async def run_rfp_writer_node(
 
         # ── Run WAF compliance checks ─────────────────────────
         log.info("running_compliance_checks")
-        compliance_report = evaluate_compliance(workload_request)
+        compliance_report = evaluate_compliance(
+            workload_request,
+            sized_results=sized_results,
+        )
         log.info(
             "compliance_checks_completed",
             score=compliance_report.compliance_score_pct,
@@ -2572,6 +2589,7 @@ async def run_rfp_writer_node(
             workload_profile,
             cost_comparison,
             compliance_report,
+            recommended_provider=state.get("recommended_provider"),
         )
 
         # ── Pull TCO projections from state KPIs ──────────────

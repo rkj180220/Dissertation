@@ -8,7 +8,7 @@ but because the comparison is invalid.
 
 Purely algorithmic — no LLM call.  Fast, deterministic, fully unit-testable.
 
-7 checks performed in order:
+8 checks performed in order:
 
 0. ``size_adequacy``    — selected SKU meets ≥ 80 % of required memory/vCPU.
 1. ``tier_consistency`` — same pricing tier (on-demand/reserved/spot) across providers.
@@ -17,6 +17,7 @@ Purely algorithmic — no LLM call.  Fast, deterministic, fully unit-testable.
 4. ``category_match``   — SKU service_category matches workload suggested_category.
 5. ``provider_parity``  — all required providers have ≥ 1 result per workload.
 6. ``ratio_check``      — instance memory:vCPU ratio within 25 % of required ratio.
+7. ``zero_cost_sku``    — no result has fit_score=0 + cost=0 + no SKU (failed lookup).
 
 Typical usage::
 
@@ -489,6 +490,62 @@ def _check_ratio(
     return findings
 
 
+# Fixed-cost workload name prefixes — these legitimately have no SKU (flat rate).
+_FIXED_COST_PREFIXES = ("[Infra]", "K8s Cluster", "Load Balancer")
+
+
+def _check_zero_cost_sku(
+    results: list[SizedWorkloadResult],
+) -> list[PricingValidationFinding]:
+    """Check [7]: no result has fit_score=0, monthly_cost=0, and no SKU selected.
+
+    A result with all three conditions indicates the sizer found no matching
+    SKU for that provider/workload combination.  Including it in a cost
+    comparison makes that provider appear artificially cheap.  Fixed-cost
+    line items (K8s management fee, load balancer, data transfer) are excluded
+    because they legitimately have no SKU but use a flat rate.
+
+    Args:
+        results: Sizer output records.
+
+    Returns:
+        Findings for this check.
+    """
+    findings: list[PricingValidationFinding] = []
+
+    for r in results:
+        if any(r.workload_name.startswith(pfx) for pfx in _FIXED_COST_PREFIXES):
+            continue
+        if (
+            r.selected_sku is None
+            and r.monthly_cost_usd == 0.0
+            and r.fit_score == 0.0
+        ):
+            provider = r.provider.value if hasattr(r.provider, "value") else str(r.provider)
+            findings.append(
+                PricingValidationFinding(
+                    check_id="zero_cost_sku",
+                    workload_name=r.workload_name,
+                    provider=provider,
+                    severity="error",
+                    description=(
+                        f"No SKU found for '{r.workload_name}' on {provider} — "
+                        f"fit_score=0, cost=$0.  Including this in cost comparison "
+                        f"makes {provider} appear artificially cheaper."
+                    ),
+                    actual_value="fit_score=0.0, monthly_cost_usd=0.0, selected_sku=None",
+                    expected_value="fit_score > 0 and monthly_cost_usd > 0",
+                    recommended_action=(
+                        f"Re-run sizer for {provider} '{r.workload_name}' with broader "
+                        f"SKU search, or exclude {provider} from comparison if no "
+                        f"equivalent managed service exists."
+                    ),
+                )
+            )
+
+    return findings
+
+
 # ---------------------------------------------------------------------------
 # Main public function
 # ---------------------------------------------------------------------------
@@ -500,7 +557,7 @@ def validate_pricing(
     requirements: list | None = None,
     required_providers: list[str] | None = None,
 ) -> PricingValidationResult:
-    """Run 7 pricing integrity checks on sizer output.
+    """Run 8 pricing integrity checks on sizer output.
 
     Purely algorithmic — no LLM call.  Deterministic and fast.
 
@@ -530,6 +587,7 @@ def validate_pricing(
     all_findings.extend(_check_category_match(sized_results, req_by_name))
     all_findings.extend(_check_provider_parity(sized_results, required_providers))
     all_findings.extend(_check_ratio(sized_results, req_by_name))
+    all_findings.extend(_check_zero_cost_sku(sized_results))
 
     error_count = sum(1 for f in all_findings if f.severity == "error")
     warning_count = sum(1 for f in all_findings if f.severity == "warning")

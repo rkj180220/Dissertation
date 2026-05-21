@@ -1,6 +1,6 @@
 # Cloud Orchestrator IDSS — Continuation Prompt
 
-> **Last Updated**: 11 May 2026 (P16a–P16f COMPLETE. All Dissertation Completeness Features done. B1–B8 RFP output bugs ALL FIXED. NEW-1 through NEW-5 post-fire-test bugs FIXED. PROV-1 through PROV-3 Cal Fire provider/workload/budget bugs FIXED. 142 tests, 0 TS build errors.)
+> **Last Updated**: 25 May 2026 (P17a–P17g COMPLETE. Processor Architecture Awareness (Graviton/SMT) fully implemented. 158/158 tests pass. Dashboard build 0 TS errors.)
 
 ---
 
@@ -110,6 +110,8 @@ Please read `.github/copilot-instructions.md` first (tech stack rules, observabi
 - **RI/Spot savings always populated**: queries live pricing first; when no data found, applies industry-standard fallback rates: AWS (30%/45%/70%), Azure (35%/50%/80%), GCP (25%/40%/60%) for 1yr-RI/3yr-RI/Spot
 - **Spot eligibility filter**: DATABASE, STORAGE, NETWORKING, MANAGEMENT, SECURITY excluded; fixed-cost items (K8s fee, LB, `[Infra]`) bypass discounting entirely
 - **TCO projections**: `_compute_tco(monthly, years, growth_pct)` computes 1yr/3yr/5yr with compound growth (default 15%/yr); stored in `state[kpis][tco_projections]`
+- **Incomplete pricing detection** (FIRE2-2 fix): `has_incomplete_pricing` + `missing_components` fields on `ProviderCostBreakdown`; providers with `fit_score=0/$0/no-SKU` results are flagged and excluded from cheapest-provider selection; `_FINOPS_SYSTEM_PROMPT` rules 6+7 instruct LLM to flag these with ⚠️
+- **User provider preference** (FIRE2-3 fix): `user_preferred_provider` passed to `_generate_finops_summary()` via `workload_request.user_preferred_provider.value`
 - Updated LLM system prompt to explicitly request TCO + savings analysis
 - LLM summary with heuristic fallback; summary message includes TCO line
 - `run_finops_node(state, llm, pricing_service)` entry point
@@ -140,7 +142,7 @@ Please read `.github/copilot-instructions.md` first (tech stack rules, observabi
 
 ### New Agents (`src/agents/`) — P15d + P15e
 - `router.py` — **P15d ✅** Router+Orchestrator Agent. LLM intent classifier + `ExecutionPlan` producer. 5 intents. Principal Architect Reasoning (§22g). Writes `execution_plan`, `routing_decision`, `pipeline_mode`, `turn_number` to state.
-- `validator.py` — **P15e ✅** Architecture quality gate. 5 checks: [0] Pricing data integrity, [1] Architecture correctness (with P15j dynamic weights), [2] Sizing adequacy, [3] Budget fit, [4] WAF compliance. Principal Architect Reasoning. Writes `validation_report` + `architecture_alternatives`.
+- `validator.py` — **P15e ✅ + VAL-1/2/3 fixes** Architecture quality gate. **7 checks**: [0] Pricing data integrity (8 sub-checks incl. `zero_cost_sku`), [1] Architecture correctness (P15j dynamic weights), [2] Sizing adequacy, [3] Budget fit, [4] WAF compliance, **[5] Tier vs SLA consistency** (non_critical+99.99% SLA → fail), **[6] Provider preference alignment** (warns when FinOps recommendation diverges from `user_preferred_provider`). Principal Architect Reasoning. Writes `validation_report` + `architecture_alternatives`.
 
 ### Session Store (`src/services/session_store.py`) — P15f ✅
 - SQLite-backed session registry (`data/sessions.db`) via aiosqlite. `SessionInfo` Pydantic model.
@@ -242,16 +244,52 @@ These bugs only appear when using the `/clarify` conversation flow (not pre-buil
 | **P16d** | Multi-scenario benchmark script | `scripts/benchmark_scenarios.py` — 3 scenarios (Cal Fire/Government, Healthcare SaaS, E-Commerce). Bypasses Clarifier by injecting pre-built WorkloadRequest. `_merge_state()` helper applies LangGraph append semantics for list fields when calling agents directly. `--dry-run` mocks both LLM AND pricing APIs. Writes `data/benchmark_results.json` + `data/benchmark_report.md`. Dry-run: 3/3 ✅ (WAF 67-100%, RFPs 36-39KB, all 5 agents pass). 142/142 tests pass. | ✅ Done |
 | **P16e** | Architecture radar chart (dashboard) | React component: 4 options x 5 WAF axes as spider chart. Makes the comparison visual and tangible. `ArchitectureRadarChart.tsx` + `ArchitectureAlternative` TS interface. Validator emits per-pillar scores (reliability/cost/scale/compliance/latency). Results page has 5 tabs (Architecture tab added). SSE pipeline_complete + OrchestrationResponse carry architecture_alternatives. npm build: 0 errors ✅ | ✅ Done |
 | **P16f** | User feedback capture | 1-5 star rating widget (`FeedbackWidget.tsx`) on Results page RFP tab. `POST /api/v1/feedback` FastAPI route logs a LangFuse score event (name=`user_satisfaction`, value=rating). Inline SVG stars (no extra deps). Optional comment textarea. 142 tests, 0 TS errors ✅ | ✅ Done |
+| **P17a+P17b** | Processor architecture scoring | `_detect_processor_architecture(workload, sku_name)` in `scoring.py`. Weights: cost 35%, arch 5%. Graviton families: c8g/m8g/r8g/t4g/x2g. SMT signals: "parallel"/"multi-thread"/concurrent_users>500. Graviton signals: "web"/"api"/"crypto"/"cache". Scores: [arm+suitable=1.0, x86+suitable=0.7, x86+SMT=1.0, arm+SMT=0.5, neutral=0.85]. COMPUTE+AI_ML only. | ✅ Done |
+| **P17c** | WAF Sustainability Graviton check | `_check_sustainability()` scans `sized_results` for Graviton-prefix SKUs → 5/5 "Graviton adoption active ✅"; else 4/5. `evaluate_compliance(sized_results=)` updated; validator.py + rfp_writer.py callers updated. | ✅ Done |
+| **P17d+P17e** | Architecture Insights dashboard tab | `ProcessorArchitecturePanel.tsx`: per-workload ARM/x86 badge, SMT match indicator, breaking latency risk badge, cost column, arch score bar, rationale cards. 6th tab "Arch Insights" in `ResultsPage.tsx` (grid-cols-6). | ✅ Done |
+| **P17f** | API wiring | `ProcessorArchitectureEntry` Pydantic model. `processor_architecture_insights` in `OrchestratorState` + `OrchestrationResponse` + SSE event. `_build_architecture_insights()` in `sizer.py`. `api.ts` + `PipelineContext.tsx` updated. | ✅ Done |
+| **P17g** | Unit tests | 16 new tests in `test_engines.py` for all 5 arch scoring cases + weight validation. Suite: **158/158** ✅ | ✅ Done |
 
 ### Next Immediate Task
 
-**All P16 items are complete ✅. PROV-1 through PROV-3 clarifier conversation bugs are fixed ✅**
+**No pending immediate tasks.** P17 is the last planned feature. Consider:
+- Live end-to-end test with the full pipeline to verify Graviton recommendations appear in the Arch Insights tab
+- Dissertation write-up / submission prep
 
-The system is feature-complete for dissertation submission. What remains is optional polish:
-- P17 (optional): End-to-end live demo run with real LLM — record/screenshot results for the dissertation appendix.
-- P17 (optional): Write the dissertation final report in `docs/FINAL_REPORT_CONTENT.md` — the scaffolding already exists.
+### Recently Fixed (11 May 2026) — Medium Severity Issues
 
+| ID | Fix |
+|----|-----|
+| `monthly_cost_estimate` serialization | `@computed_field` + `@property` added to `NormalizedPriceItem` in `src/models/pricing.py`. Now present in all `model_dump(mode="json")` / API responses. TS type corrected to `number \| null`. |
+| React error boundaries | `ErrorBoundary` class component created (`dashboard/src/components/ErrorBoundary.tsx`). Wraps: app root (main.tsx), each route (App.tsx), each result tab individually (ResultsPage.tsx). |
 
+### Critical Bugs Fixed (Test Prompt 2 — Cal Fire Wildfire Scenario) — FIRE2-1 through FIRE2-3
+
+These 3 bugs surfaced only in the `/orchestrate/stream` pipeline mode when enriched_input is injected directly (not the `/clarify` conversation flow). All fixed and verified with `uv run pytest` — 142/142 pass.
+
+| ID | Bug | Root Cause | Fix | Files |
+|----|-----|-----------|-----|-------|
+| **FIRE2-1** | Tier set to `non_critical` for a public-safety/99.99% SLA scenario | `_parse_explicit_values()` used `"non" in text and "critical" in text` — matched the enum description string `"mission_critical / business_critical / non_critical"` in the enriched_input LLM prompt template | Replaced with specific regex patterns (`_MISSION_PATTERNS`, `_NON_CRITICAL_PATTERNS`, `_MISSION_SECTOR_PATTERNS`). `_NON_CRITICAL_PATTERNS` uses `(?!\s*/)` negative lookahead to skip enum lists. Added SLA-based tier escalation in `_propagate_scale_and_sla()`: SLA ≥ 99.99% → `MISSION_CRITICAL`; SLA ≥ 99.9% + `NON_CRITICAL` → `BUSINESS_CRITICAL`. | `src/agents/clarifier.py` |
+| **FIRE2-2** | GCP selected as cheapest with incomplete pricing (GCP serverless fit=0/$0 makes total look artificially low) | `_build_provider_breakdown()` included `fit_score=0.0, monthly_cost_usd=0.0, selected_sku=None` results in total — no detection of failed SKU lookups | Added `missing_components: list[str]` tracking; detects results where `fit_score==0.0 and monthly_cost_usd==0.0 and selected_sku is None` (excluding fixed-cost line items). Added `has_incomplete_pricing` + `missing_components` to `ProviderCostBreakdown`. Cheapest provider selection now excludes providers with `has_incomplete_pricing=True`; falls back to all if none are complete. Updated `_FINOPS_SYSTEM_PROMPT` with rules 6+7 (flag incomplete pricing; respect user preference). | `src/agents/finops.py`, `src/models/recommendation.py` |
+| **FIRE2-3** | "We're thinking AWS" not recognised as a provider preference; `user_preferred_provider` ignored in FinOps analysis | `_user_named_single_provider()` only matched `"we're on aws"` / `"we use aws"` — not `"thinking aws"`, `"considering aws"`, `"leaning towards aws"`. No `user_preferred_provider` field in `WorkloadRequest`. FinOps `_generate_finops_summary()` had no `user_preferred_provider` param. | Added `user_preferred_provider: CloudProvider \| None` to `WorkloadRequest`. Added `thinking/considering/leaning towards` patterns to `_user_named_single_provider()`. Added `_PREF_PATTERNS` detection block in `_parse_explicit_values()`. Updated `_generate_finops_summary(user_preferred_provider=...)` signature + `user_content` JSON. Wired from `run_finops_node()` via `workload_request.user_preferred_provider.value`. | `src/agents/clarifier.py`, `src/models/workload.py`, `src/agents/finops.py` |
+### Critical Bugs Fixed (Third Test Run — Wildfire Scenario) — FIRE3-1 through FIRE3-4
+
+These 4 bugs surfaced in the third end-to-end test run where the user explicitly requested AWS but the pipeline went multi-cloud. All fixed and verified — 142/142 tests pass.
+
+| ID | Bug | Root Cause | Fix | Files |
+|----|-----|-----------|-----|-------|
+| **FIRE3-1** | "AWS and the data should be in USA" not recognised as single-provider preference | `_user_named_single_provider()` only matched strict patterns like `"use aws"`, `"we use aws"` — not a bare "AWS" noun phrase without a predicate | Added broader regex patterns (`aws.{0,40}data/region/usa`) + implicit single-mention heuristic: if exactly one provider name appears in the full conversation text, treat it as a provider preference. Expanded `provider_override` block: when single-provider is detected, sets `provider_strategy=single_<X>` and `providers=[X]` (not just the `best_price_all` fallback). | `src/agents/clarifier.py` |
+| **FIRE3-2** | AWS ElastiCache selects `ExtendedSupportYr1_Yr2` meter (~2× standard price) | ElastiCache pricing API returns both standard hourly instance rows and "ExtendedSupport" add-on fee rows. The DATABASE hourly filter let both through; the cheapest-picker then selected the add-on row because it has a low unit price | Added `aws_elasticache_extended_support_excluded` filter for AWS DATABASE workloads where `_is_redis_workload()` returns True. Excludes rows containing `extendedsupport`, `yr1_yr2`, `yr3`, `eol` in sku_name or product_name. | `src/agents/sizer.py` |
+| **FIRE3-3** | `analytics-data-warehouse` selects `d3en.6xlarge` ($2,302/mo, fit=0.20) — storage-dense HDD instance for a 6 vCPU/24 GB compute workload | `d3en.6xlarge` (24 vCPU, 96 GiB, 21 TB NVMe) was the only current-gen instance in the EC2 search results that met the ≥6 vCPU / ≥24 GB constraint; general-purpose `r6i`/`m6i` instances were present but scored lower relative to the huge d3en because the cost score normalization was dominated by metal instances | Added `_STORAGE_DENSE_PREFIXES` exclusion block for AWS COMPUTE workloads: `d2.*`, `d3.*`, `d3en.*`, `i2.*`, `i3.*`, `i3en.*`, `i4i.*`, `i4g.*`, `h1.*`, `hs1.*`, `f1.*`. These NVMe/HDD-dense families are never appropriate for general compute workloads. | `src/agents/sizer.py` |
+| **FIRE3-4** | RFP executive summary recommends GCP even though FinOps selected Azure | `_generate_executive_summary()` only received `cheapest_provider` from `CostComparison` (raw lowest cost). FinOps chose Azure as the formal recommendation because it had complete pricing while GCP had incomplete serverless data. LLM used cheapest_provider → GCP. | Added `recommended_provider: str \| None = None` parameter to `_generate_executive_summary()`. Injects `recommended_provider` field into the LLM user_content JSON. Call site in `run_rfp_writer_node()` passes `state.get("recommended_provider")`. | `src/agents/rfp_writer.py` |
+
+### Critical Bugs Fixed (Fourth Test Run — Wildfire Scenario) — FIRE4-1
+
+This bug surfaced in the fourth end-to-end run after FIRE3 fixes. AWS ($1,090/mo) was cheapest but GCP ($1,219/mo) was recommended because FinOps excluded AWS with `has_incomplete_pricing=True`. Fixed and verified — 142/142 tests pass.
+
+| ID | Bug | Root Cause | Fix | Files |
+|----|-----|-----------|-----|-------|
+| **FIRE4-1** | GCP recommended ($1,219/mo) over cheaper AWS ($1,090/mo) after FIRE3 fixes | DATABASE hourly filter was **conditional**: `hourly = [c for c in candidates if c.is_hourly]` then `if hourly: candidates = hourly`. When AWS RDS pricing API returned only non-hourly storage/IOPS rows, `hourly=[]`, the `if hourly:` guard silently no-op'd, leaving non-hourly rows in `candidates`. These rows pass `_filter_database_candidates()` (cand_mem=0/cand_vcpu=0 → mem_ok=True/vcpu_ok=True for absent attrs), so `if not candidates:` is never True → PostgreSQL $185 fallback never fires → PostgreSQL result has cost=$0/fit=0.0/sku=None → FinOps `_build_provider_breakdown()` adds it to `missing_components` → `has_incomplete_pricing=True` for AWS → AWS excluded from cheapest-complete comparison → GCP selected. | Made hourly filter **unconditional**: `candidates = [c for c in candidates if c.is_hourly and c.unit_price > 0]`. When no hourly rows exist, `candidates=[]` → `_filter_database_candidates([])` returns `[]` → `if not candidates:` → True → PostgreSQL $185 fallback fires → result has fit=0.7/cost=$185 → NOT flagged as incomplete → AWS participates in cheapest comparison. | `src/agents/sizer.py` |
 
 ## Auth / Credentials (already set in `.env`)
 - **AWS**: Temporary STS session credentials (`ASIA` prefix) — **Bedrock access is now DENIED** (IAM policy explicitly denies `bedrock:InvokeModel`). Still used for Pricing API. Do not attempt to restore Bedrock for LLM.
@@ -351,8 +389,19 @@ cd dashboard && npm run build
 - **SKU cache**: `data/sku_cache.db` auto-created. Delete to force fresh API data.
 - `compare_across_providers()` designed for FinOps agent's cross-provider workflow.
 
-### Implementation Notes
-- **WAF compliance API**: `evaluate_compliance()` (NOT `run_compliance_checks`).
+### P17 — Graviton/Processor Architecture Notes
+
+- **Graviton families to detect** (via SKU name prefix): `c8g`, `m8g`, `r8g`, `t4g`, `x2g`. Use `.startswith()` on the SKU name family prefix (first segment before `.`).
+- **SMT-required signals**: keywords "parallel", "multi-thread", "multi_thread", "concurrent" in workload name/notes, OR `concurrent_users > 500` in `WorkloadRequirement`.
+- **Graviton-suitable signals**: keywords "web", "api", "http", "crypto", "cache", "cdn" in workload name/notes, OR `ServiceCategory.NETWORKING`.
+- **Breaking latency risk**: LOW if expected_cpu_load < 40% (derive from `throughput_rps / max_throughput`), MEDIUM 40–70%, HIGH > 70%.
+- **WAF score after P17**: 90.9% (30/33) — Sustainability pillar goes 4/5 → 5/5 when ≥1 Graviton SKU is in the recommendation.
+- **Report already updated**: `docs/FINAL_REPORT_CONTENT.md` has all P17 sections documented with `<added>`/`<updated>` tags. Do NOT re-edit the report when implementing.
+- **Test baseline**: 142/142 tests must continue to pass. New unit tests for `_detect_processor_architecture()` go in `tests/unit/test_engines.py`.
+- **API field**: `processor_architecture_insights: list[ProcessorArchitectureEntry] | None` on `OrchestrationResponse` — nullable so existing clients don't break.
+- **Dashboard tab order**: Overview, Architecture, Cost Analysis, Compliance, **Architecture Insights**, RFP Document — 6 tabs total after P17.
+
+
 - **Profiler category priority**: AI_ML first, COMPUTE last — prevents generic `vcpus` check from shadowing `database_engine` or `gpu_count`.
 - **Profiler graceful degradation**: Falls back to `_heuristic_rationale()` when LLM unavailable.
 - **FinOps RI/Spot fallback rates**: `_RI_DISCOUNT_RATES` (AWS 30/45%, Azure 35/50%, GCP 25/40%) and `_SPOT_DISCOUNT_RATES` (AWS 70%, Azure 80%, GCP 60%) applied when live pricing returns no reserved/spot data. `source: "estimate"` flag marks these entries.

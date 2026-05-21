@@ -744,10 +744,34 @@ def _parse_explicit_values(req: WorkloadRequest, raw_input: str) -> None:
     elif any(kw in text for kw in ("development", "dev ")):
         req.environment = EnvironmentType.DEVELOPMENT
 
-    # Tier detection
-    if "mission" in text and "critical" in text:
+    # Tier detection — use specific patterns to avoid matching enum descriptions
+    # (e.g. "mission_critical / business_critical / non_critical" in prompt templates)
+    _MISSION_PATTERNS = [
+        r"\bmission[_\s-]critical\b",
+        r"\bmission critical\b",
+    ]
+    _NON_CRITICAL_PATTERNS = [
+        r"\bnon[_\s-]critical\b(?!\s*/)",   # "non-critical" but NOT "non_critical /"
+        r"\bnon critical\b(?!\s*/)",
+        r"\btier:\s*non.critical\b",
+        r"\bnot critical\b",
+        r"\blow.priority\b",
+    ]
+    _MISSION_SECTOR_PATTERNS = [
+        r"\bpublic safety\b",
+        r"\bemergency response\b",
+        r"\bfire protection\b",
+        r"\boutages cost lives\b",
+        r"\blife.critical\b",
+        r"\blife.safety\b",
+        r"\b911\b",
+        r"\bfirst responder\b",
+    ]
+
+    if any(re.search(pat, text) for pat in _MISSION_PATTERNS) or \
+            any(re.search(pat, text) for pat in _MISSION_SECTOR_PATTERNS):
         req.tier = WorkloadTier.MISSION_CRITICAL
-    elif "non" in text and "critical" in text:
+    elif any(re.search(pat, text) for pat in _NON_CRITICAL_PATTERNS):
         req.tier = WorkloadTier.NON_CRITICAL
 
     # Budget detection
@@ -798,6 +822,20 @@ def _parse_explicit_values(req: WorkloadRequest, raw_input: str) -> None:
     compliance = _parse_compliance_extended(raw_input)
     if compliance and compliance != ["waf"]:
         req.compliance_frameworks = compliance
+
+    # Detect soft provider preference ("we're thinking AWS", "considering Azure", etc.)
+    _PREF_PATTERNS: list[tuple[str, CloudProvider]] = [
+        (r"(?:thinking|considering|leaning towards?|going with|we(?:'re| are) on)\s+aws\b", CloudProvider.AWS),
+        (r"(?:thinking|considering|leaning towards?|going with|we(?:'re| are) on)\s+amazon\b", CloudProvider.AWS),
+        (r"(?:thinking|considering|leaning towards?|going with|we(?:'re| are) on)\s+azure\b", CloudProvider.AZURE),
+        (r"(?:thinking|considering|leaning towards?|going with|we(?:'re| are) on)\s+microsoft\b", CloudProvider.AZURE),
+        (r"(?:thinking|considering|leaning towards?|going with|we(?:'re| are) on)\s+gcp\b", CloudProvider.GCP),
+        (r"(?:thinking|considering|leaning towards?|going with|we(?:'re| are) on)\s+google\b", CloudProvider.GCP),
+    ]
+    for pattern, provider in _PREF_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            req.user_preferred_provider = provider
+            break
 
 
 def _parse_compliance_extended(text: str) -> list[str]:
@@ -1032,6 +1070,17 @@ def _propagate_scale_and_sla(
             workload.rpo_minutes = rpo_min
         if rto_min is not None and workload.rto_minutes is None:
             workload.rto_minutes = rto_min
+
+    # Escalate tier based on parsed SLA — higher SLA implies stricter criticality.
+    # Only escalate; never demote a tier that was explicitly set to a higher level.
+    if uptime_sla is not None:
+        current_tier = req.tier or WorkloadTier.BUSINESS_CRITICAL
+        if uptime_sla >= 99.99 and current_tier != WorkloadTier.MISSION_CRITICAL:
+            req.tier = WorkloadTier.MISSION_CRITICAL
+            log.info("tier_escalated_by_sla", uptime_sla=uptime_sla, new_tier="mission_critical")
+        elif uptime_sla >= 99.9 and current_tier == WorkloadTier.NON_CRITICAL:
+            req.tier = WorkloadTier.BUSINESS_CRITICAL
+            log.info("tier_escalated_by_sla", uptime_sla=uptime_sla, new_tier="business_critical")
 
     log.info(
         "scale_sla_propagated",
@@ -1502,7 +1551,8 @@ async def llm_clarify_turn(
         )
 
         # PROV-1 fix: deterministic provider override.
-        # If the user never explicitly named a single provider, always use best_price_all.
+        # If the user explicitly named a single provider, lock to that provider only.
+        # If not, fall back to best_price_all across all three providers.
         # This prevents the LLM from inferring "single_aws" when it mentions AWS services
         # in its own architectural notes, while the user actually said "no preference".
         if status == "ready":
@@ -1511,7 +1561,29 @@ async def llm_clarify_turn(
                 + " "
                 + user_input
             )
-            if not _user_named_single_provider(all_user_text):
+            if _user_named_single_provider(all_user_text):
+                # Determine which single provider the user named
+                _PROVIDER_NAMES = {
+                    "aws": ("aws", "amazon web services"),
+                    "azure": ("azure", "microsoft azure"),
+                    "gcp": ("gcp", "google cloud", "google gcp"),
+                }
+                text_lower = all_user_text.lower()
+                mentioned = [
+                    prov
+                    for prov, aliases in _PROVIDER_NAMES.items()
+                    if any(alias in text_lower for alias in aliases)
+                ]
+                if len(mentioned) == 1:
+                    result["structured"]["provider_strategy"] = f"single_{mentioned[0]}"
+                    result["structured"]["providers"] = [mentioned[0]]
+                    log.info(
+                        "provider_override_applied",
+                        reason="user_named_single_provider",
+                        provider=mentioned[0],
+                        strategy=f"single_{mentioned[0]}",
+                    )
+            else:
                 result["structured"]["provider_strategy"] = "best_price_all"
                 result["structured"]["providers"] = ["aws", "azure", "gcp"]
                 log.info(
@@ -1542,6 +1614,7 @@ def _user_named_single_provider(all_user_text: str) -> bool:
 
     Patterns that indicate explicit single-provider preference:
     - "use AWS", "AWS only", "we use AWS", "prefer AWS", "on AWS"
+    - "we're thinking AWS", "we're considering AWS", "leaning towards AWS"
     - "Azure only", "Microsoft Azure", "prefer Azure"
     - "GCP only", "Google Cloud", "prefer GCP", "we use GCP"
 
@@ -1569,6 +1642,7 @@ def _user_named_single_provider(all_user_text: str) -> bool:
 
     # Explicit single-provider patterns
     single_patterns = [
+        # AWS explicit patterns
         r"\buse aws\b",
         r"\baws only\b",
         r"\bamazon only\b",
@@ -1578,12 +1652,30 @@ def _user_named_single_provider(all_user_text: str) -> bool:
         r"\bmust be aws\b",
         r"\baws[\s-]first\b",
         r"\bonly aws\b",
+        r"\bwe(?:'re| are) thinking aws\b",
+        r"\bwe(?:'re| are) thinking about aws\b",
+        r"\bconsidering aws\b",
+        r"\bleaning towards? aws\b",
+        r"\bgoing with aws\b",
+        r"\bstay(?:ing)? on aws\b",
+        r"\baws and .{0,40}(?:region|usa|us[- ](?:east|west|central)|data.{0,10}in)\b",
+        r"\baws.{0,30}(?:data|region|us).{0,20}(?:usa|america|east|west)\b",
+        # Azure explicit patterns
+        r"\bwe(?:'re| are) thinking azure\b",
+        r"\bconsidering azure\b",
+        r"\bleaning towards? azure\b",
         r"\buse azure\b",
         r"\bazure only\b",
         r"\bprefer azure\b",
         r"\bmust be azure\b",
         r"\bonly azure\b",
         r"\bwe use azure\b",
+        r"\bstay(?:ing)? on azure\b",
+        # GCP explicit patterns
+        r"\bwe(?:'re| are) thinking gcp\b",
+        r"\bwe(?:'re| are) thinking google\b",
+        r"\bconsidering gcp\b",
+        r"\bleaning towards? gcp\b",
         r"\buse gcp\b",
         r"\bgcp only\b",
         r"\bprefer gcp\b",
@@ -1591,8 +1683,28 @@ def _user_named_single_provider(all_user_text: str) -> bool:
         r"\bmust be gcp\b",
         r"\bonly gcp\b",
         r"\bwe use gcp\b",
+        r"\bstay(?:ing)? on gcp\b",
     ]
-    return any(re.search(pat, text) for pat in single_patterns)
+    if any(re.search(pat, text) for pat in single_patterns):
+        return True
+
+    # Implicit single-provider: user names one provider and no competing providers.
+    # e.g. "AWS and the data should be in the USA" mentions only AWS.
+    _PROVIDER_NAMES = {
+        "aws": ("aws", "amazon web services"),
+        "azure": ("azure", "microsoft azure"),
+        "gcp": ("gcp", "google cloud", "google gcp"),
+    }
+    mentioned = {
+        prov
+        for prov, aliases in _PROVIDER_NAMES.items()
+        if any(alias in text for alias in aliases)
+    }
+    if len(mentioned) == 1:
+        # Only one provider mentioned in the entire conversation → treat as preference
+        return True
+
+    return False
 
 
 def _extract_clarify_section(text: str, section: str) -> str:

@@ -268,6 +268,11 @@ class OrchestratorState(TypedDict, total=False):
     architecture_alternatives: list[dict[str, Any]]
     """Ranked architecture options from the Validator / architecture_selector."""
 
+    processor_architecture_insights: list[dict[str, Any]]
+    """P17 — Per-workload processor architecture fit insights (ARM vs x86).
+    Populated by the Sizer node after scoring. Each entry is a serialised
+    ProcessorArchitectureEntry from src.models.recommendation."""
+
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -347,4 +352,5 @@ def create_initial_state(
         pipeline_mode="full",
         validation_report={},
         architecture_alternatives=[],
+        processor_architecture_insights=[],
     )

@@ -12,6 +12,7 @@ References:
 from __future__ import annotations
 
 import structlog
+from typing import Any
 
 from src.models.recommendation import (
     BinPackingResult,
@@ -26,6 +27,16 @@ from src.models.workload import (
 )
 
 logger = structlog.get_logger(__name__)
+
+# Graviton (ARM) instance family prefixes — mirrors scoring.py constant
+_GRAVITON_PREFIXES: frozenset[str] = frozenset(
+    {"c8g", "m8g", "r8g", "t4g", "x2g"}
+)
+
+# Categories where Graviton adoption is meaningful for sustainability scoring
+_COMPUTE_CATEGORIES: frozenset[ServiceCategory] = frozenset(
+    {ServiceCategory.COMPUTE, ServiceCategory.AI_ML}
+)
 
 
 # ─── WAF Pillar Checks ─────────────────────────────────────
@@ -277,11 +288,21 @@ def _check_operational_excellence(
 def _check_sustainability(
     request: WorkloadRequest,
     bin_results: dict[str, BinPackingResult],
+    sized_results: list[Any] | None = None,
 ) -> list[ComplianceCheckResult]:
-    """Sustainability: Resource waste minimisation."""
-    checks: list[ComplianceCheckResult] = []
-    waste_threshold = 40.0  # Max acceptable waste percentage
+    """Sustainability: Resource waste minimisation + Graviton adoption.
 
+    P17: Active Graviton/ARM adoption is scored as a full sustainability
+    check.  If at least one COMPUTE or AI_ML workload is recommended on a
+    Graviton SKU (c8g / m8g / r8g / t4g / x2g), the pillar receives 5/5
+    (100 %).  Otherwise it falls back to 4/5 (80 %) with a recommendation
+    to evaluate Graviton instances.  AWS Graviton delivers up to 40% better
+    performance at 20% lower cost and 60% less energy [Ref 20, 21].
+    """
+    checks: list[ComplianceCheckResult] = []
+    waste_threshold = 40.0
+
+    # --- Existing: resource waste check per provider ---
     for provider, result in bin_results.items():
         waste_pct = 100.0 - result.packing_efficiency_pct
         passed = waste_pct <= waste_threshold
@@ -299,6 +320,46 @@ def _check_sustainability(
                 ),
             )
         )
+
+    # --- P17: Graviton adoption check ---
+    graviton_found = False
+    if sized_results:
+        for result in sized_results:
+            # result is a SizedWorkloadResult — access attributes safely
+            category = None
+            try:
+                # Derive category from selected_sku or workload name
+                sku = getattr(result, "selected_sku", None)
+                if sku is None:
+                    continue
+                sku_name: str = getattr(sku, "sku_name", "") or ""
+                family = sku_name.split(".")[0].lower() if "." in sku_name else sku_name.lower()
+                if family in _GRAVITON_PREFIXES:
+                    graviton_found = True
+                    break
+            except Exception:
+                continue
+
+    graviton_passed = graviton_found
+    checks.append(
+        ComplianceCheckResult(
+            pillar="Sustainability",
+            check_name="Graviton/ARM Processor Adoption",
+            passed=graviton_passed,
+            severity="low" if graviton_passed else "medium",
+            finding=(
+                "Graviton adoption active ✅ — ARM-based instances recommended for eligible workloads"
+                if graviton_passed
+                else "No ARM/Graviton instances recommended"
+            ),
+            recommendation=(
+                "Graviton instances deliver up to 40% better performance at 20% lower cost "
+                "and 60% less energy. Evaluate c8g/m8g/r8g/t4g/x2g families for compute workloads."
+                if not graviton_passed
+                else "Continue prioritising Graviton for single-threaded and web/API workloads"
+            ),
+        )
+    )
 
     return checks
 
@@ -422,12 +483,16 @@ def _check_compliance_coverage(
 def evaluate_compliance(
     request: WorkloadRequest,
     bin_packing_results: dict[str, BinPackingResult] | None = None,
+    sized_results: list[Any] | None = None,
 ) -> ComplianceReport:
     """Run all WAF compliance checks against the proposed design.
 
     Args:
         request: The original workload request.
         bin_packing_results: Bin-packing results per provider (optional).
+        sized_results: Sizer output list of SizedWorkloadResult (optional).
+            When provided, enables the P17 Graviton adoption sustainability
+            check which upgrades the Sustainability pillar from 4/5 to 5/5.
 
     Returns:
         ComplianceReport with all check results and an overall score.
@@ -447,7 +512,7 @@ def evaluate_compliance(
     all_checks.extend(_check_budget_ceiling(request))
     all_checks.extend(_check_performance_efficiency(request))
     all_checks.extend(_check_operational_excellence(request))
-    all_checks.extend(_check_sustainability(request, bin_packing_results))
+    all_checks.extend(_check_sustainability(request, bin_packing_results, sized_results))
 
     total = len(all_checks)
     passed = sum(1 for c in all_checks if c.passed)

@@ -111,7 +111,7 @@ export interface NormalizedPriceItem {
   unit: string;
   currency: string;
   attributes: Record<string, string>;
-  monthly_cost_estimate: number;
+  monthly_cost_estimate: number | null;
 }
 
 // --- Workload Models ---
@@ -285,6 +285,19 @@ export interface ArchitectureAlternative {
   latency_score: number;
 }
 
+export interface ProcessorArchitectureEntry {
+  workload_name: string;
+  provider: string;
+  sku_family: string;
+  arch_type: "graviton" | "x86" | "unknown";
+  smt_suitable: boolean;
+  smt_match: boolean;
+  breaking_latency_risk: "LOW" | "MEDIUM" | "HIGH";
+  cost_monthly_usd: number;
+  architecture_score: number;
+  rationale: string;
+}
+
 export interface OrchestrationResponse {
   request_id: string;
   status: "completed" | "failed";
@@ -294,6 +307,7 @@ export interface OrchestrationResponse {
   cost_comparison: CostComparison | null;
   compliance_report: ComplianceReport | null;
   architecture_alternatives?: ArchitectureAlternative[];
+  processor_architecture_insights?: ProcessorArchitectureEntry[];
   error: string | null;
   duration_ms: number | null;
 }
@@ -346,6 +360,7 @@ export interface SSEPipelineComplete {
     cost_comparison?: CostComparison;
     compliance_report?: ComplianceReport;
     architecture_alternatives?: ArchitectureAlternative[];
+    processor_architecture_insights?: ProcessorArchitectureEntry[];
   };
 }
 

@@ -322,6 +322,15 @@ class WorkloadRequest(BaseModel):
         description="Original unstructured text from the user's chat message",
     )
 
+    # --- User's stated provider preference (soft preference, not a hard lock) ---
+    user_preferred_provider: CloudProvider | None = Field(
+        default=None,
+        description=(
+            "Provider the user explicitly said they 'prefer' or 'are thinking about'. "
+            "Surfaces in recommendation narrative even if another provider is cheaper."
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Component profile (Profiler output per workload)

@@ -1,12 +1,18 @@
 """Validator Agent — Architecture quality gate.
 
-Runs after FinOps in every pipeline.  Performs 5 checks:
+Runs after FinOps in every pipeline.  Performs 7 checks:
 
 0. **Pricing Data Integrity** — calls :mod:`src.engines.pricing_validator`
+   (8 sub-checks including the new ``zero_cost_sku`` check that flags
+   fit_score=0/$0 results which artificially deflate a provider's total cost)
 1. **Architecture Correctness** — calls :mod:`src.engines.architecture_selector`
 2. **Sizing Adequacy** — verifies every SKU meets workload requirements (±20 %)
 3. **Budget Fit** — compares total cost to ``workload_request.budget_monthly_usd``
 4. **WAF Compliance** — calls :mod:`src.engines.waf_compliance`
+5. **Tier vs SLA Consistency** — verifies ``workload_request.tier`` is appropriate
+   for the stated SLA (e.g. ``non_critical`` + 99.99 % SLA is flagged as a fail)
+6. **Provider Preference Alignment** — warns when FinOps recommendation diverges
+   from ``workload_request.user_preferred_provider``
 
 All reasoning uses the **Principal Architect Reasoning Pattern** (§22g).
 
@@ -224,6 +230,153 @@ def _check_budget_fit(state: OrchestratorState) -> dict[str, Any]:
     }
 
 
+def _check_tier_sla_consistency(state: OrchestratorState) -> dict[str, Any]:
+    """Check 5 — verify workload_request.tier is appropriate for the stated SLA.
+
+    Catches miscategorisation where the clarifier sets a low tier (e.g.
+    ``non_critical``) despite a 99.99 % SLA requirement or a public-safety sector.
+
+    Args:
+        state: Current orchestrator state.
+
+    Returns:
+        Dict with ``status`` (``"pass"`` | ``"warn"`` | ``"fail"``), ``tier``,
+        ``max_uptime_sla``, and ``note``.
+    """
+    log = logger.bind(agent="validator", step="check_tier_sla_consistency")
+
+    workload_request = state.get("workload_request")
+    workload_profile = state.get("workload_profile")
+
+    if workload_request is None:
+        return {"status": "skip", "note": "No workload_request in state"}
+
+    tier = getattr(workload_request, "tier", None)
+    tier_value = tier.value if hasattr(tier, "value") else str(tier)
+
+    # Collect max SLA across all profiled components
+    max_sla: float = 0.0
+    components = getattr(workload_profile, "components", []) if workload_profile else []
+    for comp in components:
+        sla = getattr(comp, "uptime_sla", None) or 0.0
+        if sla > max_sla:
+            max_sla = sla
+
+    # Also check raw_user_input / enriched_input for SLA keywords if profile is empty
+    raw = getattr(workload_request, "raw_user_input", "") or ""
+    if not max_sla and "99.99" in raw:
+        max_sla = 99.99
+    elif not max_sla and "99.9" in raw:
+        max_sla = 99.9
+
+    # Detect critical sector from raw input
+    _CRITICAL_SECTOR_KEYWORDS = (
+        "public safety", "emergency", "fire protection", "police", "911",
+        "hospital", "healthcare", "outages cost lives", "life safety",
+        "first responder", "law enforcement",
+    )
+    is_critical_sector = any(kw in raw.lower() for kw in _CRITICAL_SECTOR_KEYWORDS)
+
+    if tier_value == "non_critical":
+        if max_sla >= 99.99 or is_critical_sector:
+            status = "fail"
+            note = (
+                f"Tier '{tier_value}' is inconsistent with SLA {max_sla}% "
+                + ("/ critical-sector keywords detected" if is_critical_sector else "")
+                + ". Expected: mission_critical."
+            )
+        elif max_sla >= 99.9:
+            status = "warn"
+            note = (
+                f"Tier '{tier_value}' may be too low for SLA {max_sla}%. "
+                "Consider business_critical or mission_critical."
+            )
+        else:
+            status = "pass"
+            note = "Tier matches SLA requirements."
+    elif tier_value == "business_critical" and max_sla >= 99.99:
+        status = "warn"
+        note = (
+            f"Tier '{tier_value}' may be too low for SLA {max_sla}%. "
+            "Consider mission_critical for 99.99% SLA."
+        )
+    else:
+        status = "pass"
+        note = "Tier matches SLA requirements."
+
+    log.info(
+        "tier_sla_consistency_checked",
+        tier=tier_value,
+        max_sla=max_sla,
+        is_critical_sector=is_critical_sector,
+        status=status,
+    )
+    return {
+        "status": status,
+        "tier": tier_value,
+        "max_uptime_sla": max_sla,
+        "is_critical_sector": is_critical_sector,
+        "note": note,
+    }
+
+
+def _check_provider_preference_alignment(state: OrchestratorState) -> dict[str, Any]:
+    """Check 6 — warn when recommendation diverges from the user's stated provider preference.
+
+    If the user said "we're thinking AWS" but FinOps recommended GCP because GCP
+    appeared cheaper due to incomplete pricing data, the validator surfaces this
+    discrepancy so the RFP writer can include a justification paragraph.
+
+    Args:
+        state: Current orchestrator state.
+
+    Returns:
+        Dict with ``status`` (``"pass"`` | ``"warn"`` | ``"skip"``),
+        ``preferred``, ``recommended``, and ``note``.
+    """
+    log = logger.bind(agent="validator", step="check_provider_preference_alignment")
+
+    workload_request = state.get("workload_request")
+    if workload_request is None:
+        return {"status": "skip", "note": "No workload_request in state"}
+
+    preferred = getattr(workload_request, "user_preferred_provider", None)
+    if preferred is None:
+        return {
+            "status": "skip",
+            "preferred": None,
+            "recommended": state.get("recommended_provider"),
+            "note": "No user provider preference stated.",
+        }
+
+    preferred_val = preferred.value if hasattr(preferred, "value") else str(preferred)
+    recommended = state.get("recommended_provider", "")
+
+    if recommended and recommended.lower() != preferred_val.lower():
+        status = "warn"
+        note = (
+            f"User stated a preference for '{preferred_val}' but cost analysis "
+            f"recommends '{recommended}'. The RFP should explicitly justify this "
+            f"divergence (e.g. cost savings, missing services)."
+        )
+    else:
+        status = "pass"
+        note = f"Recommendation '{recommended}' aligns with user preference '{preferred_val}'."
+
+    log.info(
+        "provider_preference_alignment_checked",
+        preferred=preferred_val,
+        recommended=recommended,
+        status=status,
+    )
+    return {
+        "status": status,
+        "preferred": preferred_val,
+        "recommended": recommended,
+        "note": note,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main validator node
 # ---------------------------------------------------------------------------
@@ -350,7 +503,10 @@ async def run_validator_node(
         log.info("check_4_waf_compliance_started")
         if workload_request:
             try:
-                waf_report = evaluate_compliance(workload_request)
+                waf_report = evaluate_compliance(
+                    workload_request,
+                    sized_results=sized_results,
+                )
                 validation_report["waf_report"] = waf_report.model_dump()
                 log.info(
                     "check_4_waf_compliance_completed",
@@ -364,14 +520,40 @@ async def run_validator_node(
         else:
             validation_report["waf_report"] = {"note": "No workload_request available"}
 
+        # ── Check 5: Tier vs SLA Consistency ─────────────────────────────
+        log.info("check_5_tier_sla_consistency_started")
+        tier_result = _check_tier_sla_consistency(state)
+        validation_report["tier_sla_validation"] = tier_result
+        log.info(
+            "check_5_tier_sla_consistency_completed",
+            status=tier_result.get("status"),
+            tier=tier_result.get("tier"),
+            max_sla=tier_result.get("max_uptime_sla"),
+        )
+
+        # ── Check 6: Provider Preference Alignment ────────────────────────
+        log.info("check_6_provider_preference_started")
+        pref_result = _check_provider_preference_alignment(state)
+        validation_report["provider_preference_validation"] = pref_result
+        log.info(
+            "check_6_provider_preference_completed",
+            status=pref_result.get("status"),
+            preferred=pref_result.get("preferred"),
+            recommended=pref_result.get("recommended"),
+        )
+
         # ── LLM summary (Principal Architect Reasoning) ───────────────────
         log.info("validator_llm_summary_started")
+        tier_note = tier_result.get("note", "")
+        pref_note = pref_result.get("note", "")
         summary_input = (
             f"Pricing integrity: {'valid' if pricing_result.is_valid else f'INVALID ({error_count} errors)'}\n"
             f"Architecture: {recommended_arch} (top-scored: {ranked[0]['name'] if ranked else 'N/A'})\n"
             f"Sizing failures: {len(sizing_failures)}/{len(sizing_results)}\n"
             f"Budget: {budget_result.get('note', 'unknown')}\n"
-            f"WAF score: {validation_report.get('waf_report', {}).get('overall_score', 'N/A')}"
+            f"WAF score: {validation_report.get('waf_report', {}).get('overall_score', 'N/A')}\n"
+            f"Tier vs SLA: {tier_result.get('status', 'skip')} — {tier_note}\n"
+            f"Provider preference: {pref_result.get('status', 'skip')} — {pref_note}"
         )
 
         try:
@@ -396,8 +578,10 @@ async def run_validator_node(
         log.info(
             "validator_node_completed",
             duration_ms=round(duration_ms, 1),
-            checks_run=5,
+            checks_run=7,
             sizing_failures=len(sizing_failures),
+            tier_sla_status=tier_result.get("status"),
+            provider_pref_status=pref_result.get("status"),
         )
 
         agent_exec = state.get("agent_executions", {}).get(
@@ -424,7 +608,9 @@ async def run_validator_node(
                         f"[Validator] Architecture: {recommended_arch} | "
                         f"Pricing valid: {pricing_result.is_valid} | "
                         f"Sizing failures: {len(sizing_failures)} | "
-                        f"Budget: {budget_result.get('status', 'unknown')}"
+                        f"Budget: {budget_result.get('status', 'unknown')} | "
+                        f"Tier/SLA: {tier_result.get('status', 'skip')} | "
+                        f"Provider pref: {pref_result.get('status', 'skip')}"
                     ),
                 )
             ],

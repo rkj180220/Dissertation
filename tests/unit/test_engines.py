@@ -243,3 +243,132 @@ class TestScoringRanking:
         result = score_skus(workload, candidates=candidates)
         # Single candidate → cost_score = 0 (it's the max price), but fit > 0
         assert result[0].total_score >= 0.0
+
+
+# ---------------------------------------------------------------------------
+#  _detect_processor_architecture testsP17 
+# ---------------------------------------------------------------------------
+
+from src.engines.scoring import _detect_processor_architecture  # noqa: E402
+
+
+class TestProcessorArchitectureDetection:
+    """Tests for the P17 processor architecture scoring function."""
+
+    def _workload(
+        self,
+        name: str = "svc",
+        notes: str = "",
+        concurrent_users: int = 0,
+        category: ServiceCategory = ServiceCategory.COMPUTE,
+    ) -> WorkloadRequirement:
+        return WorkloadRequirement(
+            name=name,
+            description="test",
+            suggested_category=category,
+            resources=ResourceSpec(vcpus=2, memory_gb=4.0),
+            concurrent_users=concurrent_users if concurrent_users else None,
+            notes=notes,
+        )
+
+    # --- score: 1.0 ---
+
+    def test_graviton_suitable_arm_sku_scores_1_0(self) -> None:
+        wl = self._workload(name="api-gateway")
+        arch_type, score = _detect_processor_architecture(wl, "c8g.large")
+        assert arch_type == "graviton"
+        assert score == 1.0
+
+    def test_web_server_arm_sku_scores_1_0(self) -> None:
+        wl = self._workload(name="web-frontend", notes="web server")
+        arch_type, score = _detect_processor_architecture(wl, "m8g.xlarge")
+        assert arch_type == "graviton"
+        assert score == 1.0
+
+    def test_crypto_workload_arm_sku_scores_1_0(self) -> None:
+        wl = self._workload(notes="crypto hashing service")
+        arch_type, score = _detect_processor_architecture(wl, "t4g.small")
+        assert arch_type == "graviton"
+        assert score == 1.0
+
+    # --- score: 0.7 ---
+
+    def test_graviton_suitable_x86_sku_scores_0_7(self) -> None:
+        wl = self._workload(name="api-gateway")
+        arch_type, score = _detect_processor_architecture(wl, "c5.large")
+        assert arch_type == "x86"
+        assert score == 0.7
+
+    def test_cache_workload_x86_sku_scores_0_7(self) -> None:
+        wl = self._workload(notes="cache layer redis")
+        arch_type, score = _detect_processor_architecture(wl, "m5.large")
+        assert arch_type == "x86"
+        assert score == 0.7
+
+    # --- score: 1.0 ---
+
+    def test_smt_required_x86_sku_scores_1_0(self) -> None:
+        wl = self._workload(name="batch-processor", notes="parallel processing")
+        arch_type, score = _detect_processor_architecture(wl, "c5.2xlarge")
+        assert arch_type == "x86"
+        assert score == 1.0
+
+    def test_high_concurrent_users_x86_scores_1_0(self) -> None:
+        wl = self._workload(name="concurrent-svc", concurrent_users=600)
+        arch_type, score = _detect_processor_architecture(wl, "m5.xlarge")
+        assert arch_type == "x86"
+        assert score == 1.0
+
+    # --- score: 0.5 ---
+
+    def test_smt_required_arm_sku_scores_0_5(self) -> None:
+        wl = self._workload(name="parallel-compute", notes="multi-thread batch")
+        arch_type, score = _detect_processor_architecture(wl, "c8g.2xlarge")
+        assert arch_type == "graviton"
+        assert score == 0.5
+
+    def test_high_concurrent_users_arm_scores_0_5(self) -> None:
+        wl = self._workload(name="heavy-load-svc", concurrent_users=1000)
+        arch_type, score = _detect_processor_architecture(wl, "r8g.large")
+        assert arch_type == "graviton"
+        assert score == 0.5
+
+    # --- no signal: 0.85 neutral ---
+
+    def test_no_signal_neutral_score(self) -> None:
+        wl = self._workload(name="generic-service")
+        arch_type, score = _detect_processor_architecture(wl, "m5.large")
+        assert arch_type == "x86"
+        assert score == 0.85
+
+    def test_no_signal_graviton_neutral_score(self) -> None:
+        wl = self._workload(name="generic-service")
+        arch_type, score = _detect_processor_architecture(wl, "m8g.large")
+        assert arch_type == "graviton"
+        assert score == 0.85
+
+    # --- non-compute category: 0.85 regardless ---
+
+    def test_database_category_returns_neutral(self) -> None:
+        wl = self._workload(name="postgres-db", category=ServiceCategory.DATABASE)
+        arch_type, score = _detect_processor_architecture(wl, "c8g.large")
+        assert arch_type == "unknown"
+        assert score == 0.85
+
+    def test_storage_category_returns_neutral(self) -> None:
+        wl = self._workload(name="blob-store", category=ServiceCategory.STORAGE)
+        _, score = _detect_processor_architecture(wl, "c5.large")
+        assert score == 0.85
+
+    # --- ScoringWeights defaults check ---
+
+    def test_scoring_weights_sum_to_1(self) -> None:
+        w = ScoringWeights()
+        total = w.cost + w.cpu_fit + w.memory_fit + w.generation + w.processor_architecture
+        assert abs(total - 1.0) < 1e-9, f"Weights sum to {total}, expected 1.0"
+
+    def test_cost_weight_is_35_pct(self) -> None:
+        assert ScoringWeights().cost == 0.35
+
+    def test_processor_architecture_weight_is_5_pct(self) -> None:
+        assert ScoringWeights().processor_architecture == 0.05
